@@ -1,0 +1,12 @@
+[package]
+name = "radicom-codecs-rle"
+description = "DICOM RLE Lossless codec for radicom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+radicom.workspace = true
+
