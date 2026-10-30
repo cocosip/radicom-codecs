@@ -60,6 +60,20 @@ until `radicom` has been published and the project can consume the released pack
 - [x] Test that a placeholder codec fails with a managed codec operation error.
 - [ ] Run full family algorithm tests after Stage 1 implementation begins.
 
+### RLE Stage 1 implementation status
+
+- [x] Implement checked RLE layout validation for 8/16-bit samples.
+- [x] Implement 64-byte header read/write and segment offset validation.
+- [x] Implement deterministic PackBits literal/repeat encoding and decoding.
+- [x] Implement sample-major, high-byte-first segment mapping.
+- [x] Implement interleaved and planar RGB frame mapping.
+- [x] Implement multi-frame encode/decode through `PixelData`.
+- [x] Reject unsupported parameters and malformed frames with managed errors.
+- [x] Add unit tests for headers, segments, layout, frames, and error paths.
+- [x] Add facade/transcoder integration round-trip coverage.
+- [ ] Run external `fo-dicom.Codecs` public-API interoperability fixtures.
+- [ ] Complete final review and commit the RLE implementation.
+
 ## Next implementation stages
 
 1. **RLE:** implement DICOM RLE header, segment layout, PackBits runs, frame mapping,
