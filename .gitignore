@@ -1,0 +1,37 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Kept: Cargo.lock (workspace contains tools; reproducible builds)
+
+# Superpowers skill working directories
+docs/superpowers/
+.superpowers/
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local cargo configuration (build target-dir, personal aliases): machine
+# specific, so it stays out of the repository. The exception is config.toml,
+# which carries the shared `xtask` alias the docs and CI invoke.
+.cargo/*
+
+# Profiling / coverage output
+*.profraw
+*.profdata
+tarpaulin-report.html
+
+# Scratch / temporary files (patches, backups, merge leftovers)
+*.patch
+*.diff
+*.orig
+*.rej
+*.bak
+*.tmp
+*.log
