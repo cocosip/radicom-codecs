@@ -1,15 +1,15 @@
 # radicom-codecs development plan and status
 
 **Date:** 2026-10-30  
-**Current milestone:** workspace and registration skeleton  
-**Status:** in progress
+**Current milestone:** RLE Lossless implementation
+**Status:** complete locally; external interoperability pending
 
 ## Scope of this milestone
 
-This milestone creates the Cargo workspace and the registration boundary only.
-It does not implement RLE, JPEG, JPEG-LS, JPEG 2000, or HTJ2K bitstream coding.
-Every placeholder codec returns a managed `radicom::error::Error::Codec` operation
-error instead of silently passing data through.
+The workspace and registration boundary are complete. The RLE Lossless family is
+also implemented in pure Rust and integrated through the existing `radicom`
+codec trait and registry. JPEG, JPEG-LS, JPEG 2000, and HTJ2K remain explicit
+placeholder registrations until their implementation stages begin.
 
 The `radicom` dependency is a local path dependency. CI is intentionally deferred
 until `radicom` has been published and the project can consume the released package.
@@ -19,7 +19,7 @@ until `radicom` has been published and the project can consume the released pack
 - `Cargo.toml`: workspace members, shared package metadata, and local `radicom` path dependency.
 - `crates/radicom-codecs`: public facade, registry implementation, explicit codec registration,
   and re-exports of family codec types.
-- `crates/radicom-codecs-rle`: RLE codec registration skeleton.
+- `crates/radicom-codecs-rle`: RLE Lossless implementation and registration.
 - `crates/radicom-codecs-jpeg`: four classic JPEG registration skeletons.
 - `crates/radicom-codecs-jpeg-ls`: two JPEG-LS registration skeletons.
 - `crates/radicom-codecs-jpeg2000`: classic JPEG 2000 and three HTJ2K registration skeletons.
@@ -71,20 +71,20 @@ until `radicom` has been published and the project can consume the released pack
 - [x] Reject unsupported parameters and malformed frames with managed errors.
 - [x] Add unit tests for headers, segments, layout, frames, and error paths.
 - [x] Add facade/transcoder integration round-trip coverage.
+- [x] Decode the external `fo-dicom.Codecs` RLE acceptance fixture and verify
+  an exact Rust encode/decode round trip.
 - [ ] Run external `fo-dicom.Codecs` public-API interoperability fixtures.
-- [ ] Complete final review and commit the RLE implementation.
+- [x] Complete final review and commit the RLE implementation.
 
 ## Next implementation stages
 
-1. **RLE:** implement DICOM RLE header, segment layout, PackBits runs, frame mapping,
-   and exact round-trip tests.
-2. **JPEG:** implement marker/entropy primitives, sequential DCT, Process 14 predictors,
+1. **JPEG:** implement marker/entropy primitives, sequential DCT, Process 14 predictors,
    and four transfer syntax adapters.
-3. **JPEG-LS:** implement regular/run modes, context modeling, Golomb coding, interleave,
+2. **JPEG-LS:** implement regular/run modes, context modeling, Golomb coding, interleave,
    and near-lossless validation.
-4. **JPEG 2000:** implement classic codestream, transforms, quantization, Tier-1/Tier-2,
+3. **JPEG 2000:** implement classic codestream, transforms, quantization, Tier-1/Tier-2,
    and `.90/.91` adapters.
-5. **HTJ2K:** implement HT block coding and `.201/.202/.203` adapters.
+4. **HTJ2K:** implement HT block coding and `.201/.202/.203` adapters.
 
 Each stage must pass its focused tests and the previous stages before the next stage starts.
 
