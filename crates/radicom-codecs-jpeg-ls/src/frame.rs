@@ -64,6 +64,9 @@ impl Layout {
         if width == 0 || height == 0 {
             return Err("dimensions must be non-zero".into());
         }
+        if w > u32::from(u16::MAX) || h > u32::from(u16::MAX) {
+            return Err("dimensions exceed JPEG-LS limit".into());
+        }
         if !matches!(ba, 8 | 16) {
             return Err("BitsAllocated must be 8 or 16".into());
         }
@@ -131,14 +134,7 @@ impl Layout {
             } else {
                 u16::from_le_bytes([b[off], b[off + 1]])
             };
-            let v = raw & mask;
-            out.push(if self.signed {
-                let sign = 1u16 << (self.bits_stored - 1);
-                let s = ((v ^ sign).wrapping_sub(sign)) as i16;
-                (i32::from(s) + i32::from(sign)) as u16
-            } else {
-                v
-            });
+            out.push(raw & mask);
         }
         if self.pi == PhotometricInterpretation::YbrFull {
             color::ybr_to_rgb(&mut out, self.bits_stored)
@@ -162,11 +158,12 @@ impl Layout {
                 n
             };
             let off = logical * (self.bits_allocated / 8) as usize;
+            let value = s[n] & mask;
             let v = if self.signed {
                 let sign = 1i32 << (self.bits_stored - 1);
-                (i32::from(s[n]) - sign).rem_euclid(1 << self.bits_stored) as u16 & mask
+                ((i32::from(value) ^ sign) - sign) as i16 as u16
             } else {
-                s[n] & mask
+                value
             };
             if self.bits_allocated == 8 {
                 b[off] = v as u8
@@ -185,6 +182,17 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
     }
     if near > layout.maxval() / 2 {
         return Err("NEAR exceeds precision".into());
+    }
+    if layout.signed && near > 0 {
+        let sign = 1i32 << (layout.bits_stored - 1);
+        let lower = -sign + i32::from(near);
+        let upper = sign - 1 - i32::from(near);
+        if samples.iter().any(|&value| {
+            let signed = (i32::from(value) ^ sign) - sign;
+            signed < lower || signed > upper
+        }) {
+            return Err("signed samples must remain NEAR away from the signed limits".into());
+        }
     }
     let ilv = resolve_interleave(layout, p.interleave_mode)?;
     if p.color_transformation != 0 || p.preset_coding_params != 0 || p.reset_contexts {
@@ -264,15 +272,12 @@ pub(crate) fn decode(
     let preset = h
         .preset
         .unwrap_or(Preset::defaults(layout.maxval(), h.scan.near)?);
-    if preset.maxval != layout.maxval() {
-        return Err("preset MAXVAL mismatch".into());
-    }
     let (entropy, tail) = split_scan(data, h.scan_start)?;
     let cfg = ScanConfig {
         width: layout.width,
         height: layout.height,
         components: layout.components as usize,
-        maxval: layout.maxval(),
+        maxval: preset.maxval,
         near: h.scan.near,
         ilv: h.scan.ilv,
         preset,
@@ -362,5 +367,179 @@ mod tests {
         layout.planar = 1;
         assert_eq!(resolve_interleave(&layout, 0).unwrap(), 1);
         assert_eq!(resolve_interleave(&layout, 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn signed_subword_output_is_sign_extended() {
+        let mut layout = mono8();
+        layout.width = 4;
+        layout.bits_allocated = 16;
+        layout.bits_stored = 12;
+        layout.signed = true;
+        layout.frame_len = 8;
+        let native = [0x00, 0xf8, 0xff, 0xff, 0x00, 0x00, 0xff, 0x07];
+        let encoded = encode(&layout, &native, &JpegLsParams::default()).unwrap();
+        assert_eq!(
+            decode(&layout, &encoded, &JpegLsParams::default(), Some(0)).unwrap(),
+            native
+        );
+    }
+
+    #[test]
+    fn signed_encoding_preserves_the_unsigned_wire_bit_pattern() {
+        let mut layout = mono8();
+        layout.width = 4;
+        layout.frame_len = 4;
+        let raw = [128, 255, 0, 127];
+        let unsigned = encode(&layout, &raw, &JpegLsParams::default()).unwrap();
+        layout.signed = true;
+        assert_eq!(
+            encode(&layout, &raw, &JpegLsParams::default()).unwrap(),
+            unsigned
+        );
+    }
+
+    #[test]
+    fn signed_near_lossless_checks_signed_extrema_before_encoding() {
+        let mut layout = mono8();
+        layout.signed = true;
+        let params = JpegLsParams {
+            near_lossless: 3,
+            ..Default::default()
+        };
+        for raw in [128, 129, 130, 125, 126, 127] {
+            assert!(encode(&layout, &[raw], &params).is_err(), "sample={raw}");
+        }
+        for raw in [131, 255, 0, 124] {
+            assert!(encode(&layout, &[raw], &params).is_ok(), "sample={raw}");
+        }
+    }
+
+    #[test]
+    fn rejects_dimensions_that_cannot_be_signaled_before_encoding() {
+        assert!(Layout::values(
+            65536,
+            1,
+            8,
+            8,
+            1,
+            0,
+            0,
+            Some(PhotometricInterpretation::Monochrome2)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn malformed_codestream_mutations_never_panic() {
+        let layout = mono8();
+        let original = encode(&layout, &[7], &JpegLsParams::default()).unwrap();
+        for end in 0..original.len() {
+            assert!(decode(&layout, &original[..end], &JpegLsParams::default(), None).is_err());
+        }
+        for index in 0..original.len() {
+            for value in 0..=255 {
+                let mut bytes = original.clone();
+                bytes[index] = value;
+                let result = std::panic::catch_unwind(|| {
+                    decode(&layout, &bytes, &JpegLsParams::default(), None)
+                });
+                assert!(result.is_ok(), "index={index} value={value}");
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_lse_with_reduced_maxval_and_custom_reset() {
+        let mut layout = mono8();
+        layout.width = 32;
+        layout.height = 3;
+        layout.frame_len = 96;
+        let preset = Preset::new(100, 3, 7, 21, 8).unwrap();
+        let values = (0..96)
+            .map(|i| if i % 5 < 3 { 0 } else { i % 101 })
+            .collect::<Vec<u16>>();
+        let entropy = encode_scan(
+            ScanConfig {
+                width: 32,
+                height: 3,
+                components: 1,
+                maxval: 100,
+                near: 0,
+                ilv: 0,
+                preset,
+            },
+            &values,
+        )
+        .unwrap();
+        let mut encoded = Vec::new();
+        write_soi(&mut encoded);
+        write_sof55(
+            &mut encoded,
+            &FrameHeader {
+                precision: 8,
+                width: 32,
+                height: 3,
+                components: 1,
+            },
+        )
+        .unwrap();
+        encoded.extend([0xff, 0xf8, 0, 13, 1, 0, 100, 0, 3, 0, 7, 0, 21, 0, 8]);
+        write_sos(&mut encoded, 1, 0, 0).unwrap();
+        encoded.extend(entropy);
+        write_eoi(&mut encoded);
+        assert_eq!(
+            decode(&layout, &encoded, &JpegLsParams::default(), Some(0)).unwrap(),
+            values.iter().map(|v| *v as u8).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn deterministic_layout_matrix_preserves_samples_and_near_bound() {
+        for bits in 2..=16 {
+            let maxval = ((1u32 << bits) - 1) as u16;
+            for near in [0, 1, 3.min(maxval / 2), 255.min(maxval / 2)] {
+                for (width, height) in [(1, 1), (1, 17), (17, 1), (13, 9)] {
+                    for (components, planar, ilv) in [(1, 0, 0), (3, 0, 2), (3, 0, 3), (3, 1, 0)] {
+                        let layout = Layout {
+                            width,
+                            height,
+                            bits_allocated: if bits <= 8 { 8 } else { 16 },
+                            bits_stored: bits,
+                            components,
+                            planar,
+                            signed: false,
+                            pi: if components == 1 {
+                                PhotometricInterpretation::Monochrome2
+                            } else {
+                                PhotometricInterpretation::Rgb
+                            },
+                            frame_len: width
+                                * height
+                                * components as usize
+                                * if bits <= 8 { 1 } else { 2 },
+                        };
+                        let values = (0..width * height * components as usize)
+                            .map(|i| match i % 7 {
+                                0..=2 => 0,
+                                3 => maxval,
+                                _ => ((i * 7919 + i * i * 17) & usize::from(maxval)) as u16,
+                            })
+                            .collect::<Vec<_>>();
+                        let raw = layout.write(&values).unwrap();
+                        let params = JpegLsParams {
+                            near_lossless: u32::from(near),
+                            interleave_mode: ilv,
+                            ..Default::default()
+                        };
+                        let encoded = encode(&layout, &raw, &params).unwrap();
+                        let decoded = decode(&layout, &encoded, &params, None).unwrap();
+                        let actual = layout.read(&decoded).unwrap();
+                        assert!(values.iter().zip(&actual).all(|(a, b)| a.abs_diff(*b) <= near),
+                            "bits={bits}, near={near}, {width}x{height}, components={components}, planar={planar}, ilv={ilv}");
+                    }
+                }
+            }
+        }
     }
 }

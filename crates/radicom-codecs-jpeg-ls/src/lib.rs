@@ -102,6 +102,13 @@ fn operate(
             ))
         }
     };
+    if p.color_transformation != 0 || p.preset_coding_params != 0 || p.reset_contexts {
+        return Err(error(
+            codec,
+            if decode { "decode" } else { "encode" },
+            "requested JPEG-LS option is unsupported",
+        ));
+    }
     if syntax.uid() == syntaxes::JPEG_LS_LOSSLESS.uid() && p.near_lossless != 0 {
         return Err(error(
             codec,
@@ -154,6 +161,17 @@ fn operate(
         frame::update_decoded_color_metadata(dst, &layout);
         Ok(())
     } else {
+        if dst.transfer_syntax().uid() != syntax.uid() {
+            return Err(error(
+                codec,
+                "encode",
+                format!(
+                    "destination transfer syntax is {}, expected {}",
+                    dst.transfer_syntax().uid(),
+                    syntax.uid()
+                ),
+            ));
+        }
         if src.transfer_syntax().is_encapsulated() || !dst.transfer_syntax().is_encapsulated() {
             return Err(error(
                 codec,
@@ -162,6 +180,20 @@ fn operate(
             ));
         }
         let layout = Layout::source(src).map_err(|m| error(codec, "encode", m))?;
+        let destination = Layout::destination(dst).map_err(|m| error(codec, "encode", m))?;
+        if layout.width != destination.width
+            || layout.height != destination.height
+            || layout.bits_allocated != destination.bits_allocated
+            || layout.bits_stored != destination.bits_stored
+            || layout.components != destination.components
+            || layout.signed != destination.signed
+        {
+            return Err(error(
+                codec,
+                "encode",
+                "source and destination pixel layouts differ",
+            ));
+        }
         let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
         for i in 0..src.number_of_frames() {
             let b = src
@@ -445,6 +477,148 @@ mod facade_tests {
                 .as_ref(),
             &[128, 128, 128, 201, 62, 33, 0, 135, 0]
         );
+    }
+
+    #[test]
+    fn rejects_wrong_destination_uid_without_appending_a_frame() {
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            1,
+            8,
+            1,
+            0,
+            "MONOCHROME2",
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame([7])
+            .unwrap();
+        let mut target = source.clone();
+        target.set_transfer_syntax(syntaxes::JPEG_LS_NEAR_LOSSLESS.clone());
+        target.remove(Tag::PIXEL_DATA);
+        let result = JpegLsLosslessCodec.encode(
+            &PixelDataRef::from_dataset(&source).unwrap(),
+            &mut PixelData::create_new(&mut target).unwrap(),
+            &JpegLsLosslessCodec.default_params(),
+        );
+        assert!(result.is_err());
+        assert!(!target.contains(&Tag::PIXEL_DATA));
+    }
+
+    #[test]
+    fn rejects_incompatible_destination_metadata_before_encoding() {
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            1,
+            8,
+            1,
+            0,
+            "MONOCHROME2",
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame([7])
+            .unwrap();
+        let mut target = source.clone();
+        target.set_transfer_syntax(syntaxes::JPEG_LS_LOSSLESS.clone());
+        target.remove(Tag::PIXEL_DATA);
+        target.insert_value(Tag::COLUMNS, 2u16);
+        assert!(JpegLsLosslessCodec
+            .encode(
+                &PixelDataRef::from_dataset(&source).unwrap(),
+                &mut PixelData::create_new(&mut target).unwrap(),
+                &JpegLsLosslessCodec.default_params()
+            )
+            .is_err());
+        assert!(!target.contains(&Tag::PIXEL_DATA));
+    }
+
+    #[test]
+    fn rejects_unsupported_decode_options_without_appending_frames() {
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            1,
+            8,
+            1,
+            0,
+            "MONOCHROME2",
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame([7])
+            .unwrap();
+        let mut encoded = source.clone();
+        encoded.set_transfer_syntax(syntaxes::JPEG_LS_LOSSLESS.clone());
+        encoded.remove(Tag::PIXEL_DATA);
+        JpegLsLosslessCodec
+            .encode(
+                &PixelDataRef::from_dataset(&source).unwrap(),
+                &mut PixelData::create_new(&mut encoded).unwrap(),
+                &JpegLsLosslessCodec.default_params(),
+            )
+            .unwrap();
+        for params in [
+            CodecParams::None,
+            CodecParams::JpegLs(JpegLsParams {
+                color_transformation: 1,
+                ..Default::default()
+            }),
+            CodecParams::JpegLs(JpegLsParams {
+                preset_coding_params: 1,
+                ..Default::default()
+            }),
+            CodecParams::JpegLs(JpegLsParams {
+                reset_contexts: true,
+                ..Default::default()
+            }),
+        ] {
+            let mut target = source.clone();
+            target.remove(Tag::PIXEL_DATA);
+            assert!(JpegLsLosslessCodec
+                .decode(
+                    &PixelDataRef::from_dataset(&encoded).unwrap(),
+                    &mut PixelData::create_new(&mut target).unwrap(),
+                    &params
+                )
+                .is_err());
+            assert!(!target.contains(&Tag::PIXEL_DATA));
+        }
+    }
+
+    #[test]
+    fn malformed_later_frame_leaves_destination_without_partial_output() {
+        let mut source = ds(
+            syntaxes::JPEG_LS_LOSSLESS.clone(),
+            1,
+            1,
+            8,
+            1,
+            0,
+            "MONOCHROME2",
+        );
+        let layout = Layout::destination(&PixelData::create_new(&mut source).unwrap()).unwrap();
+        let valid = frame::encode(&layout, &[7], &JpegLsParams::default()).unwrap();
+        {
+            let mut pixels = PixelData::create_new(&mut source).unwrap();
+            pixels.add_frame(valid).unwrap();
+            pixels.add_frame([0xff, 0xd8, 0xff, 0xd9]).unwrap();
+        }
+        let mut target = source.clone();
+        target.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        target.remove(Tag::PIXEL_DATA);
+        let error = JpegLsLosslessCodec
+            .decode(
+                &PixelDataRef::from_dataset(&source).unwrap(),
+                &mut PixelData::create_new(&mut target).unwrap(),
+                &JpegLsLosslessCodec.default_params(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::Codec(_)));
+        assert!(error.to_string().contains("frame 1"));
+        assert!(!target.contains(&Tag::PIXEL_DATA));
     }
 }
 #[test]

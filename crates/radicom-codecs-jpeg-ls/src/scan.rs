@@ -106,9 +106,17 @@ fn decode_regular(
     let sign = if qs < 0 { -1 } else { 1 };
     let corrected = correct_prediction(predict(ra, rb, rc) + sign * ctx.bias(), c.maxval as i32);
     let k = ctx.k();
-    let mut error = unmap_error(decode_mapped(r, k, limit, qbpp)?);
+    let mapped = decode_mapped(r, k, limit, qbpp)?;
+    let range = c.preset.range(c.near);
+    if mapped > range {
+        return Err("mapped prediction error exceeds RANGE".into());
+    }
+    let mut error = unmap_error(mapped);
     if k == 0 && c.near == 0 {
         error ^= ctx.correction(k);
+    }
+    if error < -(range as i32 / 2) || error > (range as i32 - 1) / 2 {
+        return Err("prediction error exceeds RANGE".into());
     }
     ctx.update(error, c.near as i32, c.preset.reset as i32);
     Ok(reconstructed(
@@ -172,7 +180,14 @@ fn decode_run_interrupt(
     };
     let k = contexts[typ].k();
     let mapped = decode_mapped(r, k, limit - u32::from(J[run_index]) - 1, qbpp)? as i32;
+    let range = c.preset.range(c.near) as i32;
+    if mapped > range {
+        return Err("mapped run interruption error exceeds RANGE".into());
+    }
     let error = contexts[typ].decode_value(mapped + typ as u32 as i32, k, c.preset.reset as i32);
+    if error < -(range / 2) || error > (range - 1) / 2 {
+        return Err("run interruption error exceeds RANGE".into());
+    }
     Ok(reconstructed(reference, error, sign, near, c.maxval as i32))
 }
 
@@ -684,6 +699,25 @@ fn decode_line_scan(c: ScanConfig, entropy: &[u8]) -> Result<Vec<u16>, String> {
 mod tests {
     use super::*;
     #[test]
+    fn gradient_quantization_addresses_all_regular_contexts() {
+        let preset = Preset::defaults(255, 0).unwrap();
+        let gradients = [-30, -10, -4, -1, 0, 1, 4, 10, 30];
+        let mut visited = [false; 365];
+        for d1 in gradients {
+            for d2 in gradients {
+                for d3 in gradients {
+                    let rb = 128;
+                    let rc = rb - d2;
+                    let ra = rc - d3;
+                    let rd = rb + d1;
+                    visited[context_id(ra, rb, rc, rd, &preset, 0).unsigned_abs() as usize] = true;
+                }
+            }
+        }
+        assert!(visited.iter().all(|value| *value));
+    }
+
+    #[test]
     fn round_trips_small_mono_and_rgb_images() {
         for &(components, width, height) in &[(1, 5, 3), (3, 4, 2)] {
             let maxval = 255;
@@ -804,18 +838,42 @@ mod tests {
                 })
             })
             .collect();
+        for (components, ilv) in [(1, 0), (3, 1), (3, 2)] {
+            let samples: Vec<u16> = values
+                .iter()
+                .flat_map(|&value| std::iter::repeat_n(value, components))
+                .collect();
+            let cfg = ScanConfig {
+                width,
+                height,
+                components,
+                maxval: 255,
+                near: 0,
+                ilv,
+                preset,
+            };
+            assert_eq!(
+                decode_scan(cfg, &encode_scan(cfg, &samples).unwrap()).unwrap(),
+                samples,
+                "components={components}, ilv={ilv}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_prediction_errors_outside_the_sample_range() {
         let cfg = ScanConfig {
-            width,
-            height,
+            width: 1,
+            height: 1,
             components: 1,
-            maxval: 255,
+            maxval: 3,
             near: 0,
             ilv: 0,
-            preset,
+            preset: Preset::defaults(3, 0).unwrap(),
         };
-        assert_eq!(
-            decode_scan(cfg, &encode_scan(cfg, &values).unwrap()).unwrap(),
-            values
-        );
+        let mut writer = BitWriter::new();
+        writer.write_bit(false); // Zero-length run, followed by an interruption.
+        encode_mapped(&mut writer, 1, 8, 19, 2).unwrap();
+        assert!(decode_scan(cfg, &writer.finish()).is_err());
     }
 }

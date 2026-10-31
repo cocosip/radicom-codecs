@@ -32,15 +32,15 @@ pub(crate) fn decode_mapped(
     limit: u32,
     qbpp: u8,
 ) -> Result<u32, String> {
+    let threshold = limit.saturating_sub(u32::from(qbpp) + 1);
     let mut high = 0;
     while !r.read_bit()? {
         high += 1;
-        if high > limit + 1 {
+        if high > threshold {
             return Err("Golomb unary exceeds limit".into());
         }
     }
-    let threshold = limit.saturating_sub(u32::from(qbpp) + 1);
-    if high >= threshold {
+    if high == threshold {
         Ok(r.read_bits(qbpp)?.saturating_add(1))
     } else {
         let rem = if k > 0 { r.read_bits(k)? } else { 0 };
@@ -61,5 +61,16 @@ mod tests {
                 assert_eq!(decode_mapped(&mut r, k, 64, 8).unwrap(), m)
             }
         }
+    }
+
+    #[test]
+    fn rejects_unary_prefix_longer_than_the_escape_threshold() {
+        let mut writer = BitWriter::new();
+        // LIMIT=32, QBPP=8 permits exactly 23 leading zero bits.
+        writer.write_bits(0, 24).unwrap();
+        writer.write_bit(true);
+        writer.write_bits(0, 8).unwrap();
+        let bytes = writer.finish();
+        assert!(decode_mapped(&mut BitReader::new(&bytes), 0, 32, 8).is_err());
     }
 }

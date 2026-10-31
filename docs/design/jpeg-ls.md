@@ -14,7 +14,7 @@ Types: radicom_codecs_jpeg_ls::JpegLsLosslessCodec
 ```
 
 The result must be a pure Rust encoder and decoder. The CharLS implementation
-vendored in `D:\dotnet\source\fo-dicom.Codecs\Native\Common\CharLS` and the
+vendored in `fo-dicom.Codecs/Native/Common/CharLS` and the
 adapter in `Codec\DicomJpegLsCodec.cs` are algorithm and compatibility
 references only. The Rust crate must not compile or link that C/C++ code, use
 FFI/P/Invoke, spawn a codec process, or add a native build step.
@@ -29,10 +29,10 @@ public parameter type.
 - ISO/IEC 14495-1 / ITU-T T.87, JPEG-LS lossless and near-lossless coding.
 - DICOM PS3.5, JPEG-LS transfer syntaxes and encapsulated Pixel Data.
 - DICOM PS3.3, Image Pixel Module and Photometric Interpretation rules.
-- `D:\dotnet\source\fo-dicom.Codecs\Codec\DicomJpegLsCodec.cs`.
-- `D:\dotnet\source\fo-dicom.Codecs\Native\Dicom.Imaging.Codec.JpegLS.cpp`.
-- `D:\dotnet\source\fo-dicom.Codecs\Tests\Acceptance\PM5644-960x540_JPEG-LS_Lossless.dcm`.
-- `D:\dotnet\source\fo-dicom.Codecs\Tests\Acceptance\PM5644-960x540_JPEG-LS_NearLossless.dcm`.
+- `fo-dicom.Codecs/Codec/DicomJpegLsCodec.cs`.
+- `fo-dicom.Codecs/Native/Dicom.Imaging.Codec.JpegLS.cpp`.
+- `fo-dicom.Codecs/Tests/Acceptance/PM5644-960x540_JPEG-LS_Lossless.dcm`.
+- `fo-dicom.Codecs/Tests/Acceptance/PM5644-960x540_JPEG-LS_NearLossless.dcm`.
 
 CharLS is used as a behavior oracle while porting. A Rust function may be
 checked against the corresponding CharLS routine, but the Rust implementation
@@ -142,16 +142,20 @@ The first release accepts the following source and destination layouts:
 | 8 | 2..=8 | 3 | 0 | RGB/YBR_FULL | RGB-normalized exact or NEAR-bounded |
 | 8 | 2..=8 | 3 | 1 | RGB | planar-to-interleaved normalization |
 | 16 | 2..=16 | 3 | 0 | RGB/YBR_FULL | RGB-normalized component preservation |
+| 16 | 2..=16 | 3 | 1 | RGB | planar-to-interleaved normalization |
 
 `BitsAllocated` must be 8 or 16, `BitsStored <= BitsAllocated`, dimensions must
 be non-zero, `SamplesPerPixel` must be 1 or 3, and `PixelRepresentation` must
 be 0 or 1. Samples are read in the native DICOM byte order already guaranteed by
-`PixelDataRef`. Signed samples use an explicit offset mapping: for `b =
-BitsStored`, decode the DICOM two's-complement value `s` and pass
-`u = s + 2^(b-1)` to JPEG-LS with `MAXVAL = 2^b-1`; decoding reverses the
-offset and sign-extends to `BitsAllocated`. The NEAR bound is measured after
-the inverse mapping in the signed sample domain, so the offset does not change
-the allowed absolute error.
+`PixelDataRef`. Signed samples preserve their `BitsStored` two's-complement
+bit patterns in the JPEG-LS stream, matching fo-dicom. No sample-value offset is
+applied. On decode the adapter sign-extends to `BitsAllocated`.
+For signed near-lossless encoding, each source value `s` must satisfy
+`-2^(b-1)+NEAR <= s <= 2^(b-1)-1-NEAR`, where `b = BitsStored`.
+Values outside that range are rejected before any frame is appended, because
+the unsigned JPEG-LS NEAR bound can otherwise cross the signed discontinuity.
+Error is measured in the signed sample domain, including transitions through
+zero.
 
 The adapter accepts `YBR_FULL` by converting each frame to full-range RGB before
 JPEG-LS coding, matching fo-dicom's `YbrFullToRgb` path. The destination
@@ -166,13 +170,13 @@ visible in DICOM metadata:
 
 - RGB data is preserved as three components; no RGB-to-YBR transform is
   performed by the first Rust release.
-- YBR_FULL is converted to RGB before encoding. The integer conversion helper is
-  shared by encode/decode tests and its maximum per-component conversion delta
-  is reported separately from JPEG-LS's NEAR error.
+- YBR_FULL is converted to RGB before encoding. The conversion uses fo-dicom's
+  full-range coefficients and rounding, with the chroma center at `2^(bits-1)`.
+  Codec error bounds apply to the normalized RGB samples.
 - Planar RGB is normalized to interleaved bytes for the core and repacked only
   after a successful decode when the destination explicitly requires planar
   storage.
-- Signed RGB components use the offset mapping above. Signed YBR_FULL is
+- Signed RGB components preserve the two's-complement bit pattern above. Signed YBR_FULL is
   rejected because the DICOM YBR-to-RGB conversion is defined for unsigned
   samples.
 - The codestream's component count and sample precision must match the DICOM
@@ -201,6 +205,14 @@ Rust slices and checked arithmetic replace raw pointers and caller-sized output
 buffers; every parser returns `Result`; and the core never writes into the
 destination dataset directly.
 
+The reference routines are `jpeg_stream_reader`/`jpeg_stream_writer` for markers,
+`encoder_strategy`/`decoder_strategy` for stuffed bit I/O and Golomb coding,
+`jpegls_preset_coding_parameters::compute_default` for T.87 C.2/C.3 thresholds,
+`context_regular_mode`/`context_run_mode` for statistics, and `scan.h` for the
+predictor and run state machine. The low-precision threshold factor and the
+C.3 fallback to the lower bound are covered explicitly; ordinary numeric
+clamping is not equivalent at large NEAR.
+
 ### Marker and segment rules
 
 Encoder output is one interleaved or non-interleaved JPEG-LS scan per frame:
@@ -225,6 +237,10 @@ The decoder accepts legal LSE preset segments. Restart intervals and RST
 markers are rejected in this release; the encoder emits neither custom LSE
 values nor restart markers because the public parameter contract has no
 restart interval field.
+Zero-valued LSE fields select defaults; thresholds must satisfy
+`NEAR+1 <= T1 <= T2 <= T3 <= MAXVAL`, and RESET must be in
+`3..=max(255, MAXVAL)`. Nonzero SOS mapping-table selectors and HP color
+transformation signals in APP8 are rejected instead of being ignored.
 
 ### JPEG-LS scan algorithm
 
@@ -300,7 +316,7 @@ Each stage ends with its own focused tests and keeps earlier stages passing.
    - Prove signed mapping, `k` selection, bias updates, reset arithmetic, and
      exact reconstruction on small synthetic rows.
 3. **Run mode and complete scan state machine**
-   - Implement `run.rs`, restart handling, line boundaries, and None/Line/Sample
+   - Implement `run.rs`, restart rejection, line boundaries, and None/Line/Sample
      traversal.
    - Add encoder/decoder byte-for-byte fixtures generated from the Rust core and
      decode fixtures produced by CharLS.
@@ -309,8 +325,8 @@ Each stage ends with its own focused tests and keeps earlier stages passing.
      layout/color policy above.
    - Set the near-lossless codec default to `near_lossless = 3`; enforce `0` for
      the lossless codec.
-   - Add multi-frame, odd-length padding, planar RGB, signed 8/16-bit offset
-     mapping,
+   - Add multi-frame, odd-length padding, planar RGB, signed 8/16-bit wire
+     preservation and near-lossless boundary checks,
      wrong-parameter, wrong-syntax, and no-partial-frame tests.
 5. **Interoperability and hardening**
    - Decode both fo-dicom acceptance DICOM files in Rust.
@@ -329,14 +345,14 @@ Each stage ends with its own focused tests and keeps earlier stages passing.
   parameters.
 - All regular contexts, predictor edge cases, signed mapping around zero,
   Golomb `k=0` and large `k`, bias correction, and context reset.
-- Run lengths at zero, one, full-row, end-of-line, and restart boundaries.
+- Run lengths at zero, one, full-row, end-of-line, and rejection of restart markers.
 - Exact lossless 8/16-bit round trips and near-lossless checks for NEAR values
-  `1`, `3`, and `MAXVAL` on deterministic synthetic images.
+  `1`, `min(3, MAXVAL/2)`, and `min(255, MAXVAL/2)` on deterministic synthetic images.
 
 ### DICOM adapter checks
 
 - One and three components, interleaved and planar RGB, 8/16 `BitsAllocated`,
-  non-byte-aligned `BitsStored`, signed offset mapping, and multi-frame order.
+  non-byte-aligned `BitsStored`, signed bit preservation/sign extension, and multi-frame order.
 - Native-to-encapsulated and encapsulated-to-native paths through
   `radicom::pixel::transcoder::Transcoder`.
 - DICOM padding, fragment sequence handling, wrong transfer syntax, wrong
@@ -358,7 +374,7 @@ Each stage ends with its own focused tests and keeps earlier stages passing.
 - Lossless comparisons are byte/sample exact after DICOM native byte order and
   planar rules. Near-lossless comparisons report maximum absolute sample error,
   not only visual similarity.
-- The acceptance matrix records real database/file fixtures separately from
+- The acceptance matrix records external file fixtures separately from
   local unit and property checks; a successful Rust round trip alone is not
   claimed as cross-implementation proof.
 
@@ -389,9 +405,10 @@ Implementation changes are confined to:
   an additional public re-export; registration already exists.
 - Add focused tests beside each private module and a facade/transcoder test under
   `crates/radicom-codecs/tests/` for public behavior.
-- Keep fo-dicom DICOM files outside the repository unless their redistribution
-  license is confirmed; otherwise store small generated codestream fixtures and
-  document the external fixture paths used for interoperability.
+- Keep all fo-dicom interoperability harnesses, samples, generated streams and
+  raw comparison outputs under the ignored `.interop/` directory. They must not
+  be staged or committed. Portable Rust-only unit and integration tests remain
+  in their owning crates.
 
 No Cargo dependency is required for the core implementation. Any future pure
 Rust helper dependency requires a separate license, audit, and benchmark review;
@@ -404,3 +421,27 @@ encapsulated transcoding, all focused tests and workspace tests pass, malformed
 input returns managed errors without partial frames, the lossless fixture is
 sample-exact, the near-lossless fixture meets its stated bound, and fo-dicom
 successfully decodes Rust output in both directions for the supported layouts.
+
+### Verified evidence (2026-11-01)
+
+- The portable deterministic matrix exercises all precisions 2..=16, mono,
+  RGB Line/Sample, planar normalization, one-pixel edges, runs, and NEAR bounds.
+  Separate regressions cover all 365 context addresses, stuffed terminal FF,
+  malformed unary codes, LSE resolution, HP/mapping rejection, signed extrema,
+  wrong UID/geometry, and failure of a later frame without partial output.
+- The facade integration test uses the real registry/Transcoder for both UIDs,
+  two frames, a Basic Offset Table with multiple fragments per frame, signed
+  8/12/16-bit samples and planar 8/16-bit RGB.
+- The ignored `.interop/matrix.py` and `.interop/matrix-rust/` harnesses run
+  300 bidirectional CharLS cases. They pass the original signed two's-complement
+  bytes directly to the native encoder; comparisons apply only DICOM planar
+  ordering and sign extension, never a sample offset. Lossless samples are
+  exact; each near-lossless error is <= the requested NEAR. Rust and native
+  decoders also reconstruct each native-generated stream identically.
+- Rust decodes both 960x540 fo-dicom acceptance files. Each 1,555,200-byte
+  reconstruction matches a fresh native decode of the same stream exactly.
+- Custom RESET=8 is independently checked with native None/Line streams.
+  Sample plus custom RESET has Rust scan coverage; the bundled native oracle
+  does not supply a usable independent check for this combination.
+- Interoperability tools, native binaries, sample files, manifests, and JSON
+  results remain ignored and are excluded from commits.

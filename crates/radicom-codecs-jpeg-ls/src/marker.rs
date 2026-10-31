@@ -113,6 +113,12 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
             if ids.iter().enumerate().any(|(i, id)| ids[..i].contains(id)) {
                 return Err("duplicate SOS component id".into());
             }
+            if q[1..1 + 2 * ns as usize]
+                .chunks(2)
+                .any(|component| component[1] != 0)
+            {
+                return Err("JPEG-LS mapping tables are unsupported".into());
+            }
             let base = 1 + 2 * ns as usize;
             let ilv = q[base + 1];
             if ilv > 2 {
@@ -193,9 +199,18 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
                 if preset.is_some() {
                     return Err("duplicate LSE".into());
                 }
-                preset = Some(super::preset::Preset::new(
-                    vals[0], vals[1], vals[2], vals[3], vals[4],
-                )?);
+                preset = Some(super::preset::Preset {
+                    maxval: vals[0],
+                    t1: vals[1],
+                    t2: vals[2],
+                    t3: vals[3],
+                    reset: vals[4],
+                });
+            }
+            0xe8 if q.starts_with(b"mrfx") => {
+                if q.len() != 5 || q[4] != 0 {
+                    return Err("HP JPEG-LS color transforms are unsupported".into());
+                }
             }
             0xe0..=0xef | 0xfe => {}
             _ => return Err(format!("unsupported marker ff{code:02x}")),
@@ -210,6 +225,10 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
     if frame_ids != scan_ids {
         return Err("SOS component ids do not match SOF55".into());
     }
+    let maximum = ((1u32 << frame.precision) - 1) as u16;
+    let preset = preset
+        .map(|value| value.resolve(maximum, scan.near))
+        .transpose()?;
     Ok(ParsedHeader {
         frame,
         scan,
@@ -250,6 +269,53 @@ pub(crate) fn split_scan(data: &[u8], start: usize) -> Result<(&[u8], usize), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn header_with_segments(segments: &[(u8, &[u8])], near: u16) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_soi(&mut bytes);
+        write_sof55(
+            &mut bytes,
+            &FrameHeader {
+                precision: 8,
+                width: 1,
+                height: 1,
+                components: 1,
+            },
+        )
+        .unwrap();
+        for (code, payload) in segments {
+            segment(&mut bytes, *code, payload).unwrap();
+        }
+        write_sos(&mut bytes, 1, near, 0).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn rejects_hp_transform_instead_of_skipping_its_app8_signal() {
+        let bytes = header_with_segments(&[(0xe8, b"mrfx\x01")], 0);
+        assert!(parse_header(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_sos_mapping_table_selector() {
+        let mut bytes = header_with_segments(&[], 0);
+        let length = bytes.len();
+        bytes[length - 4] = 1;
+        assert!(parse_header(&bytes).is_err());
+    }
+
+    #[test]
+    fn resolves_zero_lse_fields_and_checks_near_thresholds() {
+        let p = [1, 0, 255, 0, 0, 0, 0, 0, 0, 0, 8];
+        let parsed = parse_header(&header_with_segments(&[(0xf8, &p)], 3)).unwrap();
+        let preset = parsed.preset.unwrap();
+        assert_eq!(
+            [preset.t1, preset.t2, preset.t3, preset.reset],
+            [12, 22, 42, 8]
+        );
+        let invalid = [1, 0, 255, 0, 1, 0, 7, 0, 21, 0, 64];
+        assert!(parse_header(&header_with_segments(&[(0xf8, &invalid)], 3)).is_err());
+    }
 
     #[test]
     fn sos_rejects_near_values_that_do_not_fit_the_wire_field() {

@@ -1,15 +1,15 @@
 # radicom-codecs development plan and status
 
-**Date:** 2026-10-31
-**Current milestone:** classic JPEG implementation
-**Status:** complete locally; native fo-dicom decode validation passed
+**Date:** 2026-11-01
+**Current milestone:** JPEG-LS implementation and interoperability hardening
+**Status:** JPEG-LS local verification and interoperability audit complete
 
 ## Scope of this milestone
 
 The workspace and registration boundary are complete. The RLE Lossless family
 and the four classic JPEG transfer syntaxes are integrated through the existing
-`radicom` codec trait and registry. JPEG-LS, JPEG 2000, and HTJ2K remain
-placeholder registrations.
+`radicom` codec trait and registry. Both JPEG-LS transfer syntaxes now have pure
+Rust implementations; JPEG 2000 and HTJ2K remain placeholder registrations.
 
 The `radicom` dependency is a local path dependency. CI is intentionally deferred
 until `radicom` has been published and the project can consume the released package.
@@ -22,7 +22,8 @@ until `radicom` has been published and the project can consume the released pack
 - `crates/radicom-codecs-rle`: RLE Lossless implementation and registration.
 - `crates/radicom-codecs-jpeg`: classic JPEG marker, entropy, DCT, sequential,
   lossless, and frame-adapter implementation.
-- `crates/radicom-codecs-jpeg-ls`: two JPEG-LS registration skeletons.
+- `crates/radicom-codecs-jpeg-ls`: JPEG-LS Lossless/Near-Lossless algorithms,
+  codestream validation, and DICOM frame adapters.
 - `crates/radicom-codecs-jpeg2000`: classic JPEG 2000 and three HTJ2K registration skeletons.
 - `tests` (facade unit tests for now): registration and transcoder-boundary checks.
 
@@ -88,13 +89,28 @@ until `radicom` has been published and the project can consume the released pack
   implemented transfer syntaxes; Process 2/4 still has no reference fixture.
 - [x] Complete final review of the RLE and classic JPEG implementations.
 
+### JPEG-LS implementation status
+
+- [x] Implement pure Rust Lossless/Near-Lossless through the existing codec boundary.
+- [x] Support 2..=16-bit precision, mono None, RGB Line/Sample, planar normalization,
+  signed two's-complement preservation and YBR_FULL-to-RGB conversion.
+- [x] Validate signed near-lossless extrema, UIDs, geometry, presets, markers, and
+  entropy completion before exposing frames.
+- [x] Cover multiframe and fragmented Pixel Data through the real registry/Transcoder.
+- [x] Decode both fo-dicom acceptance fixtures exactly against native decodes.
+- [x] Verify 300 bidirectional native CharLS cases using unshifted signed wire data.
+- [x] Keep external harnesses, binaries, fixtures and results under ignored `.interop/`.
+
+Restart intervals/RST, HP transforms, mapping tables and encoder custom-preset/reset
+flags are explicitly rejected. Custom LSE decoding is supported. Full details and
+the distinction between portable tests and native evidence are in
+[the JPEG-LS implementation contract](../design/jpeg-ls.md).
+
 ## Next implementation stages
 
-1. **JPEG-LS:** implement regular/run modes, context modeling, Golomb coding, interleave,
-   and near-lossless validation.
-2. **JPEG 2000:** implement classic codestream, transforms, quantization, Tier-1/Tier-2,
+1. **JPEG 2000:** implement classic codestream, transforms, quantization, Tier-1/Tier-2,
    and `.90/.91` adapters.
-3. **HTJ2K:** implement HT block coding and `.201/.202/.203` adapters.
+2. **HTJ2K:** implement HT block coding and `.201/.202/.203` adapters.
 
 Each stage must pass its focused tests and the previous stages before the next stage starts.
 

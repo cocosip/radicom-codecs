@@ -85,9 +85,10 @@ impl<'a> BitReader<'a> {
         }
         Ok(v)
     }
-    pub(crate) fn finish(self) -> Result<(), String> {
-        if self.previous_ff {
-            return Err("truncated JPEG-LS stuffed bit".into());
+    pub(crate) fn finish(mut self) -> Result<(), String> {
+        if self.previous_ff && self.left == 0 {
+            // A full final 0xff still needs a stuffed zero and zero padding.
+            self.fill()?;
         }
         if self.left > 0 {
             let mask = if self.left == 8 {
@@ -142,6 +143,24 @@ mod tests {
     #[test]
     fn rejects_non_zero_padding_bits() {
         let mut reader = BitReader::new(&[0b1000_0001]);
+        assert!(reader.read_bit().unwrap());
+        assert!(reader.finish().is_err());
+    }
+
+    #[test]
+    fn accepts_zero_stuffing_after_a_final_full_ff_byte() {
+        let mut writer = BitWriter::new();
+        writer.write_bits(255, 8).unwrap();
+        let bytes = writer.finish();
+        assert_eq!(bytes, [255, 0]);
+        let mut reader = BitReader::new(&bytes);
+        assert_eq!(reader.read_bits(8).unwrap(), 255);
+        reader.finish().unwrap();
+    }
+
+    #[test]
+    fn rejects_nonzero_padding_in_a_partially_consumed_ff_byte() {
+        let mut reader = BitReader::new(&[255, 0]);
         assert!(reader.read_bit().unwrap());
         assert!(reader.finish().is_err());
     }
