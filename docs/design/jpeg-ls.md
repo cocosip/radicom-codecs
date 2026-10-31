@@ -106,8 +106,8 @@ boundary as numeric fields. The JPEG-LS crate owns their validation and mapping.
 
 | Field | Codec meaning | Validation and mapping |
 | --- | --- | --- |
-| `near_lossless` | JPEG-LS `NEAR` value | `.80` requires `0`; `.81` accepts `0..=MAXVAL`, with default `3`; `NEAR=0` is mathematically lossless even when the near-lossless UID is selected |
-| `interleave_mode` | Scan interleave selection | `0` = none; `1` = DICOM planar input normalized to none; `2` = line; `3` = sample. The value `1` is an adapter/storage mode, not a T.87 codestream interleave mode |
+| `near_lossless` | JPEG-LS `NEAR` value | `.80` requires `0`; `.81` accepts `0..=min(255, MAXVAL/2)`, with default `3`; `NEAR=0` is mathematically lossless even when the near-lossless UID is selected |
+| `interleave_mode` | Scan interleave selection | `0` = derive from DICOM storage; `1` = planar DICOM input (encoded with line interleave); `2` = line; `3` = sample. The value `1` is an adapter/storage mode, not a T.87 codestream interleave mode |
 | `color_transformation` | HP1/HP2/HP3 transform selector | `0` = none; `1..=3` are accepted only when the chosen RGB policy supports the transform; first release defaults to `0` and rejects transforms rather than silently changing samples |
 | `preset_coding_params` | Request custom LSE preset parameters | `0` uses T.87 defaults; non-zero is reserved until a concrete preset structure exists and is rejected with a managed error |
 | `reset_contexts` | Context reset policy | `false` uses the standard reset value; `true` is rejected until restart/context-reset signaling is implemented and tested |

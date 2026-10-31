@@ -186,13 +186,7 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
     if near > layout.maxval() / 2 {
         return Err("NEAR exceeds precision".into());
     }
-    let ilv = if layout.components == 1 { 0 } else { 2 };
-    if p.interleave_mode != 0
-        && p.interleave_mode != 3
-        && !(p.interleave_mode == 1 && layout.planar == 1)
-    {
-        return Err("unsupported interleave mode".into());
-    }
+    let ilv = resolve_interleave(layout, p.interleave_mode)?;
     if p.color_transformation != 0 || p.preset_coding_params != 0 || p.reset_contexts {
         return Err("requested JPEG-LS option is unsupported".into());
     }
@@ -220,6 +214,26 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
     out.extend(entropy);
     write_eoi(&mut out);
     Ok(out)
+}
+
+fn resolve_interleave(layout: &Layout, requested: u32) -> Result<u8, String> {
+    match layout.components {
+        1 if requested == 0 => Ok(0),
+        1 => Err("monochrome JPEG-LS requires interleave mode None".into()),
+        3 => match requested {
+            // Mode zero follows DICOM storage: planar data uses line
+            // interleave, while interleaved data uses sample interleave.
+            0 => Ok(if layout.planar == 1 { 1 } else { 2 }),
+            // Mode one describes planar DICOM input; JPEG-LS represents it
+            // with line interleave after the adapter normalizes the samples.
+            1 if layout.planar == 1 => Ok(1),
+            1 => Err("interleave mode Planar requires PlanarConfiguration=1".into()),
+            2 => Ok(1),
+            3 => Ok(2),
+            _ => Err("unsupported interleave mode".into()),
+        },
+        _ => Err("unsupported component count".into()),
+    }
 }
 pub(crate) fn decode(
     layout: &Layout,
@@ -279,6 +293,13 @@ pub(crate) fn update_color_metadata(dst: &mut PixelData<'_>, layout: &Layout) {
     }
 }
 
+pub(crate) fn update_decoded_color_metadata(dst: &mut PixelData<'_>, layout: &Layout) {
+    if layout.components == 3 {
+        dst.dataset_mut()
+            .insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "RGB");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +345,22 @@ mod tests {
             Some(PhotometricInterpretation::YbrFull),
         )
         .is_err());
+    }
+
+    #[test]
+    fn resolves_interleave_from_storage_and_explicit_modes() {
+        let mut layout = mono8();
+        assert_eq!(resolve_interleave(&layout, 0).unwrap(), 0);
+        assert!(resolve_interleave(&layout, 3).is_err());
+
+        layout.components = 3;
+        layout.planar = 0;
+        assert_eq!(resolve_interleave(&layout, 0).unwrap(), 2);
+        assert_eq!(resolve_interleave(&layout, 2).unwrap(), 1);
+        assert_eq!(resolve_interleave(&layout, 3).unwrap(), 2);
+
+        layout.planar = 1;
+        assert_eq!(resolve_interleave(&layout, 0).unwrap(), 1);
+        assert_eq!(resolve_interleave(&layout, 1).unwrap(), 1);
     }
 }

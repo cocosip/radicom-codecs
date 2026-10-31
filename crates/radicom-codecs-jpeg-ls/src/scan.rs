@@ -140,7 +140,7 @@ fn encode_run_interrupt(
         (0usize, quantized_error((x - rb) * sign, near, range))
     };
     let k = contexts[typ].k();
-    let mapped = contexts[typ].encode_value(error, k);
+    let mapped = contexts[typ].encode_value(error, k, c.preset.reset as i32);
     encode_mapped(w, k, mapped, limit - u32::from(J[run_index]) - 1, qbpp)
         .expect("bounded run Golomb parameters");
     let sign = if typ == 1 {
@@ -172,7 +172,7 @@ fn decode_run_interrupt(
     };
     let k = contexts[typ].k();
     let mapped = decode_mapped(r, k, limit - u32::from(J[run_index]) - 1, qbpp)? as i32;
-    let error = contexts[typ].decode_value(mapped + typ as u32 as i32, k);
+    let error = contexts[typ].decode_value(mapped + typ as u32 as i32, k, c.preset.reset as i32);
     Ok(reconstructed(reference, error, sign, near, c.maxval as i32))
 }
 
@@ -780,6 +780,37 @@ mod tests {
             maxval: 255,
             near: 0,
             ilv: 1,
+            preset,
+        };
+        assert_eq!(
+            decode_scan(cfg, &encode_scan(cfg, &values).unwrap()).unwrap(),
+            values
+        );
+    }
+
+    #[test]
+    fn round_trips_run_interruptions_with_custom_reset() {
+        let preset = Preset::new(255, 3, 7, 21, 8).unwrap();
+        let width = 32;
+        let height = 12;
+        let values: Vec<u16> = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    if x + 1 == width {
+                        ((y * 17) % 256) as u16
+                    } else {
+                        ((y * 17) % 2) as u16
+                    }
+                })
+            })
+            .collect();
+        let cfg = ScanConfig {
+            width,
+            height,
+            components: 1,
+            maxval: 255,
+            near: 0,
+            ilv: 0,
             preset,
         };
         assert_eq!(

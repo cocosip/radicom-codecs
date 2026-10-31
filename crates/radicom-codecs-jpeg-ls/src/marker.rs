@@ -69,8 +69,10 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
     }
     p = 2;
     let mut frame = None;
+    let mut frame_ids = None;
     let mut preset = None;
     let mut scan = None;
+    let mut scan_ids = None;
     loop {
         if p + 2 > data.len() {
             return Err("truncated marker".into());
@@ -104,11 +106,22 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
             if ns == 0 || q.len() != 1 + 2 * ns as usize + 3 {
                 return Err("invalid SOS components".into());
             }
+            let ids = q[1..1 + 2 * ns as usize]
+                .chunks(2)
+                .map(|component| component[0])
+                .collect::<Vec<_>>();
+            if ids.iter().enumerate().any(|(i, id)| ids[..i].contains(id)) {
+                return Err("duplicate SOS component id".into());
+            }
             let base = 1 + 2 * ns as usize;
             let ilv = q[base + 1];
+            if ilv > 2 {
+                return Err("unsupported JPEG-LS interleave mode".into());
+            }
             if scan.is_some() {
                 return Err("duplicate SOS".into());
             }
+            scan_ids = Some(ids);
             scan = Some(ScanHeader {
                 components: ns,
                 near: u16::from(q[base]),
@@ -139,7 +152,12 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
                     width: u16::from_be_bytes([q[3], q[4]]),
                     components: q[5],
                 };
-                if f.components == 0 || q.len() != 6 + 3 * f.components as usize {
+                if !(2..=16).contains(&f.precision)
+                    || f.width == 0
+                    || f.height == 0
+                    || f.components == 0
+                    || q.len() != 6 + 3 * f.components as usize
+                {
                     return Err("invalid SOF55".into());
                 }
                 let ids = q[6..]
@@ -149,9 +167,16 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
                 if ids.iter().enumerate().any(|(i, id)| ids[..i].contains(id)) {
                     return Err("duplicate SOF55 component id".into());
                 }
+                if q[6..]
+                    .chunks(3)
+                    .any(|component| component[1] != 0x11 || component[2] != 0)
+                {
+                    return Err("unsupported SOF55 sampling factors".into());
+                }
                 if frame.is_some() {
                     return Err("duplicate SOF55".into());
                 }
+                frame_ids = Some(ids);
                 frame = Some(f)
             }
             0xf8 => {
@@ -172,7 +197,7 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
                     vals[0], vals[1], vals[2], vals[3], vals[4],
                 )?);
             }
-            0xe0..=0xef | 0xfe | 0xdd => {}
+            0xe0..=0xef | 0xfe => {}
             _ => return Err(format!("unsupported marker ff{code:02x}")),
         }
         p = end
@@ -181,6 +206,9 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
     let scan = scan.ok_or("missing SOS")?;
     if scan.components != frame.components {
         return Err("SOS component count does not match SOF55".into());
+    }
+    if frame_ids != scan_ids {
+        return Err("SOS component ids do not match SOF55".into());
     }
     Ok(ParsedHeader {
         frame,
@@ -240,5 +268,13 @@ mod tests {
         let (scan, tail) = split_scan(&[0x01, 0xff, 0xff, 0xd9], 0).unwrap();
         assert_eq!(scan, &[0x01]);
         assert_eq!(tail, 2);
+    }
+
+    #[test]
+    fn parse_header_rejects_restart_interval_marker() {
+        let data = [0xff, 0xd8, 0xff, 0xdd, 0x00, 0x04, 0x00, 0x01];
+        assert!(parse_header(&data)
+            .unwrap_err()
+            .contains("unsupported marker ffdd"));
     }
 }

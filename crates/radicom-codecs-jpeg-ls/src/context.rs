@@ -91,27 +91,27 @@ impl RunContext {
             || (e < 0 && k != 0)
     }
 
-    pub(crate) fn encode_value(&mut self, e: i32, k: u8) -> u32 {
+    pub(crate) fn encode_value(&mut self, e: i32, k: u8, reset: i32) -> u32 {
         let m = 2 * e.abs() - self.typ - i32::from(self.map_error(e, k));
-        self.update(e, m);
+        self.update(e, m, reset);
         m as u32
     }
-    pub(crate) fn decode_value(&mut self, temp: i32, k: u8) -> i32 {
+    pub(crate) fn decode_value(&mut self, temp: i32, k: u8, reset: i32) -> i32 {
         let map = (temp & 1) != 0;
         let abs = (temp + i32::from(map)) / 2;
         let neg = (k != 0 || (2 * self.nn >= self.n)) == map;
         let e = if neg { -abs } else { abs };
         // The Golomb value is offset by the interruption type for sign
         // reconstruction, while context statistics use the unoffset value.
-        self.update(e, temp - self.typ);
+        self.update(e, temp - self.typ, reset);
         e
     }
-    fn update(&mut self, e: i32, m: i32) {
+    fn update(&mut self, e: i32, m: i32, reset: i32) {
         if e < 0 {
             self.nn += 1
         }
         self.a += (m + 1 - self.typ) >> 1;
-        if self.n == 64 {
+        if self.n == reset {
             self.a >>= 1;
             self.n >>= 1;
             self.nn >>= 1

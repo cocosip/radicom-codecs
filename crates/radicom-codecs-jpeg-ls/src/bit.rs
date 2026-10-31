@@ -89,6 +89,16 @@ impl<'a> BitReader<'a> {
         if self.previous_ff {
             return Err("truncated JPEG-LS stuffed bit".into());
         }
+        if self.left > 0 {
+            let mask = if self.left == 8 {
+                u8::MAX
+            } else {
+                (1u8 << self.left) - 1
+            };
+            if self.current & mask != 0 {
+                return Err("non-zero JPEG-LS padding bits".into());
+            }
+        }
         if self.pos != self.data.len() {
             return Err("trailing JPEG-LS entropy data".into());
         }
@@ -127,5 +137,12 @@ mod tests {
         let mut r = BitReader::new(&b);
         assert_eq!(r.read_bits(8).unwrap(), 0xff);
         assert_eq!(r.read_bits(3).unwrap(), 0b101);
+    }
+
+    #[test]
+    fn rejects_non_zero_padding_bits() {
+        let mut reader = BitReader::new(&[0b1000_0001]);
+        assert!(reader.read_bit().unwrap());
+        assert!(reader.finish().is_err());
     }
 }

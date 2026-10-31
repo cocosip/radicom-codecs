@@ -151,6 +151,7 @@ fn operate(
             dst.add_frame(f)
                 .map_err(|e| error(codec, "decode", e.to_string()))?;
         }
+        frame::update_decoded_color_metadata(dst, &layout);
         Ok(())
     } else {
         if src.transfer_syntax().is_encapsulated() || !dst.transfer_syntax().is_encapsulated() {
@@ -322,6 +323,127 @@ mod facade_tests {
                 .unwrap()
                 .as_ref(),
             raw.as_slice()
+        );
+    }
+
+    #[test]
+    fn rgb_line_interleave_roundtrip_with_explicit_parameter() {
+        let raw = (0..24).map(|i| (i * 17) as u8).collect::<Vec<_>>();
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            2,
+            4,
+            8,
+            3,
+            0,
+            "RGB",
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let mut compressed = source.clone();
+        compressed.set_transfer_syntax(syntaxes::JPEG_LS_LOSSLESS.clone());
+        compressed.remove(Tag::PIXEL_DATA);
+        let params = CodecParams::JpegLs(JpegLsParams {
+            interleave_mode: 2,
+            ..Default::default()
+        });
+        {
+            let source_view = PixelDataRef::from_dataset(&source).unwrap();
+            let mut target = PixelData::create_new(&mut compressed).unwrap();
+            JpegLsLosslessCodec
+                .encode(&source_view, &mut target, &params)
+                .unwrap();
+        }
+        let mut decoded = compressed.clone();
+        decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        decoded.remove(Tag::PIXEL_DATA);
+        {
+            let source_view = PixelDataRef::from_dataset(&compressed).unwrap();
+            let mut target = PixelData::create_new(&mut decoded).unwrap();
+            JpegLsLosslessCodec
+                .decode(
+                    &source_view,
+                    &mut target,
+                    &JpegLsLosslessCodec.default_params(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            PixelDataRef::from_dataset(&decoded)
+                .unwrap()
+                .get_frame(0)
+                .unwrap()
+                .data()
+                .unwrap()
+                .as_ref(),
+            raw.as_slice()
+        );
+    }
+
+    #[test]
+    fn ybr_full_is_normalized_to_rgb_on_both_paths() {
+        let ybr = vec![128, 128, 128, 100, 90, 200, 0, 0, 0];
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            3,
+            8,
+            3,
+            0,
+            "YBR_FULL",
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&ybr)
+            .unwrap();
+        let mut compressed = source.clone();
+        compressed.set_transfer_syntax(syntaxes::JPEG_LS_LOSSLESS.clone());
+        compressed.remove(Tag::PIXEL_DATA);
+        {
+            let source_view = PixelDataRef::from_dataset(&source).unwrap();
+            let mut target = PixelData::create_new(&mut compressed).unwrap();
+            JpegLsLosslessCodec
+                .encode(
+                    &source_view,
+                    &mut target,
+                    &JpegLsLosslessCodec.default_params(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            compressed.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "RGB"
+        );
+        let mut decoded = compressed.clone();
+        decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        decoded.remove(Tag::PIXEL_DATA);
+        decoded.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "YBR_FULL");
+        {
+            let source_view = PixelDataRef::from_dataset(&compressed).unwrap();
+            let mut target = PixelData::create_new(&mut decoded).unwrap();
+            JpegLsLosslessCodec
+                .decode(
+                    &source_view,
+                    &mut target,
+                    &JpegLsLosslessCodec.default_params(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "RGB"
+        );
+        assert_eq!(
+            PixelDataRef::from_dataset(&decoded)
+                .unwrap()
+                .get_frame(0)
+                .unwrap()
+                .data()
+                .unwrap()
+                .as_ref(),
+            &[128, 128, 128, 201, 62, 33, 0, 135, 0]
         );
     }
 }
