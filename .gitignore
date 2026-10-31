@@ -35,3 +35,4 @@ tarpaulin-report.html
 *.bak
 *.tmp
 *.log
+.interop/

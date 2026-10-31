@@ -1,15 +1,15 @@
 # radicom-codecs development plan and status
 
-**Date:** 2026-10-30  
-**Current milestone:** RLE Lossless implementation
-**Status:** complete locally; external interoperability pending
+**Date:** 2026-10-31
+**Current milestone:** classic JPEG implementation
+**Status:** complete locally; native fo-dicom decode validation passed
 
 ## Scope of this milestone
 
-The workspace and registration boundary are complete. The RLE Lossless family is
-also implemented in pure Rust and integrated through the existing `radicom`
-codec trait and registry. JPEG, JPEG-LS, JPEG 2000, and HTJ2K remain explicit
-placeholder registrations until their implementation stages begin.
+The workspace and registration boundary are complete. The RLE Lossless family
+and the four classic JPEG transfer syntaxes are integrated through the existing
+`radicom` codec trait and registry. JPEG-LS, JPEG 2000, and HTJ2K remain
+placeholder registrations.
 
 The `radicom` dependency is a local path dependency. CI is intentionally deferred
 until `radicom` has been published and the project can consume the released package.
@@ -20,7 +20,8 @@ until `radicom` has been published and the project can consume the released pack
 - `crates/radicom-codecs`: public facade, registry implementation, explicit codec registration,
   and re-exports of family codec types.
 - `crates/radicom-codecs-rle`: RLE Lossless implementation and registration.
-- `crates/radicom-codecs-jpeg`: four classic JPEG registration skeletons.
+- `crates/radicom-codecs-jpeg`: classic JPEG marker, entropy, DCT, sequential,
+  lossless, and frame-adapter implementation.
 - `crates/radicom-codecs-jpeg-ls`: two JPEG-LS registration skeletons.
 - `crates/radicom-codecs-jpeg2000`: classic JPEG 2000 and three HTJ2K registration skeletons.
 - `tests` (facade unit tests for now): registration and transcoder-boundary checks.
@@ -43,7 +44,7 @@ until `radicom` has been published and the project can consume the released pack
 - [x] Add three `Codec` implementations for HTJ2K.
 - [x] Return the matching `radicom::syntaxes` entry from every codec.
 - [x] Return the matching `CodecParams` default from every codec.
-- [x] Return an explicit `CodecError::Operation` from unimplemented encode/decode methods.
+- [x] Return an explicit `CodecError::Operation` from unsupported operations.
 
 ### Task 3: Implement the facade registry
 
@@ -58,7 +59,7 @@ until `radicom` has been published and the project can consume the released pack
 - [x] Test raw-to-compressed and compressed-to-raw capability checks.
 - [x] Test default parameter variants.
 - [x] Test that a placeholder codec fails with a managed codec operation error.
-- [ ] Run full family algorithm tests after Stage 1 implementation begins.
+- [x] Run full family algorithm tests after Stage 1 implementation begins.
 
 ### RLE Stage 1 implementation status
 
@@ -73,18 +74,27 @@ until `radicom` has been published and the project can consume the released pack
 - [x] Add facade/transcoder integration round-trip coverage.
 - [x] Decode the external `fo-dicom.Codecs` RLE acceptance fixture and verify
   an exact Rust encode/decode round trip.
-- [ ] Run external `fo-dicom.Codecs` public-API interoperability fixtures.
-- [x] Complete final review and commit the RLE implementation.
+
+### Classic JPEG implementation status
+
+- [x] Decode the fo-dicom acceptance fixtures for JPEG Baseline YBR_FULL,
+  YBR_FULL_422, and Lossless RGB with the Rust codecs.
+- [x] Implement pure-Rust marker, entropy, Huffman, DCT, sequential, lossless,
+  and DICOM frame-adapter layers for UIDs `.50`, `.51`, `.57`, and `.70`.
+- [x] Cover 8/12/16-bit precision, predictors 1–7, point transforms, restart
+  boundaries, planar RGB, YBR color conversion, and 4:2:2 native packing.
+- [x] Reject malformed DHT/SOS input without appending a partial frame.
+- [x] Validate Rust-encoded JPEG with fo-dicom's native decoder for all four
+  implemented transfer syntaxes; Process 2/4 still has no reference fixture.
+- [x] Complete final review of the RLE and classic JPEG implementations.
 
 ## Next implementation stages
 
-1. **JPEG:** implement marker/entropy primitives, sequential DCT, Process 14 predictors,
-   and four transfer syntax adapters.
-2. **JPEG-LS:** implement regular/run modes, context modeling, Golomb coding, interleave,
+1. **JPEG-LS:** implement regular/run modes, context modeling, Golomb coding, interleave,
    and near-lossless validation.
-3. **JPEG 2000:** implement classic codestream, transforms, quantization, Tier-1/Tier-2,
+2. **JPEG 2000:** implement classic codestream, transforms, quantization, Tier-1/Tier-2,
    and `.90/.91` adapters.
-4. **HTJ2K:** implement HT block coding and `.201/.202/.203` adapters.
+3. **HTJ2K:** implement HT block coding and `.201/.202/.203` adapters.
 
 Each stage must pass its focused tests and the previous stages before the next stage starts.
 
