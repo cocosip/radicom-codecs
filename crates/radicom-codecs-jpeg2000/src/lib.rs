@@ -8,6 +8,7 @@ mod bit;
 mod codestream;
 mod frame;
 mod geometry;
+mod htj2k;
 mod marker;
 mod mq;
 mod quantization;
