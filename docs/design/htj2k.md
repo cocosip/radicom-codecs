@@ -79,9 +79,11 @@ a mean-absolute-error tolerance and require a decodable codestream.
 
 ## Stages and checks
 
-1. Bounded HT marker/bit structures, capability-marker parsing, and
-   MEL/VLC/MagSgn unit vectors are implemented.
-2. HT cleanup/refinement and exact `.201` round trips are implemented.
+1. Bounded HT marker/bit structures and capability-marker parsing are
+   implemented; the cleanup pass is pinned to a reference byte vector.
+
+2. The HT cleanup pass and exact `.201` round trips are implemented; blocks
+   declaring refinement passes are rejected rather than mis-decoded.
 3. Forced RPCL packet iteration and `.202` checks, including TLM parsing, are
    implemented.
 4. Irreversible quantization and `.203` tolerance tests are implemented,
