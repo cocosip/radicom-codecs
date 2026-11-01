@@ -189,3 +189,33 @@ fn rgb_without_color_transform_round_trips_exactly() {
         .unwrap();
     assert_eq!(frame_bytes(&decoded, 0), raw);
 }
+#[test]
+fn honour_decomposition_level_parameter() {
+    let _ = radicom_codecs::install();
+    let raw: Vec<u8> = (0..24 * 16).map(|i| (i * 17 + 9) as u8).collect();
+    for decompositions in [0u32, 1, 3] {
+        let mut source = source_dataset(24, 16, 8, 1, false, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let compressed = source
+            .clone_with_syntax(
+                syntaxes::HTJ2K_LOSSLESS.clone(),
+                Some(CodecParams::HtJpeg2000(HtJ2kParams {
+                    irreversible: false,
+                    decompositions,
+                    ..Default::default()
+                })),
+            )
+            .unwrap();
+        let decoded = compressed
+            .clone_with_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(), None)
+            .unwrap();
+        assert_eq!(
+            frame_bytes(&decoded, 0),
+            raw,
+            "decompositions {decompositions}"
+        );
+    }
+}
