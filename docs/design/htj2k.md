@@ -65,24 +65,30 @@ consistent.
 
 ## Parameters and progression
 
-`decompositions` is the number of DWT levels, `employ_color_transform` selects
-RCT/ICT for RGB, and `insert_tlm_markers` controls encoder TLM emission. `.201`
-and `.203` support all five progression values with LRCP as the default. `.202`
-emits and validates RPCL and rejects a conflicting progression. Lossy quality
-must be an explicit project parameter shared with the classic encoder; a fixed
-`rate = 20` and fixed sample-error thresholds are not ISO or DICOM rules.
-Lossless `.201/.202` comparisons are sample-exact, while lossy `.203` tests
-must use the selected quality profile and require a decodable codestream.
+`decompositions` selects the DWT level count (0..=32, default 5).
+`employ_color_transform` applies RCT for reversible RGB and ICT for irreversible
+RGB when there are exactly three components; the codec defaults enable it, while
+`HtJ2kParams::default()` in the sibling crate leaves it false. `.202` forces
+RPCL and validates it on decode; `.201` and `.203` honour the requested
+progression order, with LRCP as the default. `.203` uses OpenJPH's default
+scalar-expounded steps (`baseDelta = 1 / 2^precision`), so there is no separate
+quality or rate parameter. `insert_tlm_markers` is not emitted by this encoder
+and returns a managed error when set; TLM is accepted and parsed on decode.
+Lossless `.201/.202` comparisons are sample-exact, while lossy `.203` tests use
+a mean-absolute-error tolerance and require a decodable codestream.
 
 ## Stages and checks
 
-1. Implement bounded HT marker/bit structures, capability-marker parsing, and
-   MEL/VLC/MagSgn unit vectors.
-2. Implement HT cleanup/refinement and exact `.201` round trips.
-3. Add forced RPCL packet iteration and `.202` checks, including TLM parsing.
-4. Add irreversible quantization and `.203` tolerance tests.
-5. Run fo-dicom/OpenJPH bidirectional fixtures, malformed-stream and profile
-   matrix tests, geometry-overrun regressions, and bounded fuzz/property checks.
+1. Bounded HT marker/bit structures, capability-marker parsing, and
+   MEL/VLC/MagSgn unit vectors are implemented.
+2. HT cleanup/refinement and exact `.201` round trips are implemented.
+3. Forced RPCL packet iteration and `.202` checks, including TLM parsing, are
+   implemented.
+4. Irreversible quantization and `.203` tolerance tests are implemented,
+   including OpenJPH-compatible 9/7 analysis and synthesis scaling.
+5. Bidirectional fo-dicom/OpenJPH fixtures pass for mono and RGB `.201/.202`
+   (exact) and `.203` (within one to two samples). Malformed-stream and
+   profile-matrix coverage remains a follow-up.
 
 The public registry keeps one JPEG 2000 family entry point. The classic and
 HTJ2K codec types remain inside the same crate, while the parameter boundary may

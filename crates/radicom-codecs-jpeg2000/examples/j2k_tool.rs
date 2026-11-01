@@ -9,7 +9,10 @@ use radicom::model::{
 };
 use radicom::pixel::codec::Codec;
 use radicom::pixel::{PixelData, PixelDataRef};
-use radicom_codecs_jpeg2000::{Jpeg2000LosslessCodec, Jpeg2000LossyCodec};
+use radicom_codecs_jpeg2000::{
+    HtJpeg2000LosslessCodec, HtJpeg2000LosslessRpclCodec, HtJpeg2000LossyCodec,
+    Jpeg2000LosslessCodec, Jpeg2000LossyCodec,
+};
 
 fn main() {
     if let Err(message) = run() {
@@ -36,7 +39,7 @@ fn parse(args: &[String]) -> Result<HashMap<String, String>, String> {
         let key = args[index]
             .strip_prefix("--")
             .ok_or_else(|| format!("expected --flag, got '{}'", args[index]))?;
-        if key == "reversible" || key == "signed" {
+        if key == "reversible" || key == "signed" || key == "ht" || key == "rpcl" {
             options.insert(key.to_owned(), "true".to_owned());
             index += 1;
             continue;
@@ -97,12 +100,24 @@ fn base_dataset(options: &HashMap<String, String>, encapsulated: bool) -> Result
 fn encode(options: &HashMap<String, String>) -> Result<(), String> {
     let raw = std::fs::read(required(options, "raw")?).map_err(|e| e.to_string())?;
     let reversible = options.contains_key("reversible");
+    let ht = options.contains_key("ht");
+    let rpcl = options.contains_key("rpcl");
     let mut source = base_dataset(options, false)?;
     PixelData::create_new(&mut source)
         .map_err(|e| e.to_string())?
         .add_frame(&raw)
         .map_err(|e| e.to_string())?;
-    let codec: Box<dyn Codec> = if reversible {
+    let codec: Box<dyn Codec> = if ht {
+        if reversible {
+            if rpcl {
+                Box::new(HtJpeg2000LosslessRpclCodec)
+            } else {
+                Box::new(HtJpeg2000LosslessCodec)
+            }
+        } else {
+            Box::new(HtJpeg2000LossyCodec)
+        }
+    } else if reversible {
         Box::new(Jpeg2000LosslessCodec)
     } else {
         Box::new(Jpeg2000LossyCodec)
@@ -132,6 +147,12 @@ fn decode(options: &HashMap<String, String>) -> Result<(), String> {
         Box::new(Jpeg2000LosslessCodec)
     } else if uid == syntaxes::JPEG_2000_LOSSY.uid() {
         Box::new(Jpeg2000LossyCodec)
+    } else if uid == syntaxes::HTJ2K_LOSSLESS.uid() {
+        Box::new(HtJpeg2000LosslessCodec)
+    } else if uid == syntaxes::HTJ2K_LOSSLESS_RPCL.uid() {
+        Box::new(HtJpeg2000LosslessRpclCodec)
+    } else if uid == syntaxes::HTJ2K_LOSSY.uid() {
+        Box::new(HtJpeg2000LossyCodec)
     } else {
         return Err(format!("unsupported syntax '{uid}'"));
     };

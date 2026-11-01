@@ -7,6 +7,7 @@ use radicom::{
 };
 
 use crate::codestream;
+use crate::htj2k::codestream as ht_codestream;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Layout {
@@ -362,6 +363,54 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], reversible: bool) -> Result<Ve
     codestream::encode(&mut components, reversible)
 }
 
+pub(crate) fn encode_ht(
+    layout: &Layout,
+    raw: &[u8],
+    progression: u8,
+    reversible: bool,
+    levels: i32,
+    mct: bool,
+) -> Result<Vec<u8>, String> {
+    if matches!(
+        layout.pi,
+        PhotometricInterpretation::YbrRct | PhotometricInterpretation::YbrIct
+    ) {
+        return Err("native source cannot use YBR_RCT or YBR_ICT".into());
+    }
+    let planes = layout.read(raw)?;
+    let mut components = codestream::build_components(
+        &planes,
+        layout.width as i32,
+        layout.height as i32,
+        layout.bits_stored,
+        layout.signed,
+        levels,
+    )?;
+    ht_codestream::encode(&mut components, progression, reversible, levels, mct)
+}
+
+pub(crate) fn decode_ht(
+    layout: &Layout,
+    data: &[u8],
+    expected_progression: Option<u8>,
+) -> Result<Vec<u8>, String> {
+    let components = ht_codestream::decode(data, expected_progression)?;
+    if components.len() != layout.components as usize {
+        return Err("codestream component count does not match destination".into());
+    }
+    if components[0].width as usize != layout.width
+        || components[0].height as usize != layout.height
+        || components[0].precision != layout.bits_stored
+        || components[0].signed != layout.signed
+    {
+        return Err("codestream layout does not match destination".into());
+    }
+    let planes: Vec<Vec<i32>> = components
+        .iter()
+        .map(|component| component.samples.clone())
+        .collect();
+    layout.write(&planes)
+}
 pub(crate) fn decode(layout: &Layout, data: &[u8]) -> Result<Vec<u8>, String> {
     let components = codestream::decode(data)?;
     if components.len() != layout.components as usize {

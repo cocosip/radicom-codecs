@@ -5,6 +5,7 @@ pub(crate) const SIZ: u16 = 0xFF51;
 pub(crate) const COD: u16 = 0xFF52;
 pub(crate) const COC: u16 = 0xFF53;
 pub(crate) const TLM: u16 = 0xFF55;
+pub(crate) const CAP: u16 = 0xFF50;
 pub(crate) const PLM: u16 = 0xFF57;
 #[allow(dead_code)]
 pub(crate) const PLT: u16 = 0xFF58;
@@ -545,6 +546,9 @@ impl MainHeader {
                     let payload = c.segment()?;
                     parse_tlm(payload, &mut tile_part_offsets)?;
                 }
+                CAP => {
+                    c.segment()?;
+                }
                 COM => {
                     c.segment()?;
                 }
@@ -649,15 +653,24 @@ fn finish_header(
 
 fn parse_tlm(payload: &[u8], out: &mut Vec<(u32, u64)>) -> Result<(), String> {
     let mut c = Cursor::new(payload);
-    let ztlm = c.u8()?;
-    let stlm = ztlm & 0x3F;
-    let index_bytes = if ztlm & 0x40 != 0 { 0 } else { 1 };
-    let length_bytes = ((stlm & 0x03) + 1) as usize;
-    while !c.is_empty() {
-        let index = if index_bytes == 0 {
+    let _ztlm = c.u8()?;
+    let stlm = c.u8()?;
+    let st = usize::from((stlm >> 4) & 0x03);
+    let sp = usize::from((stlm >> 6) & 0x01);
+    let length_bytes = (sp + 1) * 2;
+    let entry_size = st + length_bytes;
+    if entry_size == 0 {
+        return Err("invalid TLM entry size".into());
+    }
+    while c.remaining() >= entry_size {
+        let index = if st == 0 {
             out.len() as u32
         } else {
-            u32::from(c.u8()?)
+            let mut value = 0u32;
+            for _ in 0..st {
+                value = (value << 8) | u32::from(c.u8()?);
+            }
+            value
         };
         let mut length = 0u64;
         for _ in 0..length_bytes {
@@ -707,6 +720,12 @@ pub(crate) fn write_soc(out: &mut Vec<u8>) {
 
 pub(crate) fn write_sod(out: &mut Vec<u8>) {
     out.extend_from_slice(&SOD.to_be_bytes());
+}
+
+pub(crate) fn write_cap(out: &mut Vec<u8>) {
+    out.extend_from_slice(&CAP.to_be_bytes());
+    out.extend_from_slice(&8u16.to_be_bytes());
+    out.extend_from_slice(&[0x00, 0x02, 0x00, 0x00, 0x00, 0x02]);
 }
 
 pub(crate) fn write_eoc(out: &mut Vec<u8>) {

@@ -6,5 +6,8 @@
 #![allow(dead_code)]
 
 pub(crate) mod cleanup;
+pub(crate) mod codestream;
 pub(crate) mod mel;
+pub(crate) mod packet;
+pub(crate) mod quant;
 pub(crate) mod tables;

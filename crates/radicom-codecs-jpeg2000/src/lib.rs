@@ -19,7 +19,7 @@ mod wavelet;
 use frame::Layout;
 use radicom::error::{CodecError, Error};
 use radicom::model::transfer_syntax::{syntaxes, TransferSyntax};
-use radicom::pixel::codec::{Codec, CodecParams, J2kParams};
+use radicom::pixel::codec::{Codec, CodecParams, HtJ2kParams, J2kParams, ProgressionOrder};
 use radicom::pixel::{PixelData, PixelDataRef};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -118,6 +118,163 @@ impl Codec for Jpeg2000LossyCodec {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HtJpeg2000LosslessCodec;
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HtJpeg2000LosslessRpclCodec;
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HtJpeg2000LossyCodec;
+
+fn progression_code(order: ProgressionOrder) -> u8 {
+    match order {
+        ProgressionOrder::Lrcp => 0,
+        ProgressionOrder::Rlcp => 1,
+        ProgressionOrder::Rpcl => 2,
+        ProgressionOrder::Pcrl => 3,
+        ProgressionOrder::Cprl => 4,
+    }
+}
+
+fn ht_params(irreversible: bool, progression_order: ProgressionOrder) -> CodecParams {
+    CodecParams::HtJpeg2000(HtJ2kParams {
+        irreversible,
+        employ_color_transform: true,
+        progression_order,
+        ..Default::default()
+    })
+}
+
+impl Codec for HtJpeg2000LosslessCodec {
+    fn name(&self) -> &str {
+        "HTJ2K Lossless"
+    }
+    fn transfer_syntax(&self) -> &'static TransferSyntax {
+        &syntaxes::HTJ2K_LOSSLESS
+    }
+    fn default_params(&self) -> CodecParams {
+        ht_params(false, ProgressionOrder::Lrcp)
+    }
+    fn encode(
+        &self,
+        src: &PixelDataRef<'_>,
+        dst: &mut PixelData<'_>,
+        params: &CodecParams,
+    ) -> Result<(), Error> {
+        operate_ht(
+            self.name(),
+            self.transfer_syntax(),
+            src,
+            dst,
+            params,
+            false,
+            true,
+        )
+    }
+    fn decode(
+        &self,
+        src: &PixelDataRef<'_>,
+        dst: &mut PixelData<'_>,
+        params: &CodecParams,
+    ) -> Result<(), Error> {
+        operate_ht(
+            self.name(),
+            self.transfer_syntax(),
+            src,
+            dst,
+            params,
+            true,
+            true,
+        )
+    }
+}
+
+impl Codec for HtJpeg2000LosslessRpclCodec {
+    fn name(&self) -> &str {
+        "HTJ2K Lossless RPCL"
+    }
+    fn transfer_syntax(&self) -> &'static TransferSyntax {
+        &syntaxes::HTJ2K_LOSSLESS_RPCL
+    }
+    fn default_params(&self) -> CodecParams {
+        ht_params(false, ProgressionOrder::Rpcl)
+    }
+    fn encode(
+        &self,
+        src: &PixelDataRef<'_>,
+        dst: &mut PixelData<'_>,
+        params: &CodecParams,
+    ) -> Result<(), Error> {
+        operate_ht(
+            self.name(),
+            self.transfer_syntax(),
+            src,
+            dst,
+            params,
+            false,
+            true,
+        )
+    }
+    fn decode(
+        &self,
+        src: &PixelDataRef<'_>,
+        dst: &mut PixelData<'_>,
+        params: &CodecParams,
+    ) -> Result<(), Error> {
+        operate_ht(
+            self.name(),
+            self.transfer_syntax(),
+            src,
+            dst,
+            params,
+            true,
+            true,
+        )
+    }
+}
+
+impl Codec for HtJpeg2000LossyCodec {
+    fn name(&self) -> &str {
+        "HTJ2K Lossy"
+    }
+    fn transfer_syntax(&self) -> &'static TransferSyntax {
+        &syntaxes::HTJ2K_LOSSY
+    }
+    fn default_params(&self) -> CodecParams {
+        ht_params(true, ProgressionOrder::Lrcp)
+    }
+    fn encode(
+        &self,
+        src: &PixelDataRef<'_>,
+        dst: &mut PixelData<'_>,
+        params: &CodecParams,
+    ) -> Result<(), Error> {
+        operate_ht(
+            self.name(),
+            self.transfer_syntax(),
+            src,
+            dst,
+            params,
+            false,
+            false,
+        )
+    }
+    fn decode(
+        &self,
+        src: &PixelDataRef<'_>,
+        dst: &mut PixelData<'_>,
+        params: &CodecParams,
+    ) -> Result<(), Error> {
+        operate_ht(
+            self.name(),
+            self.transfer_syntax(),
+            src,
+            dst,
+            params,
+            true,
+            false,
+        )
+    }
+}
 fn error(codec: &str, op: &str, message: impl Into<String>) -> Error {
     CodecError::Operation {
         codec: codec.to_owned(),
@@ -257,6 +414,168 @@ fn operate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn operate_ht(
+    codec: &str,
+    syntax: &TransferSyntax,
+    src: &PixelDataRef<'_>,
+    dst: &mut PixelData<'_>,
+    params: &CodecParams,
+    decode: bool,
+    reversible: bool,
+) -> Result<(), Error> {
+    let p = match params {
+        CodecParams::HtJpeg2000(p) => p,
+        _ => {
+            return Err(error(
+                codec,
+                if decode { "decode" } else { "encode" },
+                "requires CodecParams::HtJpeg2000",
+            ))
+        }
+    };
+    if p.irreversible == reversible {
+        return Err(error(
+            codec,
+            if decode { "decode" } else { "encode" },
+            if reversible {
+                "lossless HTJ2K requires reversible coding"
+            } else {
+                "lossy HTJ2K requires irreversible coding"
+            },
+        ));
+    }
+    if !decode && p.insert_tlm_markers {
+        return Err(error(
+            codec,
+            "encode",
+            "HTJ2K TLM insertion is not supported",
+        ));
+    }
+    let levels = i32::try_from(p.decompositions).map_err(|_| {
+        error(
+            codec,
+            if decode { "decode" } else { "encode" },
+            "invalid decomposition count",
+        )
+    })?;
+    if !(0..=32).contains(&levels) {
+        return Err(error(
+            codec,
+            if decode { "decode" } else { "encode" },
+            "invalid decomposition count",
+        ));
+    }
+    let rpcl = syntax.uid() == syntaxes::HTJ2K_LOSSLESS_RPCL.uid();
+    let expected_progression = if rpcl { Some(2) } else { None };
+    let encode_progression = if rpcl {
+        2
+    } else {
+        progression_code(p.progression_order)
+    };
+    if decode {
+        if src.transfer_syntax().uid() != syntax.uid() {
+            return Err(error(
+                codec,
+                "decode",
+                format!(
+                    "source transfer syntax is {}, expected {}",
+                    src.transfer_syntax().uid(),
+                    syntax.uid()
+                ),
+            ));
+        }
+        if dst.transfer_syntax().is_encapsulated() {
+            return Err(error(
+                codec,
+                "decode",
+                "destination must use native transfer syntax",
+            ));
+        }
+        let layout = Layout::destination(dst)
+            .map_err(|m| error(codec, "decode", m))?
+            .rgb_output();
+        let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
+        for i in 0..src.number_of_frames() {
+            let b = src
+                .get_frame(i)
+                .map_err(|e| error(codec, "decode", format!("frame {i}: {e}")))?;
+            let bytes = b
+                .data()
+                .map_err(|e| error(codec, "decode", format!("frame {i}: {e}")))?;
+            frames.push(
+                frame::decode_ht(&layout, bytes.as_ref(), expected_progression)
+                    .map_err(|m| error(codec, "decode", format!("frame {i}: {m}")))?,
+            );
+        }
+        for frame in frames {
+            dst.add_frame(frame)
+                .map_err(|e| error(codec, "decode", e.to_string()))?;
+        }
+        frame::update_decoded_color_metadata(dst, &layout);
+        Ok(())
+    } else {
+        if dst.transfer_syntax().uid() != syntax.uid() {
+            return Err(error(
+                codec,
+                "encode",
+                format!(
+                    "destination transfer syntax is {}, expected {}",
+                    dst.transfer_syntax().uid(),
+                    syntax.uid()
+                ),
+            ));
+        }
+        if src.transfer_syntax().is_encapsulated() || !dst.transfer_syntax().is_encapsulated() {
+            return Err(error(
+                codec,
+                "encode",
+                "source must be native and destination encapsulated",
+            ));
+        }
+        let layout = Layout::source(src).map_err(|m| error(codec, "encode", m))?;
+        let destination = Layout::destination(dst).map_err(|m| error(codec, "encode", m))?;
+        if layout.width != destination.width
+            || layout.height != destination.height
+            || layout.bits_allocated != destination.bits_allocated
+            || layout.bits_stored != destination.bits_stored
+            || layout.components != destination.components
+            || layout.signed != destination.signed
+        {
+            return Err(error(
+                codec,
+                "encode",
+                "source and destination pixel layouts differ",
+            ));
+        }
+        let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
+        for i in 0..src.number_of_frames() {
+            let b = src
+                .get_frame(i)
+                .map_err(|e| error(codec, "encode", format!("frame {i}: {e}")))?;
+            let bytes = b
+                .data()
+                .map_err(|e| error(codec, "encode", format!("frame {i}: {e}")))?;
+            frames.push(
+                frame::encode_ht(
+                    &layout,
+                    bytes.as_ref(),
+                    encode_progression,
+                    reversible,
+                    levels,
+                    p.employ_color_transform,
+                )
+                .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?,
+            );
+        }
+        for frame in frames {
+            dst.add_frame(frame)
+                .map_err(|e| error(codec, "encode", e.to_string()))?;
+        }
+        frame::update_color_metadata(dst, &layout);
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
