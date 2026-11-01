@@ -42,6 +42,15 @@ pub(crate) fn build_components(
 
 /// Encodes a complete codestream for one tile.
 pub(crate) fn encode(components: &mut [Component], reversible: bool) -> Result<Vec<u8>, String> {
+    encode_with_precincts(components, reversible, None)
+}
+
+/// Encodes one tile, optionally with explicit precinct exponents per resolution.
+pub(crate) fn encode_with_precincts(
+    components: &mut [Component],
+    reversible: bool,
+    precincts: Option<&[(u8, u8)]>,
+) -> Result<Vec<u8>, String> {
     if components.is_empty() {
         return Err("no components to encode".into());
     }
@@ -54,7 +63,7 @@ pub(crate) fn encode(components: &mut [Component], reversible: bool) -> Result<V
         if component.levels != levels {
             return Err("components disagree on the decomposition level count".into());
         }
-        component.build_code_blocks(DEFAULT_CODE_BLOCK, DEFAULT_CODE_BLOCK, None)?;
+        component.build_code_blocks(DEFAULT_CODE_BLOCK, DEFAULT_CODE_BLOCK, precincts)?;
         if reversible {
             wavelet::forward_53(
                 &mut component.coefficients,
@@ -214,7 +223,7 @@ pub(crate) fn encode(components: &mut [Component], reversible: bool) -> Result<V
             .collect(),
     };
     let cod = Cod {
-        scod: 0,
+        scod: if precincts.is_some() { 1 } else { 0 },
         progression: 0,
         layers: 1,
         mct: 0,
@@ -224,7 +233,7 @@ pub(crate) fn encode(components: &mut [Component], reversible: bool) -> Result<V
             code_block_height: 4,
             style: 0,
             transform: u8::from(reversible),
-            precincts: Vec::new(),
+            precincts: precincts.map(|p| p.to_vec()).unwrap_or_default(),
         },
     };
     let mut output = Vec::new();
@@ -359,7 +368,7 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
                 let bands = component.bands(resolution, precinct).to_vec();
                 for band in &bands {
                     let index_in_band = subband_index(resolution, band.orientation).max(0) as usize;
-                    let step = quant.steps.get(index_in_band).copied().unwrap_or(QStep {
+                    let step = quant.step(index_in_band).unwrap_or(QStep {
                         exponent: 0,
                         mantissa: 0,
                     });
@@ -432,8 +441,7 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
         }
     }
     if header.cod.mct != 0 && components.len() >= 3 {
-        let reversible = header.cod.style.transform == 1 && header.cod.mct == 1;
-        if reversible {
+        if header.cod.style.transform == 1 {
             inverse_rct(&mut components);
         } else {
             inverse_ict(&mut components);
@@ -546,6 +554,22 @@ mod tests {
         let decoded = decode(&codestream).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].samples, samples[0]);
+    }
+
+    #[test]
+    fn reversible_codestream_with_custom_precincts_round_trips_exactly() {
+        let width = 48usize;
+        let height = 40usize;
+        let samples = vec![pattern(width, height, 17)];
+        let precincts = vec![(2u8, 2u8); 6];
+        let mut components =
+            build_components(&samples, width as i32, height as i32, 8, false, 5).unwrap();
+        let codestream = encode_with_precincts(&mut components, true, Some(&precincts)).unwrap();
+        let decoded = decode(&codestream).unwrap();
+        assert_eq!(decoded[0].samples, samples[0]);
+        let (header, _) = MainHeader::parse(&codestream).unwrap();
+        assert_eq!(header.cod.scod, 1);
+        assert_eq!(header.cod.style.precincts, precincts);
     }
 
     #[test]

@@ -266,6 +266,9 @@ impl Cod {
             return Err("zero quality layers".into());
         }
         let mct = c.u8()?;
+        if mct > 2 {
+            return Err("invalid multiple component transform".into());
+        }
         let style = parse_coding_style(&mut c, scod)?;
         if !c.is_empty() {
             return Err("trailing bytes in COD segment".into());
@@ -308,6 +311,9 @@ fn parse_coding_style(c: &mut Cursor<'_>, scod: u8) -> Result<CodingStyle, Strin
     let code_block_width = c.u8()?;
     let code_block_height = c.u8()?;
     let style = c.u8()?;
+    if style & 0x01 != 0 {
+        return Err("selective arithmetic coding bypass is not supported".into());
+    }
     if style & 0x04 != 0 || style & 0x10 != 0 {
         return Err("unsupported code-block style (TERMALL/PTERM)".into());
     }
@@ -403,7 +409,17 @@ impl Quantization {
                     });
                 }
             }
-            1 | 2 => {
+            1 => {
+                let value = c.u16()?;
+                if !c.is_empty() {
+                    return Err("scalar-derived quantization must contain one step".into());
+                }
+                steps.push(QStep {
+                    exponent: (value >> 11) as u8,
+                    mantissa: value & 0x07FF,
+                });
+            }
+            2 => {
                 while c.remaining() >= 2 {
                     let value = c.u16()?;
                     steps.push(QStep {
@@ -442,6 +458,15 @@ impl Quantization {
         }
     }
 
+    /// Quantization step for a subband; style 1 uses one derived value for all.
+    pub(crate) fn step(&self, subband: usize) -> Option<QStep> {
+        if self.style == 1 {
+            self.steps.first().copied()
+        } else {
+            self.steps.get(subband).copied()
+        }
+    }
+
     /// Scalar quantization step for a subband, in the coefficient domain.
     #[allow(dead_code)]
     pub(crate) fn step_size(&self, subband: usize, nominal_bits: u8) -> Result<f64, String> {
@@ -449,8 +474,7 @@ impl Quantization {
             0 => Ok(1.0),
             1 | 2 => {
                 let step = self
-                    .steps
-                    .get(subband)
+                    .step(subband)
                     .ok_or_else(|| "missing quantization step".to_string())?;
                 let shift = i32::from(nominal_bits) - i32::from(step.exponent);
                 let scale = if shift >= 0 {
@@ -579,8 +603,24 @@ fn finish_header(
             return Err("QCC references an unknown component".into());
         }
     }
-    let expected_steps = crate::quantization::subband_count(cod.style.decompositions);
-    if qcd.steps.len() < expected_steps {
+    for coc in &cocs {
+        if coc.style.decompositions != cod.style.decompositions {
+            return Err("per-component decomposition levels are not supported".into());
+        }
+        if coc.style.code_block_width != cod.style.code_block_width
+            || coc.style.code_block_height != cod.style.code_block_height
+        {
+            return Err("per-component code-block sizes are not supported".into());
+        }
+    }
+    let required_steps = |style: u8, levels: u8| {
+        if style == 1 {
+            1
+        } else {
+            crate::quantization::subband_count(levels)
+        }
+    };
+    if qcd.steps.len() < required_steps(qcd.style, cod.style.decompositions) {
         return Err("QCD has fewer steps than the decomposition level count requires".into());
     }
     for (component, quantization) in &qccs {
@@ -589,7 +629,7 @@ fn finish_header(
             .find(|coc| coc.component == *component)
             .map(|coc| coc.style.decompositions)
             .unwrap_or(cod.style.decompositions);
-        if quantization.steps.len() < crate::quantization::subband_count(levels) {
+        if quantization.steps.len() < required_steps(quantization.style, levels) {
             return Err("QCC has fewer steps than the decomposition level count requires".into());
         }
     }
@@ -742,9 +782,28 @@ mod tests {
     }
 
     #[test]
+    fn scalar_derived_quantization_broadcasts_one_step() {
+        let qcd = Quantization {
+            guard_bits: 2,
+            style: 1,
+            steps: vec![QStep {
+                exponent: 9,
+                mantissa: 0x100,
+            }],
+        };
+        let mut bytes = Vec::new();
+        qcd.write(&mut bytes);
+        let parsed = Quantization::parse(&bytes[4..]).unwrap();
+        assert_eq!(parsed, qcd);
+        assert_eq!(parsed.step(0), parsed.step(15));
+        assert!(Quantization::parse(&[0x21, 0, 1, 0, 2]).is_err());
+    }
+
+    #[test]
     fn rejects_malformed_segments() {
         assert!(Siz::parse(&[0, 0]).is_err());
         assert!(Cod::parse(&[0, 0, 0, 1, 0, 0, 0, 0, 0]).is_err());
+        assert!(Cod::parse(&[0, 0, 0, 1, 0, 4, 4, 1, 0]).is_err());
         assert!(Quantization::parse(&[0x02]).is_ok());
         assert!(Quantization::parse(&[0x1F]).is_err());
     }

@@ -95,6 +95,9 @@ impl Layout {
         if ybr422 && (ba != 8 || width % 2 != 0) {
             return Err("YBR_FULL_422 requires 8-bit samples and an even width".into());
         }
+        if ybr422 && planar != 0 {
+            return Err("YBR_FULL_422 must be interleaved".into());
+        }
         if rep == 1
             && matches!(
                 pi,
@@ -260,12 +263,12 @@ impl Layout {
                 let r1 = (planes[0][pair * 2 + 1] + shift).clamp(0, maxval);
                 let g1 = (planes[1][pair * 2 + 1] + shift).clamp(0, maxval);
                 let b1 = (planes[2][pair * 2 + 1] + shift).clamp(0, maxval);
-                let (y0, cb0, cr0) = rgb_to_ybr(r0, g0, b0);
-                let (y1, cb1, cr1) = rgb_to_ybr(r1, g1, b1);
-                bytes[base] = y0;
-                bytes[base + 1] = ((i32::from(cb0) + i32::from(cb1)) / 2) as u8;
-                bytes[base + 2] = y1;
-                bytes[base + 3] = ((i32::from(cr0) + i32::from(cr1)) / 2) as u8;
+                let (y0, cb0, cr0) = rgb_to_ybr(r0, g0, b0, self.bits_stored);
+                let (y1, cb1, cr1) = rgb_to_ybr(r1, g1, b1, self.bits_stored);
+                bytes[base] = y0 as u8;
+                bytes[base + 1] = ((cb0 + cb1) / 2) as u8;
+                bytes[base + 2] = y1 as u8;
+                bytes[base + 3] = ((cr0 + cr1) / 2) as u8;
             }
             return Ok(bytes);
         }
@@ -326,15 +329,17 @@ fn ybr_to_rgb(y: i32, cb: i32, cr: i32, bits: u8) -> (i32, i32, i32) {
     )
 }
 
-fn rgb_to_ybr(r: i32, g: i32, b: i32) -> (u8, u8, u8) {
+fn rgb_to_ybr(r: i32, g: i32, b: i32, bits: u8) -> (i32, i32, i32) {
+    let max = f64::from((1i32 << bits) - 1);
+    let center = f64::from(1i32 << (bits - 1));
     let r = f64::from(r);
     let g = f64::from(g);
     let b = f64::from(b);
-    let clamp = |value: f64| value.round().clamp(0.0, 255.0) as u8;
+    let clamp = |value: f64| value.round().clamp(0.0, max) as i32;
     (
         clamp(0.2990 * r + 0.5870 * g + 0.1140 * b),
-        clamp(-0.1687 * r - 0.3313 * g + 0.5000 * b + 128.0),
-        clamp(0.5000 * r - 0.4187 * g - 0.0813 * b + 128.0),
+        clamp(-0.1687 * r - 0.3313 * g + 0.5000 * b + center),
+        clamp(0.5000 * r - 0.4187 * g - 0.0813 * b + center),
     )
 }
 
