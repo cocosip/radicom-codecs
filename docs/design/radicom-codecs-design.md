@@ -16,15 +16,15 @@ publishing both crates is a later release step.
 
 The behavior and class coverage are derived from:
 
-- `D:\Code\dotnet-source\fo-dicom.Codecs\Codec\DicomRleCodec.cs`
-- `D:\Code\dotnet-source\fo-dicom.Codecs\Codec\DicomJpegCodec.cs`
-- `D:\Code\dotnet-source\fo-dicom.Codecs\Codec\DicomJpegLsCodec.cs`
-- `D:\Code\dotnet-source\fo-dicom.Codecs\Codec\DicomJpeg2000Codec.cs`
-- `D:\Code\dotnet-source\fo-dicom.Codecs\Codec\DicomHtJpeg2000Codec.cs`
-- `D:\Code\dotnet\fo-dicom.PureCodecs\docs\design\rle-codec-design.md`
-- `D:\Code\dotnet\fo-dicom.PureCodecs\docs\design\jpeg-codec-design.md`
-- `D:\Code\dotnet\fo-dicom.PureCodecs\docs\design\jpegls-codec-design.md`
-- `D:\Code\dotnet\fo-dicom.PureCodecs\docs\design\jpeg2000-codec-design.md`
+- `fo-dicom.Codecs DicomRleCodec.cs reference implementation`
+- `fo-dicom.Codecs DicomJpegCodec.cs reference implementation`
+- `fo-dicom.Codecs DicomJpegLsCodec.cs reference implementation`
+- `fo-dicom.Codecs DicomJpeg2000Codec.cs reference implementation`
+- `fo-dicom.Codecs DicomHtJpeg2000Codec.cs reference implementation`
+- the PureCodecs RLE design
+- the PureCodecs JPEG design
+- the PureCodecs JPEG-LS design
+- the PureCodecs JPEG 2000 design
 
 The C/C++ implementation is a format and behavior reference only. It is never
 copied, translated, compiled, linked, loaded, or called by production Rust code.
@@ -105,12 +105,10 @@ the following standard transfer syntax constants used by codec registration:
 - `HTJ2K_LOSSLESS_RPCL`
 - `HTJ2K_LOSSY`
 
-Before implementing HTJ2K, the UID values in `radicom` must be reconciled with
-the current DICOM transfer syntax definitions and the reference project. The
-current checkout uses `.108`, `.109`, and `.110`, while the reference project
-and current DICOM definitions use `.201`, `.202`, and `.203`. The codec project
-must not silently register a codec under the wrong UID; this is a release-blocking
-integration item to resolve at the `radicom` boundary.
+The sibling `radicom` transfer-syntax table is already reconciled with its
+generated UID dictionary, the DICOM transfer syntax definitions, and fo-dicom:
+HTJ2K uses `.201`, `.202`, and `.203`. The codec project must assert those values
+and must not silently register under a different UID.
 
 ## 5. Cargo workspace layout
 

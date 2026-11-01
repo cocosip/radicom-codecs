@@ -10,7 +10,7 @@ require a native library or a platform-specific build step.
 The goal is a codec that can transcode DICOM `PixelData` through the existing
 `radicom::pixel::codec::Codec` boundary, preserve lossless samples exactly, and
 interoperate with the public behavior of `fo-dicom.Codecs`. The C/C++ code in
-`D:\dotnet\source\fo-dicom.Codecs\Native\Dicom.Imaging.Codec.Jpeg.cpp` is a
+the fo-dicom.Codecs native JPEG reference implementation is a
 behavioral reference for marker validation, color conversion, precision, and
 error reporting; it is not an implementation dependency.
 
@@ -19,8 +19,8 @@ error reporting; it is not an implementation dependency.
 - ISO/IEC 10918-1 / ITU-T T.81: JPEG interchange syntax and coding processes.
 - DICOM PS3.3 and PS3.5: Image Pixel Module, encapsulated Pixel Data, and JPEG
   transfer syntaxes.
-- `D:\dotnet\source\fo-dicom.Codecs\Codec\DicomJpegCodec.cs`.
-- `D:\dotnet\source\fo-dicom.Codecs\Native\Dicom.Imaging.Codec.Jpeg.cpp`.
+- `fo-dicom.Codecs DicomJpegCodec.cs reference implementation`.
+- the fo-dicom.Codecs native JPEG reference implementation.
 - The current Rust boundary in `radicom::pixel::codec::JpegParams` and
   `radicom::pixel::{PixelData, PixelDataRef}`.
 
@@ -264,7 +264,7 @@ without updating this document first.
   planar rules are applied. Lossy comparisons use fixed fixtures and a stated
   tolerance; visual similarity alone is not an acceptance criterion.
 - The malformed Process 14 fixture from
-  `D:\dotnet\source\fo-dicom.Codecs\Tests\Unit\MalformedJpegUnitTest.cs` is
+  the fo-dicom.Codecs malformed JPEG unit test is
   covered by a Rust regression test that returns a managed error and leaves the
   destination without a partial frame.
 

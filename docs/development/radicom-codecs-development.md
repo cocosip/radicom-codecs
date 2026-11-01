@@ -1,15 +1,17 @@
 # radicom-codecs development plan and status
 
 **Date:** 2026-11-01
-**Current milestone:** JPEG-LS implementation and interoperability hardening
-**Status:** JPEG-LS local verification and interoperability audit complete
+**Current milestone:** classic JPEG 2000 implementation and shared engine boundary
+**Status:** classic JPEG 2000 local verification complete; independent fo-dicom
+interoperability remains an opt-in acceptance gate
 
 ## Scope of this milestone
 
-The workspace and registration boundary are complete. The RLE Lossless family
-and the four classic JPEG transfer syntaxes are integrated through the existing
-`radicom` codec trait and registry. Both JPEG-LS transfer syntaxes now have pure
-Rust implementations; JPEG 2000 and HTJ2K remain placeholder registrations.
+The workspace and registration boundary are complete. The RLE Lossless family,
+the four classic JPEG transfer syntaxes, both JPEG-LS transfer syntaxes, and the
+two classic JPEG 2000 transfer syntaxes are integrated through the existing
+`radicom` codec trait and registry. HTJ2K remains an explicit later-stage
+registration that already uses the same engine boundary.
 
 The `radicom` dependency is a local path dependency. CI is intentionally deferred
 until `radicom` has been published and the project can consume the released package.
@@ -24,7 +26,16 @@ until `radicom` has been published and the project can consume the released pack
   lossless, and frame-adapter implementation.
 - `crates/radicom-codecs-jpeg-ls`: JPEG-LS Lossless/Near-Lossless algorithms,
   codestream validation, and DICOM frame adapters.
-- `crates/radicom-codecs-jpeg2000`: classic JPEG 2000 and three HTJ2K registration skeletons.
+- `crates/radicom-codecs-jpeg2000/src/common.rs`: DICOM-independent frame and
+  codestream engine contract shared by classic JPEG 2000 and HTJ2K.
+- `crates/radicom-codecs-jpeg2000/src/codestream.rs`: DICOM sample normalization
+  plus the classic engine facade.
+- `crates/radicom-codecs-jpeg2000/src/engine.rs`: one dispatcher selecting the
+  classic or HTJ2K engine without changing the frame adapter.
+- `crates/radicom-codecs-jpeg2000/src/htj2k.rs`: controlled later-stage HTJ2K
+  engine seam.
+- `crates/radicom-codecs-jpeg2000/vendor/`: vendored pure Rust codestream,
+  wavelet, quantization, MQ/EBCOT, packet, and bounds implementation.
 - `tests` (facade unit tests for now): registration and transcoder-boundary checks.
 
 ## Task checklist
@@ -33,7 +44,7 @@ until `radicom` has been published and the project can consume the released pack
 
 - [x] Add the root Cargo workspace.
 - [x] Add the four family crates and the facade crate as workspace members.
-- [x] Use a local path dependency on `D:\Code\rust-code\radicom\crates\radicom`.
+- [x] Use a local path dependency on the sibling radicom workspace.
 - [x] Do not add GitHub Actions or other CI configuration.
 
 ### Task 2: Implement family registration types
@@ -59,8 +70,9 @@ until `radicom` has been published and the project can consume the released pack
 - [x] Test that all twelve syntaxes are registered.
 - [x] Test raw-to-compressed and compressed-to-raw capability checks.
 - [x] Test default parameter variants.
-- [x] Test that a placeholder codec fails with a managed codec operation error.
-- [x] Run full family algorithm tests after Stage 1 implementation begins.
+- [x] Test that the deferred HTJ2K engine fails with a managed codec operation
+  error through the shared dispatcher.
+- [x] Run the classic JPEG 2000 frame and codestream tests.
 
 ### RLE Stage 1 implementation status
 
@@ -106,18 +118,28 @@ flags are explicitly rejected. Custom LSE decoding is supported. Full details an
 the distinction between portable tests and native evidence are in
 [the JPEG-LS implementation contract](../design/jpeg-ls.md).
 
+### Classic JPEG 2000 implementation status
+
+- [x] Vendor the complete pure Rust JPEG 2000 engine source into the workspace.
+- [x] Route `.90` and `.91` through one common engine contract.
+- [x] Cover 5/3 lossless, 9/7 lossy, quantization/rate targets, standard J2K
+  markers, signed samples, planar RGB, YBR 4:2:2, multi-frame data, and
+  malformed/truncated codestream rejection.
+- [x] Keep the external fo-dicom/OpenJPEG checks outside the tracked source.
+- [ ] Run the independent fo-dicom bidirectional acceptance matrix.
+
 ## Next implementation stages
 
-1. **JPEG 2000:** implement classic codestream, transforms, quantization, Tier-1/Tier-2,
-   and `.90/.91` adapters.
-2. **HTJ2K:** implement HT block coding and `.201/.202/.203` adapters.
+1. **HTJ2K:** implement MEL/VLC/MagSgn block coding and `.201/.202/.203`
+   adapters behind the existing engine contract.
+2. **Interoperability:** run the independent fo-dicom/OpenJPEG bidirectional
+   matrix for classic JPEG 2000, then add the HTJ2K matrix after Part 15 lands.
 
 Each stage must pass its focused tests and the previous stages before the next stage starts.
 
 ## Known integration issue
 
-The current local `radicom` checkout defines HTJ2K transfer syntax constants with UIDs
-`.108`, `.109`, and `.110`. The reference `fo-dicom.Codecs` project and current DICOM
-definitions use `.201`, `.202`, and `.203`. This must be corrected in `radicom` before
-HTJ2K registration can be considered compatible.
+The sibling `radicom` checkout now uses its generated UID dictionary for HTJ2K, and
+its values match fo-dicom and DICOM `.201`, `.202`, and `.203`. The compatibility
+issue is resolved; codec work only needs a read-only boundary assertion.
 

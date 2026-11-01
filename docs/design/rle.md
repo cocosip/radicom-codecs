@@ -20,9 +20,9 @@ The implementation is based on:
 
 - DICOM PS3.5, the RLE Lossless transfer syntax and encapsulated Pixel Data rules;
 - DICOM PS3.5, the RLE header and segment format;
-- `D:\Code\dotnet-source\fo-dicom.Codecs\Codec\DicomRleCodec.cs`;
-- `D:\Code\dotnet\fo-dicom.PureCodecs\src\fo-dicom.PureCodecs.Rle`;
-- `D:\Code\dotnet\fo-dicom.PureCodecs\tests\fo-dicom.PureCodecs.Tests\Rle*`.
+- `fo-dicom.Codecs DicomRleCodec.cs reference implementation`;
+- the PureCodecs RLE implementation;
+- the PureCodecs RLE tests.
 
 The Rust implementation must remain pure Rust. No native library, C/C++ source,
 P/Invoke, or external codec process is permitted.
