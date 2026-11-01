@@ -307,6 +307,9 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
             return Err("truncated SOT segment".into());
         }
         let sot = Sot::parse(&data[offset + 4..offset + 12])?;
+        if sot.tile != 0 {
+            return Err("only tile 0 is supported".into());
+        }
         offset += 12;
         if offset + 2 > data.len() {
             return Err("truncated tile-part before SOD".into());

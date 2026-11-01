@@ -583,8 +583,13 @@ fn finish_header(
     if qcd.steps.len() < expected_steps {
         return Err("QCD has fewer steps than the decomposition level count requires".into());
     }
-    for (_, quantization) in &qccs {
-        if quantization.steps.len() < expected_steps {
+    for (component, quantization) in &qccs {
+        let levels = cocs
+            .iter()
+            .find(|coc| coc.component == *component)
+            .map(|coc| coc.style.decompositions)
+            .unwrap_or(cod.style.decompositions);
+        if quantization.steps.len() < crate::quantization::subband_count(levels) {
             return Err("QCC has fewer steps than the decomposition level count requires".into());
         }
     }
