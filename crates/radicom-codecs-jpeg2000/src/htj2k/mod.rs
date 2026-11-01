@@ -3,11 +3,8 @@
 //! The module is introduced incrementally; the shared classic JPEG 2000
 //! container and DICOM adapter are reused by the HT codecs.
 
-#![allow(dead_code)]
-
 pub(crate) mod cleanup;
 pub(crate) mod codestream;
-pub(crate) mod mel;
 pub(crate) mod packet;
 pub(crate) mod quant;
 pub(crate) mod tables;

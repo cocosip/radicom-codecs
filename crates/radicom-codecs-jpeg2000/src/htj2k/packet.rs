@@ -12,7 +12,6 @@ pub(crate) struct DecodedBlock {
     pub(crate) index: usize,
     pub(crate) data: Vec<u8>,
     pub(crate) zero_bitplanes: u8,
-    pub(crate) pass_count: u32,
 }
 
 #[derive(Clone)]
@@ -267,7 +266,6 @@ pub(crate) fn decode_ht_packet(
         index: usize,
         length: usize,
         zero_bitplanes: u8,
-        pass_count: u32,
     }
     let mut pending = Vec::new();
 
@@ -304,15 +302,18 @@ pub(crate) fn decode_ht_packet(
                     0
                 };
                 let pass_count = decode_pass_count(&mut reader)?;
-                let segments = decode_ht_segments(&mut reader, pass_count)?;
-                for (passes, length) in segments {
-                    pending.push(Pending {
-                        index: block.index,
-                        length,
-                        zero_bitplanes: zero_bitplanes as u8,
-                        pass_count: passes,
-                    });
+                if pass_count > 1 {
+                    return Err("HTJ2K refinement passes are not supported".into());
                 }
+                let (_, length) = decode_ht_segments(&mut reader, pass_count)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "HTJ2K packet is missing a cleanup segment".to_string())?;
+                pending.push(Pending {
+                    index: block.index,
+                    length,
+                    zero_bitplanes: zero_bitplanes as u8,
+                });
             }
         }
     }
@@ -329,7 +330,6 @@ pub(crate) fn decode_ht_packet(
             index: item.index,
             data: data[offset..offset + item.length].to_vec(),
             zero_bitplanes: item.zero_bitplanes,
-            pass_count: item.pass_count,
         });
         offset += item.length;
     }
@@ -468,7 +468,6 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].data, vec![1, 2, 3, 4, 5]);
         assert_eq!(blocks[0].zero_bitplanes, 7);
-        assert_eq!(blocks[0].pass_count, 1);
     }
 
     #[test]
