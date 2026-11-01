@@ -13,11 +13,16 @@ pub(crate) fn encode_frame(layout: &RleLayout, raw: &[u8]) -> Result<Vec<u8>, St
     let mut frame = vec![0u8; 64];
     let mut offsets = Vec::with_capacity(layout.segment_count);
     for segment_index in 0..layout.segment_count {
-        let (sample, plane) = layout.segment_indices(segment_index)?;
-        let mut samples = Vec::with_capacity(layout.pixel_count);
-        for pixel in 0..layout.pixel_count {
-            samples.push(raw[layout.raw_offset(pixel, sample, plane)?]);
-        }
+        let samples = if layout.bit_packed {
+            unpack_bits(layout, raw)?
+        } else {
+            let (sample, plane) = layout.segment_indices(segment_index)?;
+            let mut samples = Vec::with_capacity(layout.pixel_count);
+            for pixel in 0..layout.pixel_count {
+                samples.push(raw[layout.raw_offset(pixel, sample, plane)?]);
+            }
+            samples
+        };
         let encoded = encode_segment(&samples)?;
         offsets.push(frame.len());
         frame.extend_from_slice(&encoded);
@@ -62,6 +67,10 @@ pub(crate) fn decode_frame(layout: &RleLayout, rle: &[u8]) -> Result<Vec<u8>, St
             }
             Err(error) => return Err(error),
         };
+        if layout.bit_packed {
+            pack_bits(layout, &mut raw, &decoded)?;
+            continue;
+        }
         let (sample, plane) = layout.segment_indices(segment_index)?;
         for (pixel, &value) in decoded.iter().enumerate() {
             let offset = layout.raw_offset(pixel, sample, plane)?;
@@ -71,6 +80,50 @@ pub(crate) fn decode_frame(layout: &RleLayout, rle: &[u8]) -> Result<Vec<u8>, St
         }
     }
     Ok(raw)
+}
+
+/// Expands the native LSB-first bit-packed frame to one byte per pixel.
+fn unpack_bits(layout: &RleLayout, raw: &[u8]) -> Result<Vec<u8>, String> {
+    if raw.len() < layout.frame_length {
+        return Err(format!(
+            "raw frame length {} is shorter than expected {}",
+            raw.len(),
+            layout.frame_length
+        ));
+    }
+    let mut samples = Vec::with_capacity(layout.pixel_count);
+    for pixel in 0..layout.pixel_count {
+        let byte = *raw
+            .get(pixel / 8)
+            .ok_or_else(|| "bit-packed pixel is outside the raw frame".to_owned())?;
+        samples.push((byte >> (pixel % 8)) & 1);
+    }
+    Ok(samples)
+}
+
+/// Packs one byte per pixel back into the native LSB-first frame; only 0 and 1
+/// are valid wire values for a 1-bit sample.
+fn pack_bits(layout: &RleLayout, raw: &mut [u8], samples: &[u8]) -> Result<(), String> {
+    if samples.len() != layout.pixel_count {
+        return Err(format!(
+            "decoded segment length {} does not match expected {}",
+            samples.len(),
+            layout.pixel_count
+        ));
+    }
+    raw.fill(0);
+    for (pixel, &value) in samples.iter().enumerate() {
+        match value {
+            0 => {}
+            1 => raw[pixel / 8] |= 1 << (pixel % 8),
+            other => {
+                return Err(format!(
+                    "1-bit sample value {other} at pixel {pixel} is not 0 or 1"
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -92,5 +145,33 @@ mod tests {
         let mut encoded = encode_frame(&layout, &[1, 2, 3]).unwrap();
         encoded[0] = 2;
         assert!(decode_frame(&layout, &encoded).is_err());
+    }
+
+    #[test]
+    fn encodes_one_bit_frame_as_a_single_byte_per_pixel_segment() {
+        let layout = RleLayout::new_for_test(2, 7, 1, 1, 0).unwrap();
+        let raw = [0b1010_1010, 0b0011_0011];
+        let encoded = encode_frame(&layout, &raw).unwrap();
+        let header = RleHeader::parse(&encoded).unwrap();
+        assert_eq!(header.offsets().len(), 1);
+        let start = header.offsets()[0];
+        let segment = &encoded[start..];
+        let decoded = match decode_segment(segment, layout.pixel_count) {
+            Ok(decoded) => decoded,
+            Err(_) => decode_segment(&segment[..segment.len() - 1], layout.pixel_count).unwrap(),
+        };
+        assert_eq!(decoded.len(), 14);
+        assert!(decoded.iter().all(|&value| value <= 1));
+        assert_eq!(decode_frame(&layout, &encoded).unwrap(), raw);
+    }
+
+    #[test]
+    fn rejects_one_bit_segment_values_above_one() {
+        let layout = RleLayout::new_for_test(1, 3, 1, 1, 0).unwrap();
+        let mut frame = vec![0u8; 64];
+        frame[..64].copy_from_slice(&RleHeader::write(&[64]).unwrap());
+        frame.extend_from_slice(&encode_segment(&[0, 1, 2]).unwrap());
+        let error = decode_frame(&layout, &frame).unwrap_err();
+        assert!(error.contains("is not 0 or 1"), "{error}");
     }
 }

@@ -178,6 +178,16 @@ mod tests {
         ds
     }
 
+    fn pack_bits(bits: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+        for (index, &bit) in bits.iter().enumerate() {
+            if bit == 1 {
+                bytes[index / 8] |= 1 << (index % 8);
+            }
+        }
+        bytes
+    }
+
     fn round_trip(
         rows: u32,
         columns: u32,
@@ -251,6 +261,42 @@ mod tests {
         let source = vec![0x12, 0x34, 0xAB, 0xCD, 0x00, 0xFF, 0x80, 0x01];
         let (actual, _) = round_trip(1, 4, 16, 1, None, std::slice::from_ref(&source));
         assert_eq!(actual, vec![source]);
+    }
+
+    #[test]
+    fn round_trips_one_bit_monochrome_with_odd_geometry() {
+        // 13 columns x 7 rows = 91 bits = 12 bytes; rows are not byte-aligned.
+        let bits: Vec<u8> = (0..91)
+            .map(|index| u8::from(index % 3 == 0 || index % 7 == 1))
+            .collect();
+        let source = pack_bits(&bits);
+        assert_eq!(source.len(), 12);
+        assert_eq!(source[11] & 0xF8, 0);
+        let (actual, _) = round_trip(7, 13, 1, 1, None, std::slice::from_ref(&source));
+        assert_eq!(actual, vec![source]);
+    }
+
+    #[test]
+    fn round_trips_one_bit_monochrome_multiple_frames() {
+        let first = pack_bits(
+            &(0..91)
+                .map(|index| u8::from(index % 2 == 0))
+                .collect::<Vec<_>>(),
+        );
+        let second = pack_bits(
+            &(0..91)
+                .map(|index| u8::from(index % 5 < 2))
+                .collect::<Vec<_>>(),
+        );
+        let frames = vec![first, second];
+        let (actual, compressed) = round_trip(7, 13, 1, 1, None, &frames);
+        assert_eq!(actual, frames);
+        assert_eq!(
+            PixelDataRef::from_dataset(&compressed)
+                .unwrap()
+                .number_of_frames(),
+            2
+        );
     }
 
     #[test]

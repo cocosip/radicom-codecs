@@ -72,16 +72,24 @@ The first implementation supports the layouts already covered by PureCodecs:
 
 | `BitsAllocated` | Samples | Planar configuration | Required result |
 | ---: | ---: | --- | --- |
+| 1 | 1 | absent/0 | exact round-trip (MONOCHROME1/2 only) |
 | 8 | 1 | absent/0 | exact round-trip |
 | 16 | 1 | absent/0 | exact round-trip |
 | 8 | 3 | 0 interleaved | exact round-trip |
 | 8 | 3 | 1 planar | exact round-trip |
 
 Multi-frame input is supported for every accepted layout. `BitsAllocated` must
-be a whole number of bytes and the segment count must be between 1 and 15.
-The DICOM adapter in the current `radicom` checkout rejects encapsulated output
-above 16 bits, so the first release accepts only 8 and 16 bits and rejects 1,
-32, and 64 bits with a managed error.
+be 1, 8, or 16, and the segment count must be between 1 and 15.
+`BitsAllocated` 1 is the BINARY (Segmentation IOD) form allowed by PS3.5
+Table 8.2.2-1 Note 5. The native frame packs pixels continuously least
+significant bit first, with no row-byte alignment, so its length is
+`ceil(rows * columns / 8)`. It requires `BitsStored` 1, `HighBit` 0,
+`SamplesPerPixel` 1, and `PhotometricInterpretation` MONOCHROME1 or
+MONOCHROME2; `PixelRepresentation` 0 or 1 is accepted because the bit pattern
+is used as 0/1. On the wire each 1-bit segment holds one byte per pixel
+(0x00 or 0x01), so `segment_count` stays 1. The DICOM adapter in the current
+`radicom` checkout rejects encapsulated output above 16 bits, so 32 and 64
+bits are rejected with a managed error.
 
 The codec must validate:
 
@@ -91,6 +99,8 @@ The codec must validate:
 - `pixel_representation` is 0 or 1;
 - the source frame contains at least the exact uncompressed frame size;
 - `bytes_allocated * samples_per_pixel <= 15`;
+- for `BitsAllocated` 1: `BitsStored` 1, `HighBit` 0, one sample, and
+  MONOCHROME1/MONOCHROME2;
 - checked arithmetic succeeds for every size, offset, and allocation.
 
 For one sample, planar configuration has no effect. For multiple samples, value
@@ -224,6 +234,11 @@ Encoding reads those offsets in increasing pixel order to form one segment of
 This mapping preserves the native little-endian DICOM sample representation while
 honoring the RLE requirement that the high byte plane is segment zero.
 
+For `BitsAllocated` 1 the plane mapping does not apply: the native frame is
+LSB-first packed with no row alignment, and the single segment is formed by
+expanding each bit to a 0x00/0x01 byte. Decoding packs those bytes back and
+rejects any value above 1 as malformed input.
+
 ## 7. Rust module structure
 
 The implementation should stay small and split by responsibility:
@@ -295,7 +310,9 @@ metadata error instead of silently writing an RLE frame into another syntax.
 9. Append all decoded frames to `dst` only after every source frame succeeds.
 
 The output frame is exactly `rows * columns * samples_per_pixel * bytes_allocated`
-bytes. `dst.add_frame` handles any final DICOM padding and frame storage details.
+bytes, except for `BitsAllocated` 1 where it is
+`ceil(rows * columns * samples_per_pixel / 8)`. `dst.add_frame` handles any final
+DICOM padding and frame storage details.
 
 ## 10. Error conditions
 
@@ -386,6 +403,27 @@ Once the local RLE implementation passes its own tests:
 
 Lossless acceptance is exact byte equality after decode. Compressed byte equality
 is an additional diagnostic, not a substitute for decoded-pixel correctness.
+
+#### 11.5.1 `BitsAllocated` 1 has no third-party reader
+
+PS3.5 Annex G.2 defines the 1-bit case as a *Padded Composite Pixel Code*: the
+1-bit code is padded with zero most-significant bits to one byte, so the frame is
+a single byte segment holding one byte per pixel. No deployed decoder implements
+that case, which was verified rather than assumed:
+
+| Tool | Result |
+| --- | --- |
+| fo-dicom (CharLS/its own RLE) | rejects `BitsAllocated` 1 in both directions |
+| DCMTK 3.7.1 `dcmcrle` | `F: No conversion to transfer syntax RLE Lossless possible!` |
+| DCMTK 3.7.1 `dcmdrle` | `E: The RLE decoder only supports images where BitsAllocated is a multiple of 8.` |
+
+The oracle is therefore an independent decoder written from Annex G.2/G.3 inside
+the C# interop harness (`dicomref rle-dec`, ~40 lines: 64-byte header, PackBits
+segments, byte-plane reassembly, bit repacking). It decodes the encoder's
+`BitsAllocated` 1 output to the source samples with 0 differences over all 384
+bytes. DCMTK 3.7.1 does read and write 8-bit and 16-bit RLE in both directions
+with byte-exact results, and its compressed bytes differ from ours only in how
+literal and repeat runs are split.
 
 ## 12. Code review checklist
 
