@@ -13,6 +13,7 @@ use frame::Layout;
 use radicom::error::{CodecError, Error};
 use radicom::model::transfer_syntax::{syntaxes, TransferSyntax};
 use radicom::pixel::codec::{Codec, CodecParams, JpegLsParams};
+use radicom::pixel::photometric::PhotometricInterpretation;
 use radicom::pixel::{PixelData, PixelDataRef};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -102,7 +103,7 @@ fn operate(
             ))
         }
     };
-    if p.color_transformation != 0 || p.preset_coding_params != 0 || p.reset_contexts {
+    if p.preset_coding_params != 0 || p.reset_contexts {
         return Err(error(
             codec,
             if decode { "decode" } else { "encode" },
@@ -136,6 +137,11 @@ fn operate(
             ));
         }
         let layout = Layout::destination(dst).map_err(|m| error(codec, "decode", m))?;
+        // The compressed dataset's PI describes its samples. A YBR_FULL stream is
+        // converted to RGB exactly like the encode path converts YBR input, so the
+        // output samples and the rewritten PI agree (PS3.5 Table 8.2.3-1 note 3).
+        let source_ybr =
+            src.photometric_interpretation() == Some(PhotometricInterpretation::YbrFull);
         let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
         for i in 0..src.number_of_frames() {
             let b = src
@@ -150,6 +156,7 @@ fn operate(
                     bytes.as_ref(),
                     p,
                     (syntax.uid() == syntaxes::JPEG_LS_LOSSLESS.uid()).then_some(0),
+                    source_ybr,
                 )
                 .map_err(|m| error(codec, "decode", format!("frame {i}: {m}")))?,
             )
@@ -269,6 +276,48 @@ mod facade_tests {
         }
         d
     }
+    fn encode_stream(source: &Dataset) -> Dataset {
+        let mut compressed = source.clone();
+        compressed.set_transfer_syntax(syntaxes::JPEG_LS_LOSSLESS.clone());
+        compressed.remove(Tag::PIXEL_DATA);
+        JpegLsLosslessCodec
+            .encode(
+                &PixelDataRef::from_dataset(source).unwrap(),
+                &mut PixelData::create_new(&mut compressed).unwrap(),
+                &JpegLsLosslessCodec.default_params(),
+            )
+            .unwrap();
+        compressed
+    }
+    fn decode_stream(compressed: &Dataset) -> Dataset {
+        let mut decoded = compressed.clone();
+        decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        decoded.remove(Tag::PIXEL_DATA);
+        JpegLsLosslessCodec
+            .decode(
+                &PixelDataRef::from_dataset(compressed).unwrap(),
+                &mut PixelData::create_new(&mut decoded).unwrap(),
+                &JpegLsLosslessCodec.default_params(),
+            )
+            .unwrap();
+        decoded
+    }
+    fn frame_bytes(ds: &Dataset) -> Vec<u8> {
+        PixelDataRef::from_dataset(ds)
+            .unwrap()
+            .get_frame(0)
+            .unwrap()
+            .data()
+            .unwrap()
+            .to_vec()
+    }
+    fn native_bytes(ba: u16, samples: &[u16]) -> Vec<u8> {
+        if ba == 8 {
+            samples.iter().map(|v| *v as u8).collect()
+        } else {
+            samples.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+    }
     #[test]
     fn mono8_lossless_codec_roundtrip() {
         let raw = vec![0, 37, 74, 112, 149, 186, 224, 5, 42, 80, 117, 154];
@@ -314,7 +363,110 @@ mod facade_tests {
         );
     }
     #[test]
+    fn rgb_color_transform_roundtrip() {
+        // The HP transforms are an encoding preference: the stream carries the
+        // APP8 segment and the decoder undoes it without adapter involvement.
+        let raw = (0..24).map(|i| (i * 11) as u8).collect::<Vec<_>>();
+        for color_transformation in 1..=3 {
+            let mut source = ds(
+                syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+                2,
+                4,
+                8,
+                3,
+                0,
+                "RGB",
+            );
+            PixelData::create_new(&mut source)
+                .unwrap()
+                .add_frame(&raw)
+                .unwrap();
+            let mut enc = source.clone();
+            enc.set_transfer_syntax(syntaxes::JPEG_LS_LOSSLESS.clone());
+            enc.remove(Tag::PIXEL_DATA);
+            let c = JpegLsLosslessCodec;
+            let params = CodecParams::JpegLs(JpegLsParams {
+                color_transformation,
+                ..Default::default()
+            });
+            {
+                let s = PixelDataRef::from_dataset(&source).unwrap();
+                let mut d = PixelData::create_new(&mut enc).unwrap();
+                c.encode(&s, &mut d, &params).unwrap();
+            }
+            let codestream = PixelDataRef::from_dataset(&enc).unwrap().get_frame(0).unwrap();
+            let bytes = codestream.data().unwrap();
+            assert_eq!(
+                bytes
+                    .as_ref()
+                    .windows(4)
+                    .filter(|window| *window == b"mrfx")
+                    .count(),
+                1,
+                "HP{color_transformation} writes one mrfx segment"
+            );
+            let mut out = enc.clone();
+            out.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+            out.remove(Tag::PIXEL_DATA);
+            {
+                let s = PixelDataRef::from_dataset(&enc).unwrap();
+                let mut d = PixelData::create_new(&mut out).unwrap();
+                // The decode-side params are ignored: the stream decides.
+                c.decode(&s, &mut d, &c.default_params()).unwrap();
+            }
+            assert_eq!(
+                PixelDataRef::from_dataset(&out)
+                    .unwrap()
+                    .get_frame(0)
+                    .unwrap()
+                    .data()
+                    .unwrap()
+                    .as_ref(),
+                raw.as_slice(),
+                "HP{color_transformation}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_color_transformation_for_monochrome() {
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            2,
+            2,
+            8,
+            1,
+            0,
+            "MONOCHROME2",
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame([3u8, 4, 5, 6])
+            .unwrap();
+        let mut enc = source.clone();
+        enc.set_transfer_syntax(syntaxes::JPEG_LS_LOSSLESS.clone());
+        enc.remove(Tag::PIXEL_DATA);
+        let c = JpegLsLosslessCodec;
+        let err = c
+            .encode(
+                &PixelDataRef::from_dataset(&source).unwrap(),
+                &mut PixelData::create_new(&mut enc).unwrap(),
+                &CodecParams::JpegLs(JpegLsParams {
+                    color_transformation: 1,
+                    ..Default::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("three unsigned components"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn rgb_sample_interleave_roundtrip() {
+        // The default interleave mode derives from storage: an interleaved
+        // three-component frame is written as one sample-interleaved scan.
         let raw = (0..24).map(|i| (i * 11) as u8).collect::<Vec<_>>();
         let mut source = ds(
             syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
@@ -415,8 +567,69 @@ mod facade_tests {
     }
 
     #[test]
+    fn rgb_plane_interleave_roundtrip_with_explicit_parameter() {
+        // Mode one asks for plane interleaving (one scan per component) even
+        // though the source stores interleaved samples.
+        let raw = (0..24).map(|i| (i * 19) as u8).collect::<Vec<_>>();
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            2,
+            4,
+            8,
+            3,
+            0,
+            "RGB",
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let mut compressed = source.clone();
+        compressed.set_transfer_syntax(syntaxes::JPEG_LS_LOSSLESS.clone());
+        compressed.remove(Tag::PIXEL_DATA);
+        let params = CodecParams::JpegLs(JpegLsParams {
+            interleave_mode: 1,
+            ..Default::default()
+        });
+        {
+            let source_view = PixelDataRef::from_dataset(&source).unwrap();
+            let mut target = PixelData::create_new(&mut compressed).unwrap();
+            JpegLsLosslessCodec
+                .encode(&source_view, &mut target, &params)
+                .unwrap();
+        }
+        let mut decoded = compressed.clone();
+        decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        decoded.remove(Tag::PIXEL_DATA);
+        {
+            let source_view = PixelDataRef::from_dataset(&compressed).unwrap();
+            let mut target = PixelData::create_new(&mut decoded).unwrap();
+            JpegLsLosslessCodec
+                .decode(
+                    &source_view,
+                    &mut target,
+                    &JpegLsLosslessCodec.default_params(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            PixelDataRef::from_dataset(&decoded)
+                .unwrap()
+                .get_frame(0)
+                .unwrap()
+                .data()
+                .unwrap()
+                .as_ref(),
+            raw.as_slice()
+        );
+    }
+
+    #[test]
     fn ybr_full_is_normalized_to_rgb_on_both_paths() {
-        let ybr = vec![128, 128, 128, 100, 90, 200, 0, 0, 0];
+        let ybr = vec![128u8, 128, 128, 100, 90, 200, 0, 0, 0];
+        let rgb = [128u8, 128, 128, 201, 62, 33, 0, 135, 0];
+
+        // Encode path: a YBR_FULL source is converted to RGB samples and relabelled.
         let mut source = ds(
             syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
             1,
@@ -430,53 +643,170 @@ mod facade_tests {
             .unwrap()
             .add_frame(&ybr)
             .unwrap();
-        let mut compressed = source.clone();
-        compressed.set_transfer_syntax(syntaxes::JPEG_LS_LOSSLESS.clone());
-        compressed.remove(Tag::PIXEL_DATA);
-        {
-            let source_view = PixelDataRef::from_dataset(&source).unwrap();
-            let mut target = PixelData::create_new(&mut compressed).unwrap();
-            JpegLsLosslessCodec
-                .encode(
-                    &source_view,
-                    &mut target,
-                    &JpegLsLosslessCodec.default_params(),
-                )
-                .unwrap();
-        }
+        let compressed = encode_stream(&source);
         assert_eq!(
             compressed.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
             "RGB"
         );
-        let mut decoded = compressed.clone();
-        decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
-        decoded.remove(Tag::PIXEL_DATA);
-        decoded.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "YBR_FULL");
-        {
-            let source_view = PixelDataRef::from_dataset(&compressed).unwrap();
-            let mut target = PixelData::create_new(&mut decoded).unwrap();
-            JpegLsLosslessCodec
-                .decode(
-                    &source_view,
-                    &mut target,
-                    &JpegLsLosslessCodec.default_params(),
-                )
-                .unwrap();
-        }
+        assert_eq!(frame_bytes(&decode_stream(&compressed)), rgb);
+
+        // Decode path: the compressed dataset's PI says YBR_FULL, so its samples
+        // are YBR and must be converted before they are relabelled RGB. Encoding an
+        // RGB-labelled copy of the same samples keeps them unconverted.
+        let mut foreign = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            3,
+            8,
+            3,
+            0,
+            "RGB",
+        );
+        PixelData::create_new(&mut foreign)
+            .unwrap()
+            .add_frame(&ybr)
+            .unwrap();
+        let mut stream = encode_stream(&foreign);
+        stream.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "YBR_FULL");
+        let decoded = decode_stream(&stream);
         assert_eq!(
             decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
             "RGB"
         );
-        assert_eq!(
-            PixelDataRef::from_dataset(&decoded)
-                .unwrap()
-                .get_frame(0)
-                .unwrap()
-                .data()
-                .unwrap()
-                .as_ref(),
-            &[128, 128, 128, 201, 62, 33, 0, 135, 0]
+        assert_eq!(frame_bytes(&decoded), rgb);
+    }
+
+    #[test]
+    fn rgb_labelled_stream_is_not_colour_converted() {
+        let rgb = vec![0u8, 10, 200, 30, 128, 255, 3, 99, 17];
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            3,
+            8,
+            3,
+            0,
+            "RGB",
         );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&rgb)
+            .unwrap();
+        let decoded = decode_stream(&encode_stream(&source));
+        assert_eq!(
+            decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "RGB"
+        );
+        assert_eq!(frame_bytes(&decoded), rgb, "RGB samples stay untouched");
+    }
+
+    #[test]
+    fn palette_color_round_trips_with_photometric_interpretation_preserved() {
+        const PAL8: &[u16] = &[0, 1, 2, 3, 4, 5, 6, 255, 128, 64, 32, 7];
+        const PAL2: &[u16] = &[0, 1, 2, 3, 3, 2, 1, 0, 1, 3, 2, 0];
+        const PAL8B: &[u16] = &[0, 1, 255, 128, 7, 42, 200, 3, 99, 17, 240, 1];
+        const PAL12: &[u16] = &[0, 1, 4095, 2048, 7, 42, 3000, 3, 999, 17, 2400, 1];
+        const PAL16: &[u16] = &[0, 1, 65535, 32768, 7, 42, 60000, 3, 999, 17, 2400, 1];
+        // PALETTE COLOR is a one-sample index image: no colour conversion happens
+        // and the PI must survive the encode/decode pair unchanged.
+        for (ba, bs, samples) in [
+            (8u16, 8u16, PAL8),
+            (16, 2, PAL2),
+            (16, 8, PAL8B),
+            (16, 12, PAL12),
+            (16, 16, PAL16),
+        ] {
+            let mut source = ds(
+                syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+                4,
+                3,
+                ba,
+                1,
+                0,
+                "PALETTE COLOR",
+            );
+            source.insert_value(Tag::BITS_STORED, bs);
+            source.insert_value(Tag::HIGH_BIT, bs - 1);
+            PixelData::create_new(&mut source)
+                .unwrap()
+                .add_frame(native_bytes(ba, samples))
+                .unwrap();
+            let compressed = encode_stream(&source);
+            assert_eq!(
+                compressed.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+                "PALETTE COLOR",
+                "encode keeps the palette PI (BA={ba} BS={bs})"
+            );
+            let decoded = decode_stream(&compressed);
+            assert_eq!(
+                decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+                "PALETTE COLOR",
+                "decode keeps the palette PI (BA={ba} BS={bs})"
+            );
+            assert_eq!(
+                frame_bytes(&decoded),
+                native_bytes(ba, samples),
+                "BA={ba} BS={bs}"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_color_with_three_components_is_rejected_on_both_paths() {
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            1,
+            8,
+            3,
+            0,
+            "PALETTE COLOR",
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame([1u8, 2, 3])
+            .unwrap();
+        let mut target = source.clone();
+        target.set_transfer_syntax(syntaxes::JPEG_LS_LOSSLESS.clone());
+        target.remove(Tag::PIXEL_DATA);
+        let error = JpegLsLosslessCodec
+            .encode(
+                &PixelDataRef::from_dataset(&source).unwrap(),
+                &mut PixelData::create_new(&mut target).unwrap(),
+                &JpegLsLosslessCodec.default_params(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("PhotometricInterpretation"));
+        assert!(!target.contains(&Tag::PIXEL_DATA));
+
+        let mut mono = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            1,
+            8,
+            1,
+            0,
+            "MONOCHROME2",
+        );
+        PixelData::create_new(&mut mono)
+            .unwrap()
+            .add_frame([7u8])
+            .unwrap();
+        let stream = encode_stream(&mono);
+        let mut decoded = stream.clone();
+        decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        decoded.remove(Tag::PIXEL_DATA);
+        decoded.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "PALETTE COLOR");
+        decoded.insert_value(Tag::SAMPLES_PER_PIXEL, 3u16);
+        let error = JpegLsLosslessCodec
+            .decode(
+                &PixelDataRef::from_dataset(&stream).unwrap(),
+                &mut PixelData::create_new(&mut decoded).unwrap(),
+                &JpegLsLosslessCodec.default_params(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("PhotometricInterpretation"));
+        assert!(!decoded.contains(&Tag::PIXEL_DATA));
     }
 
     #[test]
@@ -562,10 +892,6 @@ mod facade_tests {
             .unwrap();
         for params in [
             CodecParams::None,
-            CodecParams::JpegLs(JpegLsParams {
-                color_transformation: 1,
-                ..Default::default()
-            }),
             CodecParams::JpegLs(JpegLsParams {
                 preset_coding_params: 1,
                 ..Default::default()

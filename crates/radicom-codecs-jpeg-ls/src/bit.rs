@@ -85,7 +85,10 @@ impl<'a> BitReader<'a> {
         }
         Ok(v)
     }
-    pub(crate) fn finish(mut self) -> Result<(), String> {
+    /// Verifies that the segment ended on a byte boundary with zero padding and
+    /// no unconsumed bytes. Takes `&mut self` so a restart boundary can finish
+    /// one scan segment and continue with a fresh reader.
+    pub(crate) fn finish(&mut self) -> Result<(), String> {
         if self.previous_ff && self.left == 0 {
             // A full final 0xff still needs a stuffed zero and zero padding.
             self.fill()?;
