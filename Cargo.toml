@@ -16,4 +16,4 @@ license = "MIT"
 repository = "https://github.com/cocosip/radicom-codecs"
 
 [workspace.dependencies]
-radicom = { path = "../radicom/crates/radicom" }
+radicom = { path = "../radicom/crates/radicom", version = "=0.2.0" }
