@@ -8,8 +8,8 @@ transfer syntaxes.
 - ISO/IEC 15444-15 / ITU-T T.814, High Throughput JPEG 2000.
 - DICOM PS3.3 and PS3.5, HTJ2K transfer syntaxes and encapsulated Pixel Data.
 - `fo-dicom.Codecs DicomHtJpeg2000Codec.cs reference implementation`.
-- OpenJPH/OpenJPEG output and fo-dicom acceptance tests are external oracles;
-  no native library is linked by the Rust implementation.
+- OpenJPH/OpenJPEG output and fo-dicom acceptance tests may be used as external
+  oracles only; their source is not copied, vendored, linked, or called.
 
 ## Registrations
 
@@ -31,13 +31,13 @@ caller-supplied progression value.
 
 ## DICOM and shared codestream contract
 
-HTJ2K reuses classic JPEG 2000 marker parsing, SIZ geometry, tile/component
-layout, wavelet/quantization selection, Tier-2 packet assembly, and the DICOM
-frame adapter. It accepts the same 8/16-bit mono/RGB, signedness, planar RGB,
-YBR_FULL/YBR_FULL_422 normalization, checked dimensions, and encapsulation rules
-described in the shared design. JP2/JPT wrappers, partial YBR, palette/CMYK,
-unknown photometric interpretations, and unsupported Part 2 extensions fail
-with managed codec errors.
+HTJ2K is a module in the JPEG 2000 crate. It reuses classic JPEG 2000 marker
+parsing, SIZ geometry, tile/component layout, wavelet/quantization selection,
+Tier-2 packet assembly, and the DICOM frame adapter. It accepts the same
+8/16-bit mono/RGB, signedness, planar RGB, YBR_FULL/YBR_FULL_422 normalization,
+checked dimensions, and encapsulation rules described in the shared design.
+JP2/JPT wrappers, partial YBR, palette/CMYK, unknown photometric
+interpretations, and unsupported Part 2 extensions fail with managed errors.
 
 SIZ width/height, component count, precision, signedness, and decoded byte size
 are checked against the destination before HT decoding. The check uses checked
@@ -46,8 +46,9 @@ in fo-dicom's `HtJpeg2000GeometryUnitTest`.
 
 ## HT block pipeline
 
-The HT path writes the normal J2K geometry and packet markers but sets the HT
-coding style in COD/COC. Each code block is encoded or decoded independently:
+The HT path writes the normal J2K geometry and packet markers, emits the Part 15
+capability marker when required by the selected profile, and sets the HT
+code-block style in COD/COC. Each code block is encoded or decoded independently:
 
 1. cleanup-pass significance state and stripe traversal;
 2. MEL run-length coding for zero/significance runs;
@@ -56,31 +57,35 @@ coding style in COD/COC. Each code block is encoded or decoded independently:
 5. legal HT termination and refinement segments;
 6. Tier-2 inclusion/zero-bit-plane tag trees and progression packets.
 
-Classic MQ and HT block coders share no state. A marker that declares HT coding
-must route to the HT implementation; a classic block in an HT stream is an
-error. TLM markers are optional on encode and accepted on decode when their
-bounded lengths and tile-part offsets are consistent.
+Classic MQ and HT block coders share no state. The declared code-block style
+selects the coder; the DICOM HTJ2K profiles require HT blocks and reject a
+legacy block style when it is encountered. TLM markers are optional on encode
+and accepted on decode when their bounded lengths and tile-part offsets are
+consistent.
 
 ## Parameters and progression
 
 `decompositions` is the number of DWT levels, `employ_color_transform` selects
 RCT/ICT for RGB, and `insert_tlm_markers` controls encoder TLM emission. `.201`
 and `.203` support all five progression values with LRCP as the default. `.202`
-emits and validates RPCL and rejects a conflicting progression. Because the
-parameter type has no rate field, `.203` uses a fixed profile equivalent to
-classic J2K `rate = 20`; acceptance bounds are maximum absolute error `<= 2`
-for 8-bit fixtures and `<= 512` for 16-bit fixtures. Lossless `.201/.202`
-comparisons are sample-exact and lossy `.203` requires a decodable codestream.
+emits and validates RPCL and rejects a conflicting progression. Lossy quality
+must be an explicit project parameter shared with the classic encoder; a fixed
+`rate = 20` and fixed sample-error thresholds are not ISO or DICOM rules.
+Lossless `.201/.202` comparisons are sample-exact, while lossy `.203` tests
+must use the selected quality profile and require a decodable codestream.
 
 ## Stages and checks
 
-1. Implement bounded HT marker/bit structures and MEL/VLC/MagSgn unit vectors.
+1. Implement bounded HT marker/bit structures, capability-marker parsing, and
+   MEL/VLC/MagSgn unit vectors.
 2. Implement HT cleanup/refinement and exact `.201` round trips.
 3. Add forced RPCL packet iteration and `.202` checks, including TLM parsing.
 4. Add irreversible quantization and `.203` tolerance tests.
-5. Run fo-dicom/OpenJPH bidirectional fixtures, malformed-stream tests,
-   geometry-overrun regressions, and bounded fuzz/property checks.
+5. Run fo-dicom/OpenJPH bidirectional fixtures, malformed-stream and profile
+   matrix tests, geometry-overrun regressions, and bounded fuzz/property checks.
 
-The public registry and parameter types stay unchanged; the sibling `radicom`
-boundary is already aligned with the generated dictionary and the DICOM
+The public registry keeps one JPEG 2000 family entry point. The classic and
+HTJ2K codec types remain inside the same crate, while the parameter boundary may
+be extended with an explicit lossy quality field. The sibling `radicom`
+boundary is aligned with the generated dictionary and the DICOM
 `.201/.202/.203` assignments.

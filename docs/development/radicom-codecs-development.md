@@ -1,17 +1,16 @@
 # radicom-codecs development plan and status
 
 **Date:** 2026-11-01
-**Current milestone:** classic JPEG 2000 implementation and shared engine boundary
-**Status:** classic JPEG 2000 local verification complete; independent fo-dicom
-interoperability remains an opt-in acceptance gate
+**Current milestone:** JPEG 2000 and HTJ2K self-implementation design retained
+**Status:** JPEG 2000/HTJ2K production code was removed; the design is pending a
+new pure-Rust implementation
 
 ## Scope of this milestone
 
 The workspace and registration boundary are complete. The RLE Lossless family,
-the four classic JPEG transfer syntaxes, both JPEG-LS transfer syntaxes, and the
-two classic JPEG 2000 transfer syntaxes are integrated through the existing
-`radicom` codec trait and registry. HTJ2K remains an explicit later-stage
-registration that already uses the same engine boundary.
+the four classic JPEG transfer syntaxes, and both JPEG-LS transfer syntaxes are
+integrated through the existing `radicom` codec trait and registry. JPEG 2000
+and HTJ2K remain design-only work until their shared pure-Rust crate is rebuilt.
 
 The `radicom` dependency is a local path dependency. CI is intentionally deferred
 until `radicom` has been published and the project can consume the released package.
@@ -26,16 +25,10 @@ until `radicom` has been published and the project can consume the released pack
   lossless, and frame-adapter implementation.
 - `crates/radicom-codecs-jpeg-ls`: JPEG-LS Lossless/Near-Lossless algorithms,
   codestream validation, and DICOM frame adapters.
-- `crates/radicom-codecs-jpeg2000/src/common.rs`: DICOM-independent frame and
-  codestream engine contract shared by classic JPEG 2000 and HTJ2K.
-- `crates/radicom-codecs-jpeg2000/src/codestream.rs`: DICOM sample normalization
-  plus the classic engine facade.
-- `crates/radicom-codecs-jpeg2000/src/engine.rs`: one dispatcher selecting the
-  classic or HTJ2K engine without changing the frame adapter.
-- `crates/radicom-codecs-jpeg2000/src/htj2k.rs`: controlled later-stage HTJ2K
-  engine seam.
-- `crates/radicom-codecs-jpeg2000/vendor/`: vendored pure Rust codestream,
-  wavelet, quantization, MQ/EBCOT, packet, and bounds implementation.
+- `crates/radicom-codecs-jpeg2000/` (planned): one pure-Rust crate containing
+  shared DICOM/codestream layers, classic JPEG 2000, and HTJ2K Tier-1 modules.
+- `docs/design/jpeg2000.md` and `docs/design/htj2k.md`: implementation contracts;
+  no third-party codec source is permitted.
 - `tests` (facade unit tests for now): registration and transcoder-boundary checks.
 
 ## Task checklist
@@ -52,27 +45,26 @@ until `radicom` has been published and the project can consume the released pack
 - [x] Add one `Codec` implementation for RLE Lossless.
 - [x] Add four `Codec` implementations for classic JPEG.
 - [x] Add two `Codec` implementations for JPEG-LS.
-- [x] Add two `Codec` implementations for classic JPEG 2000.
-- [x] Add three `Codec` implementations for HTJ2K.
+- [ ] Add two `Codec` implementations for classic JPEG 2000 in the shared crate.
+- [ ] Add three HTJ2K codec variants in that same crate.
 - [x] Return the matching `radicom::syntaxes` entry from every codec.
 - [x] Return the matching `CodecParams` default from every codec.
 - [x] Return an explicit `CodecError::Operation` from unsupported operations.
 
 ### Task 3: Implement the facade registry
 
-- [x] Register all twelve codec types explicitly.
+- [x] Register the seven currently implemented codec types explicitly.
 - [x] Implement `has_codec`, `get_codec`, and `can_transcode` using the core contract.
 - [x] Provide one installation function that calls `radicom::pixel::codec::set_codec_registry`.
 - [x] Re-export the concrete codec types from the facade.
 
 ### Task 4: Verify the boundary
 
-- [x] Test that all twelve syntaxes are registered.
+- [x] Test that all seven currently implemented syntaxes are registered.
 - [x] Test raw-to-compressed and compressed-to-raw capability checks.
 - [x] Test default parameter variants.
-- [x] Test that the deferred HTJ2K engine fails with a managed codec operation
-  error through the shared dispatcher.
-- [x] Run the classic JPEG 2000 frame and codestream tests.
+- [ ] Test the shared JPEG 2000/HTJ2K boundary and managed error paths.
+- [ ] Run the classic JPEG 2000 and HTJ2K frame and codestream tests.
 
 ### RLE Stage 1 implementation status
 
@@ -120,20 +112,21 @@ the distinction between portable tests and native evidence are in
 
 ### Classic JPEG 2000 implementation status
 
-- [x] Vendor the complete pure Rust JPEG 2000 engine source into the workspace.
-- [x] Route `.90` and `.91` through one common engine contract.
-- [x] Cover 5/3 lossless, 9/7 lossy, quantization/rate targets, standard J2K
-  markers, signed samples, planar RGB, YBR 4:2:2, multi-frame data, and
-  malformed/truncated codestream rejection.
-- [x] Keep the external fo-dicom/OpenJPEG checks outside the tracked source.
+- [ ] Implement the shared codestream, wavelet, quantization, Tier-1, and
+  Tier-2 layers in Rust without a vendor or third-party codec engine.
+- [ ] Route `.90` and `.91` through one common JPEG 2000 crate contract.
+- [ ] Cover 5/3 lossless, 9/7 lossy, quality layers, marker profiles, signed
+  samples, planar RGB, YBR 4:2:2, multi-frame data, and malformed codestreams.
+- [ ] Keep fo-dicom/OpenJPEG interoperability tools outside production source.
 - [ ] Run the independent fo-dicom bidirectional acceptance matrix.
 
 ## Next implementation stages
 
-1. **HTJ2K:** implement MEL/VLC/MagSgn block coding and `.201/.202/.203`
-   adapters behind the existing engine contract.
+1. **JPEG 2000 crate:** implement shared codestream/adapter layers, classic
+   5/3 and 9/7 coding, then the HTJ2K MEL/VLC/MagSgn block coder in the same
+   crate.
 2. **Interoperability:** run the independent fo-dicom/OpenJPEG bidirectional
-   matrix for classic JPEG 2000, then add the HTJ2K matrix after Part 15 lands.
+   matrix for `.90/.91/.201/.202/.203` after the pure-Rust implementation lands.
 
 Each stage must pass its focused tests and the previous stages before the next stage starts.
 

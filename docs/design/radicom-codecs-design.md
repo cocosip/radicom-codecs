@@ -31,6 +31,10 @@ copied, translated, compiled, linked, loaded, or called by production Rust code.
 The C# implementation is used to compare public behavior and test cases; it is
 not a Rust dependency.
 
+No third-party JPEG, JPEG 2000, HTJ2K, OpenJPEG, OpenJPH, or native codec source
+may be vendored into this repository. External implementations are test oracles
+only; every production codec algorithm is implemented in Rust in this workspace.
+
 The standards documents are the normative source for codestream syntax. The
 separate family documents in this directory record the applicable standard,
 supported profiles, algorithm stages, DICOM metadata rules, and rejection rules.
@@ -122,7 +126,7 @@ radicom-codecs/
 │   ├── radicom-codecs-rle/          # RLE implementation
 │   ├── radicom-codecs-jpeg/         # classic JPEG implementation
 │   ├── radicom-codecs-jpeg-ls/      # JPEG-LS implementation
-│   └── radicom-codecs-jpeg2000/     # classic JPEG 2000 and HTJ2K
+│   └── radicom-codecs-jpeg2000/     # one crate: classic JPEG 2000 + HTJ2K
 ├── tests/                           # cross-crate and radicom integration tests
 └── docs/
 ```
@@ -133,9 +137,10 @@ single registration function for applications. No codec is discovered through
 reflection or dynamic library loading.
 
 The JPEG 2000 crate contains both classic JPEG 2000 and HTJ2K because they share
-codestream geometry, DICOM frame adaptation, and marker infrastructure. Their
-wavelet transforms, quantization, packet policy, and block coding remain separate
-modules and separate compatibility tests.
+codestream geometry, DICOM frame adaptation, and marker infrastructure. HTJ2K is
+an alternate Part 15 code-block algorithm inside that crate, not a separate
+top-level codec family. Their wavelet transforms, quantization, packet policy,
+and Tier-1 block coding remain separate modules and separate compatibility tests.
 
 ## 6. Codec registration surface
 
@@ -218,7 +223,8 @@ Errors must identify:
 - marker, segment, tile, packet, component, or bitstream location when known.
 
 No codec may panic on malformed input. Native libraries, P/Invoke, build scripts
-that compile C/C++, and runtime native fallback are forbidden.
+that compile C/C++, runtime native fallback, and vendored third-party codec
+engines are forbidden.
 
 ## 10. Verification and compatibility gates
 
@@ -261,6 +267,7 @@ The development document records the checklist and current status for these
 stages. A stage is complete only when its family tests, registry tests, and
 reference interoperability tests pass without weakening an earlier stage.
 
-The first published package will be the result of the local path development
-workspace. Publishing is not a substitute for the complete compatibility matrix.
+The JPEG 2000 and HTJ2K rows remain design targets until the single Rust crate,
+its marker/profile matrix, and the complete compatibility matrix are implemented
+and verified. Publishing is not a substitute for those gates.
 
