@@ -13,6 +13,7 @@ use radicom::pixel::codec::{set_codec_registry, Codec, CodecRegistry};
 pub use radicom_codecs_jpeg::{
     JpegLossless14Codec, JpegLossless14Sv1Codec, JpegProcess1Codec, JpegProcess2_4Codec,
 };
+pub use radicom_codecs_jpeg2000::{Jpeg2000LosslessCodec, Jpeg2000LossyCodec};
 pub use radicom_codecs_jpeg_ls::{JpegLsLosslessCodec, JpegLsNearLosslessCodec};
 pub use radicom_codecs_rle::RleLosslessCodec;
 
@@ -56,6 +57,8 @@ impl Default for RadicomCodecRegistry {
         registry.register(JpegLossless14Sv1Codec);
         registry.register(JpegLsLosslessCodec);
         registry.register(JpegLsNearLosslessCodec);
+        registry.register(Jpeg2000LosslessCodec);
+        registry.register(Jpeg2000LossyCodec);
         registry
     }
 }
@@ -105,6 +108,8 @@ mod tests {
             syntaxes::JPEG_LOSSLESS_PROCESS_14_SV1.clone(),
             syntaxes::JPEG_LS_LOSSLESS.clone(),
             syntaxes::JPEG_LS_NEAR_LOSSLESS.clone(),
+            syntaxes::JPEG_2000_LOSSLESS.clone(),
+            syntaxes::JPEG_2000_LOSSY.clone(),
         ]
     }
 
@@ -153,13 +158,20 @@ mod tests {
                 .default_params(),
             CodecParams::JpegLs(_)
         ));
+        assert!(matches!(
+            registry
+                .get_codec(&syntaxes::JPEG_2000_LOSSLESS)
+                .unwrap()
+                .default_params(),
+            CodecParams::Jpeg2000(_)
+        ));
     }
 
     #[test]
     fn install_injects_the_registry_into_radicom() {
         let registry = install();
         assert!(radicom::pixel::codec::codec_registry().has_codec(&syntaxes::RLE_LOSSLESS));
-        assert_eq!(registry.len(), 7);
+        assert_eq!(registry.len(), 9);
         reset_codec_registry();
     }
 }

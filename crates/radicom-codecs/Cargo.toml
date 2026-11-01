@@ -12,3 +12,4 @@ radicom.workspace = true
 radicom-codecs-rle = { path = "../radicom-codecs-rle", version = "0.1.0" }
 radicom-codecs-jpeg = { path = "../radicom-codecs-jpeg", version = "0.1.0" }
 radicom-codecs-jpeg-ls = { path = "../radicom-codecs-jpeg-ls", version = "0.1.0" }
+radicom-codecs-jpeg2000 = { path = "../radicom-codecs-jpeg2000", version = "0.1.0" }

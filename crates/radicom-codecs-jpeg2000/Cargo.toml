@@ -1,0 +1,11 @@
+[package]
+name = "radicom-codecs-jpeg2000"
+description = "Pure Rust JPEG 2000 DICOM codecs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+radicom.workspace = true

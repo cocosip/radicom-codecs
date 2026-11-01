@@ -294,6 +294,7 @@ dependencies = [
  "radicom",
  "radicom-codecs-jpeg",
  "radicom-codecs-jpeg-ls",
+ "radicom-codecs-jpeg2000",
  "radicom-codecs-rle",
 ]
 
@@ -306,6 +307,13 @@ dependencies = [
 
 [[package]]
 name = "radicom-codecs-jpeg-ls"
+version = "0.1.0"
+dependencies = [
+ "radicom",
+]
+
+[[package]]
+name = "radicom-codecs-jpeg2000"
 version = "0.1.0"
 dependencies = [
  "radicom",
