@@ -366,10 +366,7 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], reversible: bool) -> Result<Ve
 pub(crate) fn encode_ht(
     layout: &Layout,
     raw: &[u8],
-    progression: u8,
-    reversible: bool,
-    levels: i32,
-    mct: bool,
+    options: &ht_codestream::EncodeOptions,
 ) -> Result<Vec<u8>, String> {
     if matches!(
         layout.pi,
@@ -384,9 +381,9 @@ pub(crate) fn encode_ht(
         layout.height as i32,
         layout.bits_stored,
         layout.signed,
-        levels,
+        options.levels,
     )?;
-    ht_codestream::encode(&mut components, progression, reversible, levels, mct)
+    ht_codestream::encode(&mut components, options)
 }
 
 pub(crate) fn decode_ht(

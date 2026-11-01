@@ -71,9 +71,17 @@ RGB when there are exactly three components; the codec defaults enable it, while
 `HtJ2kParams::default()` in the sibling crate leaves it false. `.202` forces
 RPCL and validates it on decode; `.201` and `.203` honour the requested
 progression order, with LRCP as the default. `.203` uses OpenJPH's default
-scalar-expounded steps (`baseDelta = 1 / 2^precision`), so there is no separate
-quality or rate parameter. `insert_tlm_markers` is not emitted by this encoder
-and returns a managed error when set; TLM is accepted and parsed on decode.
+scalar-expounded steps (`baseDelta = 1 / 2^precision`) when `quality` is 0 and
+the fo-dicom quality table for `quality` 1..=100, which is pinned to the
+reference `CreateQualityScalarExpoundedSteps` output. `insert_tlm_markers` emits
+a one-entry TLM before SOT and is accepted and parsed on decode.
+
+HTJ2K quality layers are fixed at 1: the cleanup pass codes every bit plane, so
+a second layer would need SigProp/MagRef refinement passes. OpenJPH's decoder
+rejects such codestreams too (`0x00030053`, "supports 1 quality layer only") and
+its encoder asserts `num_passes == 1`, so a codestream declaring more layers is
+rejected with a managed error instead of being partially decoded.
+
 Lossless `.201/.202` comparisons are sample-exact, while lossy `.203` tests use
 a mean-absolute-error tolerance and require a decodable codestream.
 
@@ -83,17 +91,20 @@ a mean-absolute-error tolerance and require a decodable codestream.
    implemented; the cleanup pass is pinned to a reference byte vector.
 
 2. The HT cleanup pass and exact `.201` round trips are implemented; blocks
-   declaring refinement passes are rejected rather than mis-decoded.
+   declaring refinement passes are rejected rather than mis-decoded, and a
+   codestream asking for more than one quality layer is rejected at COD parse.
 3. Forced RPCL packet iteration and `.202` checks, including TLM parsing, are
-   implemented.
+   implemented, and TLM emission is covered by a marker-layout test.
 4. Irreversible quantization and `.203` tolerance tests are implemented,
-   including OpenJPH-compatible 9/7 analysis and synthesis scaling.
-5. Bidirectional fo-dicom/OpenJPH fixtures pass for mono and RGB `.201/.202`
-   (exact) and `.203` (within one to two samples). Malformed-stream and
-   profile-matrix coverage remains a follow-up.
+   including OpenJPH-compatible 9/7 analysis and synthesis scaling and the
+   explicit quality table.
+5. Bidirectional fo-dicom fixtures pass for mono and RGB `.201/.202` (exact),
+   `.202` with TLM (exact), and `.203` at the default and at `quality = 40`
+   (within one to two samples). Malformed-stream and profile-matrix coverage
+   remains a follow-up.
 
 The public registry keeps one JPEG 2000 family entry point. The classic and
-HTJ2K codec types remain inside the same crate, while the parameter boundary may
-be extended with an explicit lossy quality field. The sibling `radicom`
-boundary is aligned with the generated dictionary and the DICOM
-`.201/.202/.203` assignments.
+HTJ2K codec types remain inside the same crate. The sibling `radicom` boundary
+is aligned with the generated dictionary and the DICOM `.201/.202/.203`
+assignments.
+

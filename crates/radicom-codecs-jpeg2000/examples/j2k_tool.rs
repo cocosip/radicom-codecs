@@ -7,7 +7,7 @@ use std::sync::Arc;
 use radicom::model::{
     buffer::MemoryBuffer, dataset::Dataset, tag::Tag, transfer_syntax::syntaxes, vr::Vr,
 };
-use radicom::pixel::codec::Codec;
+use radicom::pixel::codec::{Codec, CodecParams, ProgressionOrder};
 use radicom::pixel::{PixelData, PixelDataRef};
 use radicom_codecs_jpeg2000::{
     HtJpeg2000LosslessCodec, HtJpeg2000LosslessRpclCodec, HtJpeg2000LossyCodec,
@@ -39,7 +39,7 @@ fn parse(args: &[String]) -> Result<HashMap<String, String>, String> {
         let key = args[index]
             .strip_prefix("--")
             .ok_or_else(|| format!("expected --flag, got '{}'", args[index]))?;
-        if key == "reversible" || key == "signed" || key == "ht" || key == "rpcl" {
+        if key == "reversible" || key == "signed" || key == "ht" || key == "rpcl" || key == "tlm" {
             options.insert(key.to_owned(), "true".to_owned());
             index += 1;
             continue;
@@ -122,13 +122,30 @@ fn encode(options: &HashMap<String, String>) -> Result<(), String> {
     } else {
         Box::new(Jpeg2000LossyCodec)
     };
+    let params = if ht {
+        match codec.default_params() {
+            CodecParams::HtJpeg2000(mut p) => {
+                if let Some(quality) = options.get("quality") {
+                    p.quality = quality.parse().map_err(|_| "invalid quality".to_string())?;
+                }
+                p.insert_tlm_markers = options.contains_key("tlm");
+                if rpcl {
+                    p.progression_order = ProgressionOrder::Rpcl;
+                }
+                CodecParams::HtJpeg2000(p)
+            }
+            other => other,
+        }
+    } else {
+        codec.default_params()
+    };
     let mut encoded = source.clone();
     encoded.set_transfer_syntax(std::sync::Arc::new(codec.transfer_syntax().clone()));
     encoded.remove(Tag::PIXEL_DATA);
     let src = PixelDataRef::from_dataset(&source).map_err(|e| e.to_string())?;
     let mut dst = PixelData::create_new(&mut encoded).map_err(|e| e.to_string())?;
     codec
-        .encode(&src, &mut dst, &codec.default_params())
+        .encode(&src, &mut dst, &params)
         .map_err(|e| e.to_string())?;
     let codestream = PixelDataRef::from_dataset(&encoded)
         .map_err(|e| e.to_string())?

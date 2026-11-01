@@ -728,6 +728,16 @@ pub(crate) fn write_cap(out: &mut Vec<u8>) {
     out.extend_from_slice(&[0x00, 0x02, 0x00, 0x00, 0x00, 0x02]);
 }
 
+/// Writes a single-entry tile-part length table: `Ztlm = 1`, `Stlm` carries
+/// `ST = 0` (no tile index bytes) and `SP = 1` (32-bit length).
+pub(crate) fn write_tlm(out: &mut Vec<u8>, tile_part_length: u32) {
+    out.extend_from_slice(&TLM.to_be_bytes());
+    out.extend_from_slice(&8u16.to_be_bytes());
+    out.push(1);
+    out.push(0x40);
+    out.extend_from_slice(&tile_part_length.to_be_bytes());
+}
+
 pub(crate) fn write_eoc(out: &mut Vec<u8>) {
     out.extend_from_slice(&EOC.to_be_bytes());
 }

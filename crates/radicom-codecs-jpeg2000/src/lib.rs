@@ -16,6 +16,7 @@ mod tier1;
 mod tier2;
 mod wavelet;
 
+use crate::htj2k::codestream as ht_codestream;
 use frame::Layout;
 use radicom::error::{CodecError, Error};
 use radicom::model::transfer_syntax::{syntaxes, TransferSyntax};
@@ -445,13 +446,6 @@ fn operate_ht(
             },
         ));
     }
-    if !decode && p.insert_tlm_markers {
-        return Err(error(
-            codec,
-            "encode",
-            "HTJ2K TLM insertion is not supported",
-        ));
-    }
     let levels = i32::try_from(p.decompositions).map_err(|_| {
         error(
             codec,
@@ -473,6 +467,17 @@ fn operate_ht(
     } else {
         progression_code(p.progression_order)
     };
+    let options = ht_codestream::EncodeOptions {
+        progression: encode_progression,
+        reversible,
+        levels,
+        mct: p.employ_color_transform,
+        quality: p.quality,
+        insert_tlm: p.insert_tlm_markers,
+    };
+    options
+        .validate()
+        .map_err(|m| error(codec, if decode { "decode" } else { "encode" }, m))?;
     if decode {
         if src.transfer_syntax().uid() != syntax.uid() {
             return Err(error(
@@ -557,15 +562,8 @@ fn operate_ht(
                 .data()
                 .map_err(|e| error(codec, "encode", format!("frame {i}: {e}")))?;
             frames.push(
-                frame::encode_ht(
-                    &layout,
-                    bytes.as_ref(),
-                    encode_progression,
-                    reversible,
-                    levels,
-                    p.employ_color_transform,
-                )
-                .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?,
+                frame::encode_ht(&layout, bytes.as_ref(), &options)
+                    .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?,
             );
         }
         for frame in frames {

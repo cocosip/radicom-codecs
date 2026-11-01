@@ -219,3 +219,39 @@ fn honour_decomposition_level_parameter() {
         );
     }
 }
+#[test]
+fn honours_the_lossy_quality_parameter() {
+    let _ = radicom_codecs::install();
+    let raw: Vec<u8> = (0..32 * 24).map(|i| (i * 7 + i / 32) as u8).collect();
+    let error_for = |quality: u32| {
+        let mut source = source_dataset(32, 24, 8, 1, false, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let compressed = source
+            .clone_with_syntax(
+                syntaxes::HTJ2K_LOSSY.clone(),
+                Some(CodecParams::HtJpeg2000(HtJ2kParams {
+                    irreversible: true,
+                    quality,
+                    ..Default::default()
+                })),
+            )
+            .unwrap();
+        let decoded = compressed
+            .clone_with_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(), None)
+            .unwrap();
+        let actual = frame_bytes(&decoded, 0);
+        let total: i64 = raw
+            .iter()
+            .zip(&actual)
+            .map(|(a, b)| i64::from((*a as i32 - *b as i32).abs()))
+            .sum();
+        total as f64 / raw.len() as f64
+    };
+    let coarse = error_for(20);
+    let fine = error_for(95);
+    assert!(coarse > fine, "coarse {coarse} fine {fine}");
+    assert!(fine < 2.0, "fine quality error {fine}");
+}

@@ -6,8 +6,8 @@
 
 use crate::geometry::{CodeBlock, Component, PrecinctBand};
 use crate::marker::{
-    write_cap, write_eoc, write_soc, write_sod, Cod, CodingStyle, MainHeader, QStep, Quantization,
-    Siz, SizComp, Sot, EOC, SOD, SOT,
+    write_cap, write_eoc, write_soc, write_sod, write_tlm, Cod, CodingStyle, MainHeader, QStep,
+    Quantization, Siz, SizComp, Sot, EOC, SOD, SOT,
 };
 use crate::quantization::{bit_plane_depth, reversible_steps, subband_index};
 use crate::wavelet;
@@ -15,28 +15,50 @@ use crate::wavelet;
 use super::cleanup::{decode_cleanup, encode_cleanup};
 use super::packet::{decode_ht_packet, encode_ht_packet};
 use super::quant::{
-    create_openjph_steps, decode_delta, from_sign_magnitude, kmax, to_sign_magnitude,
+    create_openjph_steps, create_quality_steps, decode_delta, from_sign_magnitude, kmax,
+    to_sign_magnitude,
 };
 
 const CODE_BLOCK: i32 = 64;
 const GUARD_BITS: u8 = 1;
 
+/// Encoder settings shared by the codestream and DICOM frame layers.
+pub(crate) struct EncodeOptions {
+    pub(crate) progression: u8,
+    pub(crate) reversible: bool,
+    pub(crate) levels: i32,
+    pub(crate) mct: bool,
+    /// 1..=100 selects an explicit irreversible quality; 0 keeps the default.
+    pub(crate) quality: u32,
+    pub(crate) insert_tlm: bool,
+}
+
+impl EncodeOptions {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !(0..=32).contains(&self.levels) {
+            return Err("invalid decomposition level count".into());
+        }
+        if self.quality > 100 {
+            return Err("HTJ2K quality must be between 1 and 100".into());
+        }
+        Ok(())
+    }
+}
+
 /// Encodes one HTJ2K tile.
 pub(crate) fn encode(
     components: &mut [Component],
-    progression: u8,
-    reversible: bool,
-    levels: i32,
-    use_mct: bool,
+    options: &EncodeOptions,
 ) -> Result<Vec<u8>, String> {
     if components.is_empty() {
         return Err("no components to encode".into());
     }
-    if !(0..=32).contains(&levels) {
-        return Err("invalid decomposition level count".into());
-    }
+    options.validate()?;
+    let levels = options.levels;
+    let reversible = options.reversible;
+    let progression = options.progression;
     let precision = components[0].precision;
-    let mct = u8::from(use_mct && components.len() >= 3);
+    let mct = u8::from(options.mct && components.len() >= 3);
     if reversible && mct != 0 {
         forward_rct(components);
     }
@@ -97,7 +119,11 @@ pub(crate) fn encode(
             .collect();
         (steps, encoded, 0u8)
     } else {
-        let encoded = create_openjph_steps(levels as u8, precision, -1.0);
+        let encoded = if options.quality == 0 {
+            create_openjph_steps(levels as u8, precision, -1.0)
+        } else {
+            create_quality_steps(levels as u8, precision, options.quality)
+        };
         let steps: Vec<QStep> = encoded
             .iter()
             .map(|&value| QStep {
@@ -207,9 +233,13 @@ pub(crate) fn encode(
     write_cap(&mut output);
     cod.write(&mut output);
     quant.write(&mut output);
+    let tile_part_length = (14 + tile_data.len()) as u32;
+    if options.insert_tlm {
+        write_tlm(&mut output, tile_part_length);
+    }
     let sot = Sot {
         tile: 0,
-        length: (14 + tile_data.len()) as u32,
+        length: tile_part_length,
         part: 0,
         parts: 1,
     };
@@ -317,6 +347,14 @@ pub(crate) fn decode(
     let (header, mut offset) = MainHeader::parse(data)?;
     if header.cod.style.style & 0x40 == 0 {
         return Err("codestream is not HTJ2K (COD style 0x40 is missing)".into());
+    }
+    if header.cod.layers != 1 {
+        // Multi-layer HTJ2K needs SigProp/MagRef refinement passes, which
+        // OpenJPH also rejects (`0x00030053`); no reference encoder emits them.
+        return Err(format!(
+            "HTJ2K quality layers are limited to 1, this codestream has {}",
+            header.cod.layers
+        ));
     }
     if let Some(expected) = expected_progression {
         if header.cod.progression != expected {
@@ -664,13 +702,23 @@ mod tests {
     use super::*;
     use crate::codestream::build_components;
 
+    fn options(components: &[Component], reversible: bool) -> EncodeOptions {
+        EncodeOptions {
+            progression: 0,
+            reversible,
+            levels: components[0].levels,
+            mct: components.len() >= 3,
+            quality: 0,
+            insert_tlm: false,
+        }
+    }
+
     #[test]
     fn reversible_codestream_round_trips() {
         let mut components =
             build_components(&[vec![1, 2, 3, 4, 5, 6, 7, 8, 9]], 3, 3, 8, false, 0).unwrap();
-        let levels = components[0].levels;
-        let mct = components.len() >= 3;
-        let encoded = encode(&mut components, 0, true, levels, mct).unwrap();
+        let opts = options(&components, true);
+        let encoded = encode(&mut components, &opts).unwrap();
         let decoded = decode(&encoded, None).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].samples, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
@@ -693,9 +741,8 @@ mod tests {
         }
         let mut components =
             build_components(&planes, width as i32, height as i32, 8, false, 5).unwrap();
-        let levels = components[0].levels;
-        let mct = components.len() >= 3;
-        let encoded = encode(&mut components, 0, true, levels, mct).unwrap();
+        let opts = options(&components, true);
+        let encoded = encode(&mut components, &opts).unwrap();
         let decoded = decode(&encoded, None).unwrap();
         assert_eq!(decoded.len(), 3);
         for (component, plane) in decoded.iter().zip(planes.iter()) {
@@ -715,9 +762,8 @@ mod tests {
         }
         let mut components =
             build_components(&[plane.clone()], width as i32, height as i32, 8, false, 5).unwrap();
-        let levels = components[0].levels;
-        let mct = components.len() >= 3;
-        let encoded = encode(&mut components, 0, false, levels, mct).unwrap();
+        let opts = options(&components, false);
+        let encoded = encode(&mut components, &opts).unwrap();
         let decoded = decode(&encoded, None).unwrap();
         let actual = &decoded[0].samples;
         assert_eq!(actual.len(), plane.len());
@@ -728,5 +774,88 @@ mod tests {
             .sum();
         let mean = total as f64 / plane.len() as f64;
         assert!(mean < 2.0, "mean absolute error {mean}");
+    }
+
+    #[test]
+    fn tlm_marker_lists_the_tile_part_length() {
+        let mut components = build_components(&[vec![7i32; 64]], 8, 8, 8, false, 1).unwrap();
+        let opts = EncodeOptions {
+            insert_tlm: true,
+            ..options(&components, true)
+        };
+        let encoded = encode(&mut components, &opts).unwrap();
+        let position = encoded
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0x55])
+            .expect("TLM marker");
+        assert_eq!(
+            &encoded[position + 2..position + 6],
+            &[0x00, 0x08, 0x01, 0x40]
+        );
+        let sot = encoded
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0x90])
+            .expect("SOT marker");
+        let target = u32::from_be_bytes([
+            encoded[position + 6],
+            encoded[position + 7],
+            encoded[position + 8],
+            encoded[position + 9],
+        ]);
+        let length = u32::from_be_bytes([
+            encoded[sot + 6],
+            encoded[sot + 7],
+            encoded[sot + 8],
+            encoded[sot + 9],
+        ]);
+        assert_eq!(target, length);
+        assert_eq!(decode(&encoded, None).unwrap()[0].samples, vec![7i32; 64]);
+    }
+
+    #[test]
+    fn multi_layer_codestreams_are_rejected() {
+        let mut components = build_components(&[vec![3i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let opts = options(&components, true);
+        let mut encoded = encode(&mut components, &opts).unwrap();
+        let cod = encoded
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0x52])
+            .expect("COD marker");
+        encoded[cod + 7] = 2;
+        let message = decode(&encoded, None).unwrap_err();
+        assert!(message.contains("quality layers"), "{message}");
+    }
+
+    #[test]
+    fn quality_level_changes_the_lossy_error() {
+        let width = 32usize;
+        let height = 32usize;
+        let mut plane = vec![0i32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                plane[y * width + x] = (((x * 7 + y * 13) % 256) as i32) - 128;
+            }
+        }
+        let error_for = |quality: u32| {
+            let mut components =
+                build_components(&[plane.clone()], width as i32, height as i32, 8, false, 3)
+                    .unwrap();
+            let opts = EncodeOptions {
+                quality,
+                ..options(&components, false)
+            };
+            let encoded = encode(&mut components, &opts).unwrap();
+            let decoded = decode(&encoded, None).unwrap();
+            let total: i64 = plane
+                .iter()
+                .zip(&decoded[0].samples)
+                .map(|(a, b)| i64::from((a - b).abs()))
+                .sum();
+            total as f64 / plane.len() as f64
+        };
+        let coarse = error_for(20);
+        let fine = error_for(95);
+        assert!(coarse > fine, "coarse {coarse} fine {fine}");
+        assert!(fine < 2.0, "fine quality error {fine}");
     }
 }

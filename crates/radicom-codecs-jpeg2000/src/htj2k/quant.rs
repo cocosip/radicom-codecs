@@ -81,6 +81,38 @@ pub(crate) fn kmax(encoded_step: u16, guard_bits: u8) -> i32 {
     i32::from((encoded_step >> 11) & 0x1F) - 1 + i32::from(guard_bits)
 }
 
+/// Base step size for an explicit 1..=100 quality level.
+fn quality_scale(quality: u32) -> f64 {
+    let quality = f64::from(quality.clamp(1, 100));
+    (2f64.powf((100.0 - quality) / 12.5)).max(0.01) * 0.18
+}
+
+/// Builds the step table for an explicit quality level.
+pub(crate) fn create_quality_steps(
+    decomposition_levels: u8,
+    bit_depth: u8,
+    quality: u32,
+) -> Vec<u16> {
+    use crate::quantization::{dwt_norm_97, encode_step_size};
+
+    let scale = quality_scale(quality);
+    let levels = usize::from(decomposition_levels);
+    let mut steps = Vec::with_capacity(3 * levels + 1);
+    for index in 0..=3 * levels {
+        let resolution = if index == 0 { 0 } else { (index - 1) / 3 + 1 };
+        let orientation = if index == 0 {
+            0
+        } else {
+            ((index - 1) % 3 + 1) as u8
+        };
+        let level = (levels as i32 - resolution as i32).max(0);
+        let norm = dwt_norm_97(level, orientation);
+        let step = if norm <= 0.0 { scale } else { scale / norm };
+        steps.push(encode_step_size(step, bit_depth));
+    }
+    steps
+}
+
 /// Decodes the coefficient-domain delta for one subband and code-block.
 pub(crate) fn decode_delta(encoded_step: u16, orientation: u8, k_max: i32) -> f64 {
     let exponent = i32::from((encoded_step >> 11) & 0x1F);
@@ -153,5 +185,46 @@ mod tests {
         for (a, b) in values.iter().zip(&restored) {
             assert!((a - b).abs() <= delta * 1.1);
         }
+    }
+
+    #[test]
+    fn quality_steps_match_the_reference_tables() {
+        // Expected values come from the fo-dicom reference implementation.
+        let expected = [
+            (
+                (5u8, 8u8, 90u32),
+                vec![
+                    31072, 31040, 31040, 31008, 29024, 29024, 29008, 27032, 27032, 27048, 25100,
+                    25100, 25184, 23018, 23018, 22948,
+                ],
+            ),
+            (
+                (5, 8, 75),
+                vec![
+                    29408, 29376, 29376, 29328, 27344, 27344, 27320, 25348, 25348, 25368, 23436,
+                    23436, 23532, 21349, 21349, 21267,
+                ],
+            ),
+            (
+                (3, 16, 80),
+                vec![
+                    41036, 41052, 41052, 41064, 39104, 39104, 39176, 37026, 37026, 36965,
+                ],
+            ),
+        ];
+        for ((levels, bits, quality), steps) in expected {
+            assert_eq!(
+                create_quality_steps(levels, bits, quality),
+                steps,
+                "levels {levels} bits {bits} quality {quality}"
+            );
+        }
+    }
+
+    #[test]
+    fn higher_quality_uses_finer_steps() {
+        let coarse = create_quality_steps(5, 8, 30);
+        let fine = create_quality_steps(5, 8, 90);
+        assert!(fine[0] > coarse[0]);
     }
 }

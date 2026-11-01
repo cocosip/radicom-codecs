@@ -67,7 +67,7 @@ pub(crate) fn irreversible_steps(levels: u8) -> Vec<f64> {
     steps
 }
 
-fn dwt_norm_97(level: i32, orientation: u8) -> f64 {
+pub(crate) fn dwt_norm_97(level: i32, orientation: u8) -> f64 {
     let orientation = usize::from(orientation.min(3));
     let max_level = if orientation == 0 { 9 } else { 8 };
     let level = level.clamp(0, max_level);
