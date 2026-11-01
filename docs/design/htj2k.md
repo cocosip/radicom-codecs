@@ -76,6 +76,16 @@ the fo-dicom quality table for `quality` 1..=100, which is pinned to the
 reference `CreateQualityScalarExpoundedSteps` output. `insert_tlm_markers` emits
 a one-entry TLM before SOT and is accepted and parsed on decode.
 
+The reference encoder is the native
+`Native/Common/OpenJPH/interface/ojph_interface.cpp`
+(`HTJpeg2000EncodeStream`), whose hard-coded defaults are `decompositions_ = 5`,
+64×64 code blocks, `quantizationStep_ = -1.0f` (derive the irreversible steps,
+the same table `quality = 0` selects) and `request_tlm_marker_ = true`. It also
+splits one tile-part per resolution, so its TLM carries several entries; a
+single tile-part with a single TLM entry is equally valid and is what fo-dicom
+accepts from this encoder.
+
+
 HTJ2K quality layers are fixed at 1: the cleanup pass codes every bit plane, so
 a second layer would need SigProp/MagRef refinement passes. OpenJPH's decoder
 rejects such codestreams too (`0x00030053`, "supports 1 quality layer only") and
