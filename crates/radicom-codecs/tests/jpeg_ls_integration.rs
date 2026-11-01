@@ -6,9 +6,19 @@ use radicom::pixel::{
     PixelData, PixelDataRef,
 };
 
+/// The codec registry is process-wide, so tests that install or reset it must
+/// not run concurrently.
+static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn install() -> std::sync::MutexGuard<'static, ()> {
+    let guard = REGISTRY_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _ = radicom_codecs::install();
+    guard
+}
+
 #[test]
 fn registry_transcodes_jpeg_ls_multiframe_signed_and_planar_layouts() {
-    let _ = radicom_codecs::install();
+    let _guard = install();
     for (allocated, stored, components, planar, signed) in [
         (8, 8, 1, 0, false),
         (8, 8, 1, 0, true),
@@ -136,5 +146,108 @@ fn registry_transcodes_jpeg_ls_multiframe_signed_and_planar_layouts() {
             }
         }
     }
-    radicom::pixel::codec::reset_codec_registry();
+}
+
+fn marker_count(stream: &[u8], marker: u8) -> usize {
+    stream
+        .windows(2)
+        .filter(|pair| pair[0] == 0xFF && pair[1] == marker)
+        .count()
+}
+
+#[test]
+fn registry_transcodes_jpeg_ls_with_restart_intervals() {
+    let _guard = install();
+    for (components, interleave, planar) in [(1u16, 0u32, 0u16), (3, 3, 0), (3, 1, 0)] {
+        let mut source = Dataset::new();
+        source.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        for (tag, value) in [
+            (Tag::ROWS, 50u16),
+            (Tag::COLUMNS, 12),
+            (Tag::BITS_ALLOCATED, 8),
+            (Tag::BITS_STORED, 8),
+            (Tag::HIGH_BIT, 7),
+            (Tag::SAMPLES_PER_PIXEL, components),
+            (Tag::PIXEL_REPRESENTATION, 0),
+            (Tag::PLANAR_CONFIGURATION, planar),
+        ] {
+            source.insert_value(tag, value);
+        }
+        source.insert_str(
+            Tag::PHOTOMETRIC_INTERPRETATION,
+            Vr::Cs,
+            if components == 1 { "MONOCHROME2" } else { "RGB" },
+        );
+        let frame: Vec<u8> = (0..50 * 12 * usize::from(components))
+            .map(|i| ((i * 37 + i / 5) & 0xff) as u8)
+            .collect();
+        {
+            let mut pixels = PixelData::create_new(&mut source).unwrap();
+            pixels.add_frame(&frame).unwrap();
+        }
+        for interval in [0u16, 1, 7] {
+            let params = JpegLsParams {
+                interleave_mode: interleave,
+                restart_interval: interval,
+                ..Default::default()
+            };
+            let compressed = source
+                .clone_with_syntax(
+                    syntaxes::JPEG_LS_LOSSLESS.clone(),
+                    Some(CodecParams::JpegLs(params)),
+                )
+                .unwrap();
+            let stream = PixelDataRef::from_dataset(&compressed)
+                .unwrap()
+                .get_frame(0)
+                .unwrap()
+                .data()
+                .unwrap()
+                .to_vec();
+            assert_eq!(marker_count(&stream, 0xDD), usize::from(interval != 0));
+            let decoded = compressed
+                .clone_with_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(), None)
+                .unwrap();
+            let restored = PixelDataRef::from_dataset(&decoded)
+                .unwrap()
+                .get_frame(0)
+                .unwrap()
+                .data()
+                .unwrap()
+                .to_vec();
+            // Lossless: restart intervals must not change a single sample.
+            let planar_layout = planar == 1;
+            let samples = usize::from(components) * 12 * 50;
+            let value = |bytes: &[u8], i: usize| {
+                let index = if planar_layout && components == 3 {
+                    (i % 3) * 12 * 50 + i / 3
+                } else {
+                    i
+                };
+                bytes[index]
+            };
+            for i in 0..samples {
+                assert_eq!(
+                    value(&frame, i),
+                    value(&restored, i),
+                    "components={components} interleave={interleave} interval={interval} sample={i}"
+                );
+            }
+            if interval != 0 {
+                let expected = (50u32.div_ceil(u32::from(interval)) - 1) as usize;
+                let rst = (0..8)
+                    .map(|index| marker_count(&stream, 0xD0 + index))
+                    .sum::<usize>();
+                // ILV=2 counts one MCU per line of the interleaved set; ILV=0/1
+                // count one MCU per line of each component, so the plane and line
+                // interleaved streams carry one restart sequence per scan (3x).
+                let scans = if components == 3 && interleave != 3 { 3 } else { 1 };
+                assert_eq!(
+                    rst,
+                    expected * scans,
+                    "components={components} interleave={interleave} interval={interval}"
+                );
+            }
+        }
+    }
 }
