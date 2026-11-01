@@ -69,6 +69,24 @@ impl LosslessFrame {
         point_transform: u8,
         restart_interval: Option<u16>,
     ) -> Result<Vec<u8>, String> {
+        let components = (0..self.components).collect::<Vec<_>>();
+        self.encode_scans(
+            predictor,
+            point_transform,
+            restart_interval,
+            std::slice::from_ref(&components),
+        )
+    }
+
+    /// Encode one or more scans. A scan is a list of component indices carried
+    /// by that scan; T.81 permits a non-interleaved scan per component.
+    fn encode_scans(
+        &self,
+        predictor: u8,
+        point_transform: u8,
+        restart_interval: Option<u16>,
+        scans: &[Vec<u8>],
+    ) -> Result<Vec<u8>, String> {
         validate_predictor(predictor)?;
         validate_point_transform(self.precision, point_transform)?;
         if let Some(interval) = restart_interval {
@@ -87,53 +105,69 @@ impl LosslessFrame {
         if let Some(interval) = restart_interval {
             output.write_segment(Marker::Dri, &interval.to_be_bytes())?;
         }
-        output.write_segment(
-            Marker::Sos,
-            &sos_payload(self.components, predictor, point_transform)?,
-        )?;
-
-        let mut entropy = BitWriter::default();
         let mut reconstructed = allocate_samples(self.samples.len())?;
-        let mut restart_index = 0u8;
-        for pixel in 0..self.width * self.height {
-            let x = pixel % self.width;
-            let y = pixel / self.width;
-            let restart_pixel = restart_interval
-                .is_some_and(|interval| pixel != 0 && pixel % usize::from(interval) == 0);
-            if restart_pixel {
-                entropy.flush_to_byte();
-                output_bytes(&mut output, entropy.take_bytes());
-                output.write_marker(Marker::Restart(restart_index))?;
-                restart_index = (restart_index + 1) & 7;
+        let mut seen = [false; 3];
+        for scan in scans {
+            if scan.is_empty() {
+                return Err("JPEG lossless scan has no components".to_owned());
             }
-            for component in 0..usize::from(self.components) {
-                let index = pixel * usize::from(self.components) + component;
-                let shifted = i32::from(self.samples[index] >> point_transform);
-                let prediction = predict(
-                    &reconstructed,
-                    index,
-                    x,
-                    y,
-                    self.width,
-                    self.components,
-                    component,
-                    predictor,
-                    initial,
-                    restart_pixel,
-                );
-                let difference = encode_difference(shifted - prediction, effective_precision);
-                let category = category(difference);
-                huffman.encode(category, &mut entropy)?;
-                if category != 0 && category != 16 {
-                    let amplitude = encode_amplitude(difference, category);
-                    entropy.write_bits(amplitude, category)?;
+            for &component in scan {
+                let slot = usize::from(component);
+                if slot >= usize::from(self.components) {
+                    return Err(format!(
+                        "JPEG scan references component {component} outside the frame"
+                    ));
                 }
-                reconstructed[index] = u16::try_from(shifted)
-                    .map_err(|_| "JPEG reconstructed sample is outside u16".to_owned())?;
+                if seen[slot] {
+                    return Err(format!(
+                        "JPEG lossless scan repeats component {component}"
+                    ));
+                }
+                seen[slot] = true;
             }
+            output.write_segment(Marker::Sos, &sos_payload(scan, predictor, point_transform)?)?;
+            let mut entropy = BitWriter::default();
+            let mut restart_index = 0u8;
+            for pixel in 0..self.width * self.height {
+                let x = pixel % self.width;
+                let y = pixel / self.width;
+                let restart_pixel = restart_interval
+                    .is_some_and(|interval| pixel != 0 && pixel.is_multiple_of(usize::from(interval)));
+                if restart_pixel {
+                    entropy.flush_to_byte();
+                    output_bytes(&mut output, entropy.take_bytes());
+                    output.write_marker(Marker::Restart(restart_index))?;
+                    restart_index = (restart_index + 1) & 7;
+                }
+                for &component in scan {
+                    let index = pixel * usize::from(self.components) + usize::from(component);
+                    let shifted = i32::from(self.samples[index] >> point_transform);
+                    let prediction = predict(
+                        &reconstructed,
+                        index,
+                        x,
+                        y,
+                        self.width,
+                        self.components,
+                        usize::from(component),
+                        predictor,
+                        initial,
+                        restart_pixel,
+                    );
+                    let difference = encode_difference(shifted - prediction, effective_precision);
+                    let category = category(difference);
+                    huffman.encode(category, &mut entropy)?;
+                    if category != 0 && category != 16 {
+                        let amplitude = encode_amplitude(difference, category);
+                        entropy.write_bits(amplitude, category)?;
+                    }
+                    reconstructed[index] = u16::try_from(shifted)
+                        .map_err(|_| "JPEG reconstructed sample is outside u16".to_owned())?;
+                }
+            }
+            entropy.flush_to_byte();
+            output_bytes(&mut output, entropy.take_bytes());
         }
-        entropy.flush_to_byte();
-        output_bytes(&mut output, entropy.take_bytes());
         output.write_marker(Marker::Eoi)?;
         Ok(output.into_bytes())
     }
@@ -141,134 +175,174 @@ impl LosslessFrame {
     pub(crate) fn decode(data: &[u8]) -> Result<Self, String> {
         let mut reader = MarkerReader::new(data);
         expect_marker(&mut reader, Marker::Soi)?;
-        let sof = loop {
+        let (width, height, precision, components, component_ids) = loop {
             let (marker, payload) = reader.read_segment()?;
             match marker {
-                Marker::Sof3 => break payload,
+                Marker::Sof3 => break parse_sof(&payload)?,
                 Marker::App(_) | Marker::Com => {}
                 other => return Err(format!("expected JPEG SOF3, got {other:?}")),
             }
         };
-        let (width, height, precision, components, component_ids) = parse_sof(&sof)?;
         if !(2..=16).contains(&precision) {
             return Err(format!(
                 "JPEG lossless precision {precision} is outside 2..=16"
             ));
         }
-        let dht = loop {
-            let (marker, payload) = reader.read_segment()?;
-            match marker {
-                Marker::Dht => break payload,
-                Marker::App(_) | Marker::Com => {}
-                other => return Err(format!("expected JPEG DHT, got {other:?}")),
-            }
-        };
-        let huffman = parse_dht(&dht)?;
-        let mut restart_interval = None;
-        let (predictor, point_transform) = loop {
-            let (marker, payload) = reader.read_segment()?;
-            match marker {
-                Marker::Dri => {
-                    if payload.len() != 2 {
-                        return Err("JPEG DRI payload must contain two bytes".to_owned());
-                    }
-                    let interval = u16::from_be_bytes([payload[0], payload[1]]);
-                    if interval == 0 {
-                        return Err("JPEG restart interval must be non-zero".to_owned());
-                    }
-                    restart_interval = Some(interval);
-                }
-                Marker::Sos => break parse_sos(&payload, components, &component_ids)?,
-                Marker::App(_) | Marker::Com => {}
-                other => return Err(format!("unexpected JPEG marker before SOS: {other:?}")),
-            }
-        };
-        validate_point_transform(precision, point_transform)?;
-        let entropy_start = reader.position();
-        let entropy = data
-            .get(entropy_start..)
-            .ok_or_else(|| "JPEG entropy stream starts outside input".to_owned())?;
-        let mut bits = BitReader::new(entropy);
-        let effective_precision = precision - point_transform;
-        let initial = 1i32 << (effective_precision - 1);
         let expected = width
             .checked_mul(height)
             .and_then(|pixels| pixels.checked_mul(usize::from(components)))
             .ok_or_else(|| "JPEG sample count overflows usize".to_owned())?;
         let mut samples = allocate_samples(expected)?;
         let mut shifted_samples = allocate_samples(expected)?;
-        let mut restart_index = 0u8;
-        for pixel in 0..width * height {
-            let x = pixel % width;
-            let y = pixel / width;
-            let restart_pixel = restart_interval
-                .is_some_and(|interval| pixel != 0 && pixel % usize::from(interval) == 0);
-            if restart_pixel {
-                bits.align_to_byte();
-                let marker = bits.take_marker()?.ok_or_else(|| {
-                    "expected JPEG restart marker at restart interval boundary".to_owned()
-                })?;
-                if marker != 0xd0 + restart_index {
-                    return Err(format!(
-                        "unexpected JPEG restart marker 0xff{marker:02x}, expected 0xff{:02x}",
-                        0xd0 + restart_index
-                    ));
+        let mut tables: [Option<HuffmanTable>; 4] = [None, None, None, None];
+        let mut restart_interval = None;
+        let mut decoded = [false; 3];
+        loop {
+            let (marker, payload) = reader.read_segment()?;
+            match marker {
+                Marker::Dht => parse_dht(&payload, &mut tables)?,
+                Marker::Dri => restart_interval = parse_restart_interval(&payload)?,
+                Marker::App(_) | Marker::Com => {}
+                Marker::Sos => {
+                    let scan = parse_sos(&payload, precision, components, &component_ids)?;
+                    for &(component, _) in &scan.components {
+                        if decoded[usize::from(component)] {
+                            return Err(format!(
+                                "JPEG lossless component {} appears in more than one scan",
+                                component_ids[usize::from(component)]
+                            ));
+                        }
+                        decoded[usize::from(component)] = true;
+                    }
+                    let consumed = decode_scan(
+                        data,
+                        reader.position(),
+                        &scan,
+                        &tables,
+                        restart_interval,
+                        width,
+                        height,
+                        components,
+                        precision,
+                        &mut samples,
+                        &mut shifted_samples,
+                    )?;
+                    reader.seek(reader.position() + consumed);
                 }
-                restart_index = (restart_index + 1) & 7;
-            }
-            for component in 0..usize::from(components) {
-                let index = pixel * usize::from(components) + component;
-                let prediction = predict(
-                    &shifted_samples,
-                    index,
-                    x,
-                    y,
-                    width,
-                    components,
-                    component,
-                    predictor,
-                    initial,
-                    restart_pixel,
-                );
-                let category = huffman.decode(&mut bits)?;
-                if category > effective_precision + 1 {
-                    return Err(format!(
-                        "JPEG lossless category {category} exceeds effective precision {effective_precision}"
-                    ));
-                }
-                let amplitude = if category == 0 {
-                    0
-                } else if category == 16 {
-                    -32768
-                } else {
-                    let bits_value = bits.read_bits(category)?;
-                    decode_amplitude(bits_value, category)
-                };
-                let shifted = prediction
-                    .checked_add(amplitude)
-                    .ok_or_else(|| "JPEG lossless reconstruction overflows i32".to_owned())?;
-                let max = (1i32 << effective_precision) - 1;
-                let shifted = if effective_precision == 16 {
-                    shifted & max
-                } else {
-                    shifted
-                };
-                if !(0..=max).contains(&shifted) {
-                    return Err(format!(
-                        "JPEG lossless sample is outside the declared precision at pixel {pixel}, component {component}: prediction={prediction}, amplitude={amplitude}, shifted={shifted}, max={max}"
-                    ));
-                }
-                shifted_samples[index] = shifted as u16;
-                samples[index] = u16::try_from(shifted << point_transform)
-                    .map_err(|_| "JPEG lossless sample exceeds u16".to_owned())?;
+                Marker::Eoi => break,
+                other => return Err(format!("unexpected JPEG marker {other:?}")),
             }
         }
-        bits.align_to_byte();
-        if bits.take_marker()? != Some(0xd9) {
-            return Err("JPEG lossless scan is missing EOI".to_owned());
+        if decoded[..usize::from(components)].iter().any(|&seen| !seen) {
+            return Err("JPEG lossless stream does not decode every component".to_owned());
         }
         Self::new(width, height, precision, components, samples)
     }
+}
+
+/// One lossless scan: the components it carries (as frame component indices plus
+/// their DC Huffman table selectors), the predictor and the point transform.
+struct Scan {
+    components: Vec<(u8, u8)>,
+    predictor: u8,
+    point_transform: u8,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_scan(
+    data: &[u8],
+    start: usize,
+    scan: &Scan,
+    tables: &[Option<HuffmanTable>; 4],
+    restart_interval: Option<u16>,
+    width: usize,
+    height: usize,
+    components: u8,
+    precision: u8,
+    samples: &mut [u16],
+    shifted_samples: &mut [u16],
+) -> Result<usize, String> {
+    let entropy = data
+        .get(start..)
+        .ok_or_else(|| "JPEG entropy stream starts outside input".to_owned())?;
+    let mut bits = BitReader::new(entropy);
+    let effective_precision = precision - scan.point_transform;
+    let initial = 1i32 << (effective_precision - 1);
+    let mcus = width
+        .checked_mul(height)
+        .ok_or_else(|| "JPEG sample count overflows usize".to_owned())?;
+    let stride = usize::from(components);
+    let mut restart_index = 0u8;
+    for mcu in 0..mcus {
+        let x = mcu % width;
+        let y = mcu / width;
+        let restart =
+            restart_interval.is_some_and(|interval| mcu != 0 && mcu.is_multiple_of(usize::from(interval)));
+        if restart {
+            bits.align_to_byte();
+            let marker = bits.take_marker()?.ok_or_else(|| {
+                "expected JPEG restart marker at restart interval boundary".to_owned()
+            })?;
+            let expected = 0xd0 + restart_index;
+            if marker != expected {
+                return Err(format!(
+                    "unexpected JPEG restart marker 0xff{marker:02x}, expected 0xff{expected:02x}"
+                ));
+            }
+            restart_index = (restart_index + 1) & 7;
+        }
+        for &(component, table) in &scan.components {
+            let huffman = tables[usize::from(table)]
+                .as_ref()
+                .ok_or_else(|| format!("missing JPEG DC Huffman table {table}"))?;
+            let index = mcu * stride + usize::from(component);
+            let prediction = predict(
+                shifted_samples,
+                index,
+                x,
+                y,
+                width,
+                components,
+                usize::from(component),
+                scan.predictor,
+                initial,
+                restart,
+            );
+            let category = huffman.decode(&mut bits)?;
+            if category > effective_precision + 1 {
+                return Err(format!(
+                    "JPEG lossless category {category} exceeds effective precision {effective_precision}"
+                ));
+            }
+            let amplitude = if category == 0 {
+                0
+            } else if category == 16 {
+                -32768
+            } else {
+                let bits_value = bits.read_bits(category)?;
+                decode_amplitude(bits_value, category)
+            };
+            let shifted = prediction
+                .checked_add(amplitude)
+                .ok_or_else(|| "JPEG lossless reconstruction overflows i32".to_owned())?;
+            let max = (1i32 << effective_precision) - 1;
+            let shifted = if effective_precision == 16 {
+                shifted & max
+            } else {
+                shifted
+            };
+            if !(0..=max).contains(&shifted) {
+                return Err(format!(
+                    "JPEG lossless sample is outside the declared precision at pixel {mcu}, component {component}: prediction={prediction}, amplitude={amplitude}, shifted={shifted}, max={max}"
+                ));
+            }
+            shifted_samples[index] = shifted as u16;
+            samples[index] = u16::try_from(shifted << scan.point_transform)
+                .map_err(|_| "JPEG lossless sample exceeds u16".to_owned())?;
+        }
+    }
+    bits.align_to_byte();
+    Ok(bits.position())
 }
 
 fn validate_predictor(predictor: u8) -> Result<(), String> {
@@ -311,11 +385,12 @@ fn dht_payload() -> Vec<u8> {
     payload
 }
 
-fn sos_payload(components: u8, predictor: u8, point_transform: u8) -> Result<Vec<u8>, String> {
+fn sos_payload(scan: &[u8], predictor: u8, point_transform: u8) -> Result<Vec<u8>, String> {
     validate_predictor(predictor)?;
-    let mut payload = Vec::with_capacity(2 + usize::from(components) * 2 + 3);
-    payload.push(components);
-    for component in 0..components {
+    let count = u8::try_from(scan.len()).map_err(|_| "JPEG scan has too many components".to_owned())?;
+    let mut payload = Vec::with_capacity(2 + scan.len() * 2 + 3);
+    payload.push(count);
+    for &component in scan {
         payload.extend([component + 1, 0]);
     }
     payload.extend([predictor, 0, point_transform]);
@@ -349,32 +424,91 @@ fn parse_sof(payload: &[u8]) -> Result<(usize, usize, u8, u8, [u8; 3]), String> 
     Ok((width, height, precision, components, ids))
 }
 
-fn parse_dht(payload: &[u8]) -> Result<HuffmanTable, String> {
-    if payload.len() < 17 || payload[0] != 0 {
-        return Err("JPEG lossless requires one DC Huffman table with id 0".to_owned());
+fn parse_dht(payload: &[u8], tables: &mut [Option<HuffmanTable>; 4]) -> Result<(), String> {
+    let mut position = 0usize;
+    while position < payload.len() {
+        let info = payload[position];
+        position += 1;
+        if info >> 4 != 0 {
+            return Err("JPEG lossless only supports DC Huffman tables".to_owned());
+        }
+        let id = usize::from(info & 0x0f);
+        if id > 3 {
+            return Err(format!(
+                "JPEG DC Huffman table id {id} is outside the 0..=3 range"
+            ));
+        }
+        let counts = payload
+            .get(position..position + 16)
+            .ok_or_else(|| "JPEG DHT payload is truncated".to_owned())?;
+        position += 16;
+        let total = counts
+            .iter()
+            .map(|&count| usize::from(count))
+            .sum::<usize>();
+        let values = payload
+            .get(position..position + total)
+            .ok_or_else(|| "JPEG DHT payload has an invalid symbol count".to_owned())?;
+        position += total;
+        tables[id] = Some(HuffmanTable::new(counts, values)?);
     }
-    let counts = &payload[1..17];
-    let total = counts
-        .iter()
-        .map(|&count| usize::from(count))
-        .sum::<usize>();
-    if payload.len() != 17 + total {
-        return Err("JPEG DHT payload has an invalid symbol count".to_owned());
+    if tables.iter().all(Option::is_none) {
+        return Err("JPEG lossless stream has no DC Huffman table".to_owned());
     }
-    HuffmanTable::new(counts, &payload[17..])
+    Ok(())
 }
 
-fn parse_sos(payload: &[u8], components: u8, component_ids: &[u8; 3]) -> Result<(u8, u8), String> {
-    let expected = 1 + usize::from(components) * 2 + 3;
-    if payload.len() != expected || payload[0] != components {
+fn parse_restart_interval(payload: &[u8]) -> Result<Option<u16>, String> {
+    if payload.len() != 2 {
+        return Err("JPEG DRI payload must contain two bytes".to_owned());
+    }
+    let interval = u16::from_be_bytes([payload[0], payload[1]]);
+    Ok(if interval == 0 { None } else { Some(interval) })
+}
+
+fn parse_sos(
+    payload: &[u8],
+    precision: u8,
+    components: u8,
+    component_ids: &[u8; 3],
+) -> Result<Scan, String> {
+    let count = usize::from(
+        *payload
+            .first()
+            .ok_or_else(|| "JPEG SOS payload is truncated".to_owned())?,
+    );
+    if count == 0 || count > usize::from(components) {
         return Err("JPEG lossless SOS component count is invalid".to_owned());
     }
-    for component in payload[1..1 + usize::from(components) * 2].chunks_exact(2) {
-        if !component_ids[..usize::from(components)].contains(&component[0]) || component[1] != 0 {
-            return Err("JPEG lossless only supports DC Huffman table 0".to_owned());
-        }
+    if payload.len() != 1 + count * 2 + 3 {
+        return Err("JPEG lossless SOS payload has an invalid length".to_owned());
     }
-    let scan = &payload[1 + usize::from(components) * 2..];
+    let mut scan_components = Vec::with_capacity(count);
+    for pair in payload[1..1 + count * 2].chunks_exact(2) {
+        let index = component_ids[..usize::from(components)]
+            .iter()
+            .position(|&id| id == pair[0])
+            .ok_or_else(|| {
+                format!(
+                    "JPEG lossless SOS references unknown component {}",
+                    pair[0]
+                )
+            })?;
+        if scan_components
+            .iter()
+            .any(|&(component, _): &(u8, u8)| usize::from(component) == index)
+        {
+            return Err("JPEG lossless SOS repeats a component".to_owned());
+        }
+        let table = pair[1] >> 4;
+        if table > 3 {
+            return Err(format!(
+                "JPEG DC Huffman table selector {table} is outside the 0..=3 range"
+            ));
+        }
+        scan_components.push((index as u8, table));
+    }
+    let scan = &payload[1 + count * 2..];
     if scan[1] != 0 {
         return Err("JPEG lossless SOS spectral end must be zero".to_owned());
     }
@@ -382,7 +516,13 @@ fn parse_sos(payload: &[u8], components: u8, component_ids: &[u8; 3]) -> Result<
         return Err("JPEG lossless successive approximation is unsupported".to_owned());
     }
     validate_predictor(scan[0])?;
-    Ok((scan[0], scan[2] & 0x0f))
+    let point_transform = scan[2] & 0x0f;
+    validate_point_transform(precision, point_transform)?;
+    Ok(Scan {
+        components: scan_components,
+        predictor: scan[0],
+        point_transform,
+    })
 }
 
 fn expect_marker(reader: &mut MarkerReader<'_>, expected: Marker) -> Result<(), String> {
@@ -544,6 +684,85 @@ mod tests {
             .windows(2)
             .any(|window| (0xd0..=0xd7).contains(&window[1])));
         assert_eq!(LosslessFrame::decode(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn accepts_multiple_dht_segments_and_dc_table_selectors() {
+        let frame = sample_frame(8, 1);
+        let encoded = frame.encode(1, 0, None).unwrap();
+        let sos = encoded
+            .windows(2)
+            .position(|window| window == [0xff, 0xda])
+            .unwrap();
+        let sos_length = usize::from(u16::from_be_bytes([encoded[sos + 2], encoded[sos + 3]]));
+        let entropy = &encoded[sos + 2 + sos_length..encoded.len() - 2];
+        for table in 0..=3u8 {
+            let mut stream = MarkerWriter::default();
+            stream.write_marker(Marker::Soi).unwrap();
+            stream
+                .write_segment(Marker::Sof3, &sof_payload(&frame).unwrap())
+                .unwrap();
+            for id in 0..=3u8 {
+                let mut payload = dht_payload();
+                payload[0] = id;
+                stream.write_segment(Marker::Dht, &payload).unwrap();
+            }
+            let mut sos_payload = sos_payload(&[0], 1, 0).unwrap();
+            sos_payload[2] = table << 4;
+            stream.write_segment(Marker::Sos, &sos_payload).unwrap();
+            stream.write_raw(entropy);
+            stream.write_marker(Marker::Eoi).unwrap();
+            assert_eq!(
+                LosslessFrame::decode(&stream.into_bytes()).unwrap(),
+                frame,
+                "table selector {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_non_interleaved_multi_scan_streams() {
+        let frame = sample_frame(8, 3);
+        let per_component = frame
+            .encode_scans(1, 0, None, &[vec![0], vec![1], vec![2]])
+            .unwrap();
+        assert_eq!(
+            LosslessFrame::decode(&per_component).unwrap(),
+            frame,
+            "one scan per component"
+        );
+        let mixed = frame
+            .encode_scans(1, 0, None, &[vec![0, 1], vec![2]])
+            .unwrap();
+        assert_eq!(
+            LosslessFrame::decode(&mixed).unwrap(),
+            frame,
+            "interleaved subset scan"
+        );
+    }
+
+    #[test]
+    fn rejects_repeated_or_missing_components_across_scans() {
+        let frame = sample_frame(8, 3);
+        let per_component = frame
+            .encode_scans(1, 0, None, &[vec![0], vec![1], vec![2]])
+            .unwrap();
+        let sos: Vec<usize> = per_component
+            .windows(2)
+            .enumerate()
+            .filter(|(_, window)| *window == [0xff, 0xda])
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(sos.len(), 3);
+        let mut repeated = per_component.clone();
+        repeated[sos[1] + 5] = 1;
+        let error = LosslessFrame::decode(&repeated).unwrap_err();
+        assert!(error.contains("more than one scan"), "{error}");
+        let missing = frame
+            .encode_scans(1, 0, None, &[vec![0], vec![1]])
+            .unwrap();
+        let error = LosslessFrame::decode(&missing).unwrap_err();
+        assert!(error.contains("every component"), "{error}");
     }
 
     #[test]

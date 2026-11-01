@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nonzero_smoothing_without_partial_frame() {
+    fn accepts_nonzero_smoothing_and_rejects_out_of_range() {
         let mut source = dataset(
             syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
             1,
@@ -655,17 +655,31 @@ mod tests {
         let source_view = PixelDataRef::from_dataset(&source).unwrap();
         let mut compressed = dataset(syntaxes::JPEG_PROCESS_1.clone(), 1, 1, 8, 1, None);
         let params = JpegParams {
-            smoothing_factor: 1,
+            smoothing_factor: 50,
             ..Default::default()
         };
-        assert!(JpegProcess1Codec
+        JpegProcess1Codec
             .encode(
                 &source_view,
                 &mut PixelData::create_new(&mut compressed).unwrap(),
                 &CodecParams::Jpeg(params),
             )
+            .unwrap();
+        assert!(compressed.contains(&radicom::model::tag::Tag::PIXEL_DATA));
+        // Out-of-range smoothing stays a parameter error with no partial frame.
+        let mut rejected = dataset(syntaxes::JPEG_PROCESS_1.clone(), 1, 1, 8, 1, None);
+        let params = JpegParams {
+            smoothing_factor: 101,
+            ..Default::default()
+        };
+        assert!(JpegProcess1Codec
+            .encode(
+                &source_view,
+                &mut PixelData::create_new(&mut rejected).unwrap(),
+                &CodecParams::Jpeg(params),
+            )
             .is_err());
-        assert!(!compressed.contains(&radicom::model::tag::Tag::PIXEL_DATA));
+        assert!(!rejected.contains(&radicom::model::tag::Tag::PIXEL_DATA));
     }
 
     #[test]
@@ -793,5 +807,194 @@ mod tests {
             .max()
             .unwrap();
         assert!(max < 180, "max={max}");
+    }
+
+    #[test]
+    fn process1_422_conversion_normalizes_a_ybr422_destination() {
+        use radicom::model::tag::Tag;
+        use radicom::model::vr::Vr;
+        let source_bytes: Vec<u8> = (0..17 * 9 * 3).map(|v| ((v * 29) % 256) as u8).collect();
+        let mut source = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            9,
+            17,
+            8,
+            3,
+            Some(0),
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&source_bytes)
+            .unwrap();
+        let mut compressed = dataset(syntaxes::JPEG_PROCESS_1.clone(), 9, 17, 8, 3, Some(0));
+        let params = JpegParams {
+            sample_factor: radicom::pixel::codec::SampleFactor::Half,
+            ..Default::default()
+        };
+        JpegProcess1Codec
+            .encode(
+                &PixelDataRef::from_dataset(&source).unwrap(),
+                &mut PixelData::create_new(&mut compressed).unwrap(),
+                &CodecParams::Jpeg(params),
+            )
+            .unwrap();
+        assert_eq!(
+            compressed
+                .get_str(Tag::PHOTOMETRIC_INTERPRETATION)
+                .unwrap(),
+            "YBR_FULL_422"
+        );
+        let compressed_view = PixelDataRef::from_dataset(&compressed).unwrap();
+
+        let mut packed = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            9,
+            17,
+            8,
+            3,
+            Some(0),
+        );
+        packed.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "YBR_FULL_422");
+        JpegProcess1Codec
+            .decode(
+                &compressed_view,
+                &mut PixelData::create_new(&mut packed).unwrap(),
+                &CodecParams::Jpeg(JpegParams::default()),
+            )
+            .unwrap();
+        assert_eq!(
+            packed.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "YBR_FULL_422"
+        );
+        assert_eq!(
+            PixelDataRef::from_dataset(&packed)
+                .unwrap()
+                .get_frame(0)
+                .unwrap()
+                .size(),
+            324
+        );
+
+        let mut converted = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            9,
+            17,
+            8,
+            3,
+            Some(0),
+        );
+        converted.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "YBR_FULL_422");
+        JpegProcess1Codec
+            .decode(
+                &compressed_view,
+                &mut PixelData::create_new(&mut converted).unwrap(),
+                &CodecParams::Jpeg(JpegParams {
+                    convert_colorspace_to_rgb: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            converted
+                .get_str(Tag::PHOTOMETRIC_INTERPRETATION)
+                .unwrap(),
+            "RGB"
+        );
+        let actual = PixelDataRef::from_dataset(&converted)
+            .unwrap()
+            .get_frame(0)
+            .unwrap()
+            .data()
+            .unwrap()
+            .to_vec();
+        assert_eq!(actual.len(), 17 * 9 * 3);
+        let max = actual
+            .iter()
+            .zip(source_bytes.iter())
+            .map(|(a, b)| (*a as i16 - *b as i16).abs())
+            .max()
+            .unwrap();
+        assert!(max < 180, "max={max}");
+    }
+
+    #[test]
+    fn lossless_preserves_palette_color_without_conversion() {
+        use radicom::model::tag::Tag;
+        use radicom::model::vr::Vr;
+        for bits in [8u16, 16] {
+            let index: Vec<u8> = (0..20u32)
+                .flat_map(|value| {
+                    let sample = (value * 7) % 251;
+                    if bits == 8 {
+                        vec![sample as u8]
+                    } else {
+                        vec![(sample & 0xff) as u8, (sample >> 8) as u8]
+                    }
+                })
+                .collect();
+            let mut source = dataset(
+                syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+                4,
+                5,
+                bits,
+                1,
+                None,
+            );
+            source.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "PALETTE COLOR");
+            PixelData::create_new(&mut source)
+                .unwrap()
+                .add_frame(&index)
+                .unwrap();
+            let mut compressed = dataset(syntaxes::JPEG_LOSSLESS_PROCESS_14.clone(), 4, 5, bits, 1, None);
+            compressed.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "PALETTE COLOR");
+            JpegLossless14Codec
+                .encode(
+                    &PixelDataRef::from_dataset(&source).unwrap(),
+                    &mut PixelData::create_new(&mut compressed).unwrap(),
+                    &CodecParams::Jpeg(JpegParams::default()),
+                )
+                .unwrap();
+            let mut decoded = dataset(
+                syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+                4,
+                5,
+                bits,
+                1,
+                None,
+            );
+            decoded.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "PALETTE COLOR");
+            JpegLossless14Codec
+                .decode(
+                    &PixelDataRef::from_dataset(&compressed).unwrap(),
+                    &mut PixelData::create_new(&mut decoded).unwrap(),
+                    &CodecParams::Jpeg(JpegParams::default()),
+                )
+                .unwrap();
+            assert_eq!(
+                decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+                "PALETTE COLOR"
+            );
+            assert_eq!(
+                PixelDataRef::from_dataset(&decoded)
+                    .unwrap()
+                    .get_frame(0)
+                    .unwrap()
+                    .data()
+                    .unwrap()
+                    .to_vec(),
+                index,
+                "bits={bits}"
+            );
+
+            let mut lossy = dataset(syntaxes::JPEG_PROCESS_1.clone(), 4, 5, 8, 1, None);
+            lossy.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "PALETTE COLOR");
+            assert!(JpegProcess1Codec
+                .encode(
+                    &PixelDataRef::from_dataset(&source).unwrap(),
+                    &mut PixelData::create_new(&mut lossy).unwrap(),
+                    &CodecParams::Jpeg(JpegParams::default()),
+                )
+                .is_err());
+        }
     }
 }

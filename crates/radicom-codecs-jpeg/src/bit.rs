@@ -116,6 +116,11 @@ impl<'a> BitReader<'a> {
         self.remaining = 0;
     }
 
+    /// Byte offset of the next unread byte in the stream.
+    pub(crate) fn position(&self) -> usize {
+        self.position
+    }
+
     fn fill_byte(&mut self) -> Result<(), String> {
         let byte = *self
             .data

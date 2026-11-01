@@ -1,7 +1,7 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 use super::lossless::LosslessFrame;
-use super::sequential::SequentialFrame;
+use super::sequential::{fancy_upsample, SequentialFrame};
 use radicom::error::{CodecError, Error};
 use radicom::model::tag::Tag;
 use radicom::model::vr::Vr;
@@ -22,7 +22,7 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    fn from_source(data: &PixelDataRef<'_>) -> Result<Self, String> {
+    fn from_source(data: &PixelDataRef<'_>, allow_palette: bool) -> Result<Self, String> {
         Self::from_values(
             data.width(),
             data.height(),
@@ -32,10 +32,11 @@ impl Layout {
             data.planar_configuration(),
             data.pixel_representation(),
             data.photometric_interpretation(),
+            allow_palette,
         )
     }
 
-    fn from_destination(data: &PixelData<'_>) -> Result<Self, String> {
+    fn from_destination(data: &PixelData<'_>, allow_palette: bool) -> Result<Self, String> {
         Self::from_values(
             data.width(),
             data.height(),
@@ -45,6 +46,7 @@ impl Layout {
             data.planar_configuration(),
             data.pixel_representation(),
             data.photometric_interpretation(),
+            allow_palette,
         )
     }
 
@@ -58,6 +60,7 @@ impl Layout {
         planar: u16,
         pixel_representation: u16,
         photometric: Option<PhotometricInterpretation>,
+        allow_palette: bool,
     ) -> Result<Self, String> {
         let width =
             usize::try_from(width).map_err(|_| "JPEG width does not fit usize".to_owned())?;
@@ -70,14 +73,14 @@ impl Layout {
             8 | 16 => usize::from(bits_allocated / 8),
             other => {
                 return Err(format!(
-                    "JPEG lossless BitsAllocated {other} is unsupported"
+                    "JPEG BitsAllocated {other} is unsupported"
                 ))
             }
         };
         let bits_stored =
             u8::try_from(bits_stored).map_err(|_| "JPEG BitsStored does not fit u8".to_owned())?;
         if !(2..=16).contains(&bits_stored) || usize::from(bits_stored) > bits_allocated * 8 {
-            return Err(format!("JPEG lossless BitsStored {bits_stored} is invalid"));
+            return Err(format!("JPEG BitsStored {bits_stored} is invalid"));
         }
         if pixel_representation > 1 {
             return Err(format!(
@@ -91,7 +94,7 @@ impl Layout {
             .map_err(|_| "JPEG SamplesPerPixel does not fit u8".to_owned())?;
         if !(1..=3).contains(&components) {
             return Err(format!(
-                "JPEG lossless SamplesPerPixel {components} is unsupported"
+                "JPEG SamplesPerPixel {components} is unsupported"
             ));
         }
         if components > 1 && planar > 1 {
@@ -104,7 +107,7 @@ impl Layout {
                 Some(photometric),
                 Some(PhotometricInterpretation::Monochrome1)
                     | Some(PhotometricInterpretation::Monochrome2)
-            )
+            ) || (allow_palette && photometric == PhotometricInterpretation::PaletteColor)
         } else {
             matches!(
                 Some(photometric),
@@ -114,7 +117,7 @@ impl Layout {
             )
         };
         if !expected_photometric {
-            return Err("JPEG lossless photometric interpretation is unsupported".to_owned());
+            return Err("JPEG photometric interpretation is unsupported".to_owned());
         }
         let frame_length = if photometric == PhotometricInterpretation::YbrFull422 {
             if components != 3 || planar != 0 || bits_allocated != 1 {
@@ -322,13 +325,7 @@ pub(crate) fn encode_sequential(
             "quality and smoothing_factor must be 0..=100",
         ));
     }
-    if params.smoothing_factor != 0 {
-        return Err(operation_error(
-            codec,
-            "smoothing_factor is not supported by the pure-Rust encoder; use 0",
-        ));
-    }
-    let layout = Layout::from_source(src).map_err(|m| operation_error(codec, &m))?;
+    let layout = Layout::from_source(src, false).map_err(|m| operation_error(codec, &m))?;
     if layout.pixel_representation != 0
         || (baseline && layout.bits_stored != 8)
         || (!baseline && !matches!(layout.bits_stored, 8 | 12))
@@ -385,7 +382,13 @@ pub(crate) fn encode_sequential(
         .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?;
         frames.push(
             frame
-                .encode(params.quality, !baseline, sampling_half)
+                .encode_with_smoothing(
+                    params.quality,
+                    !baseline,
+                    sampling_half,
+                    params.smoothing_factor,
+                    (params.restart_interval != 0).then_some(params.restart_interval),
+                )
                 .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?,
         );
     }
@@ -444,7 +447,13 @@ pub(crate) fn decode_sequential(
         }
         frames.push(frame);
     }
+    let photometric = src.photometric_interpretation();
     let convert = params.convert_colorspace_to_rgb
+        && matches!(
+            photometric,
+            Some(PhotometricInterpretation::YbrFull)
+                | Some(PhotometricInterpretation::YbrFull422)
+        )
         && frames.first().is_some_and(|frame| frame.components == 3);
     if convert && dst.pixel_representation() != 0 {
         return Err(operation_error(
@@ -452,7 +461,24 @@ pub(crate) fn decode_sequential(
             "color conversion is unsupported for signed samples",
         ));
     }
-    let layout = Layout::from_destination(dst).map_err(|m| operation_error(codec, &m))?;
+    let mut layout = Layout::from_destination(dst, false).map_err(|m| operation_error(codec, &m))?;
+    if convert && layout.photometric == PhotometricInterpretation::YbrFull422 {
+        // A 4:2:2 destination packs 2 bytes per pixel, but conversion produces
+        // three interleaved samples per pixel labelled RGB.
+        layout = Layout::from_values(
+            dst.width(),
+            dst.height(),
+            dst.bits_allocated()
+                .map_err(|error| operation_error(codec, &error.to_string()))?,
+            dst.bits_stored(),
+            3,
+            0,
+            dst.pixel_representation(),
+            Some(PhotometricInterpretation::Rgb),
+            false,
+        )
+        .map_err(|m| operation_error(codec, &m))?;
+    }
     if layout.pixel_representation != 0 {
         return Err(operation_error(
             codec,
@@ -462,6 +488,14 @@ pub(crate) fn decode_sequential(
     let mut output = Vec::with_capacity(frames.len());
     for mut frame in frames {
         if convert {
+            fancy_upsample(
+                &mut frame.samples,
+                frame.width,
+                frame.height,
+                frame.precision,
+                frame.components,
+                &frame.sampling,
+            );
             ybr_to_rgb(&mut frame.samples, frame.precision);
         }
         output.push(
@@ -502,7 +536,7 @@ pub(crate) fn encode_lossless(
             "lossless encode does not perform color conversion",
         ));
     }
-    let layout = Layout::from_source(src).map_err(|message| operation_error(codec, &message))?;
+    let layout = Layout::from_source(src, true).map_err(|message| operation_error(codec, &message))?;
     let point_transform = u8::try_from(params.point_transform)
         .map_err(|_| operation_error(codec, "point transform must fit in u8"))?;
     if point_transform >= layout.bits_stored {
@@ -532,7 +566,11 @@ pub(crate) fn encode_lossless(
         .map_err(|message| operation_error(codec, &format!("frame {frame_index}: {message}")))?;
         encoded_frames.push(
             frame
-                .encode(predictor, point_transform, None)
+                .encode(
+                predictor,
+                point_transform,
+                (params.restart_interval != 0).then_some(params.restart_interval),
+            )
                 .map_err(|message| {
                     operation_error(codec, &format!("frame {frame_index}: {message}"))
                 })?,
@@ -564,7 +602,7 @@ pub(crate) fn decode_lossless(
         ));
     }
     let layout =
-        Layout::from_destination(dst).map_err(|message| operation_error(codec, &message))?;
+        Layout::from_destination(dst, true).map_err(|message| operation_error(codec, &message))?;
     let mut decoded_frames = Vec::with_capacity(src.number_of_frames() as usize);
     for frame_index in 0..src.number_of_frames() {
         let buffer = src

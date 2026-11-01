@@ -109,13 +109,31 @@ contract does not define a signed YCbCr/RGB conversion.
 ## 4. Photometric interpretation and color policy
 
 The encoder accepts `MONOCHROME1`, `MONOCHROME2`, `RGB`, `YBR_FULL`, and
-`YBR_FULL_422` for the supported process and sampling. `YBR_ICT`,
-`YBR_RCT`, palette color, CMYK, and YCCK are rejected for classic JPEG.
+`YBR_FULL_422` for the supported process and sampling. The lossless transfer
+syntaxes (`1.2.840.10008.1.2.4.57` and `.70`) additionally accept `PALETTE
+COLOR` with one component, as PS3.5 Table 8.2.1-2 permits; the lossy syntaxes
+reject it, matching Table 8.2.1-1. `YBR_ICT`, `YBR_RCT`, CMYK, and YCCK are
+rejected for classic JPEG.
 
 For lossy RGB encoding, the implementation converts RGB to full-range YCbCr.
 `sample_factor = Full` emits `YBR_FULL`; `sample_factor = Half` emits
-`YBR_FULL_422`. Decode can convert the YCbCr components back to RGB when
-`convert_colorspace_to_rgb` is true.
+`YBR_FULL_422`. Decoding accepts every sampling factor set that T.81 allows
+(`H_i`,`V_i` in `1..=4`, each dividing the frame maximum) because such streams
+exist in the wild even though Table 8.2.1-1 defines no `YBR_FULL_420`
+photometric interpretation: the block geometry comes from one normalized
+`(Hmax, Vmax)` implementation, and chroma reconstruction replicates integer
+factors (libjpeg's `int_upsample`) while 2×1, 1×2 and 2×2 use the triangular
+filters from `jdsample.c`. A frame decoded from a non-DICOM sampling
+configuration cannot be re-encoded as such — the encoder only offers 4:4:4 and
+4:2:2. Decode converts the components back to RGB when
+`convert_colorspace_to_rgb` is true and the compressed dataset is labelled
+`YBR_FULL` or `YBR_FULL_422`; an `RGB`-labelled codestream is never converted
+again. A `YBR_FULL_422` destination declares two bytes per pixel, so a converted
+decode rebuilds the destination layout as interleaved RGB before writing the
+three samples per pixel and then sets the photometric interpretation to `RGB`.
+Note that decoding 4:2:0 into a `YBR_FULL_422` destination keeps only the
+horizontal chroma resolution (2 bytes/pixel is the DICOM lossy contract); use
+`YBR_FULL` or `convert_colorspace_to_rgb` when vertical chroma matters.
 
 For lossless JPEG, the encoder keeps the component color space and forces
 one-by-one component sampling. This avoids the RGB-to-YCbCr conversion that
@@ -134,11 +152,12 @@ must be deterministic and must agree with the bytes written to the destination.
 | Field | Meaning | Validation |
 | --- | --- | --- |
 | `quality` | Quantization quality for Process 1/2/4 | `0..=100`; ignored by Process 14 |
-| `smoothing_factor` | Pre-encoding smoothing | must be `0` in the first Rust release; ignored by Process 14 |
+| `smoothing_factor` | Pre-encoding input smoothing | `0..=100`; ignored by Process 14. Ported bit for bit from libjpeg-turbo `jcsample.c`: `fullsize_smooth_downsample` for undownsampled components and `h2v2_smooth_downsample` for 2×2 chroma. Those are the only two smoothing kernels libjpeg has — for 2×1 and other integer ratios it sets `smoothok = FALSE` and logs `JTRC_SMOOTH_NOTIMPL`, so a 4:2:2 encode smooths luma only, exactly like libjpeg/fo-dicom |
 | `convert_colorspace_to_rgb` | Decode YCbCr/RGB as RGB | reject for signed samples |
-| `sample_factor` | Chroma sampling | `Full` = 4:4:4, `Half` = 4:2:2; lossless forces 4:4:4 |
+| `sample_factor` | Chroma sampling on encode | `Full` = 4:4:4, `Half` = 4:2:2; lossless forces 4:4:4. Decode additionally accepts any T.81 factor set (4:2:0, 4:1:1, 4:4:0, …) |
 | `predictor` | Process 14 predictor selection | `1..=7`; SV1 overrides to `1` |
 | `point_transform` | Right shift before predictive coding | must fit the selected precision; lossless exact tests use `0` |
+| `restart_interval` | DRI restart interval in MCUs (`0` = none) | `0`..=`u16::MAX`; emitted as one DRI segment plus `RST0`–`RST7`; Process 14 counts one MCU per pixel, Process 1/2/4 one MCU per 8×8 block set |
 
 The wrong `CodecParams` variant is rejected before touching the destination.
 Parameters that the selected transfer syntax cannot use are rejected instead
@@ -164,12 +183,26 @@ follow the existing RLE crate conventions, but responsibilities are fixed:
 
 ### Marker rules
 
-The decoder must validate SOI, one supported SOF marker, DQT/DHT definitions,
-SOS component selectors, restart interval use, and EOI. Segment lengths include
-their two length bytes and must stay inside the frame. APPn and COM are skipped
-with the same bounds checks. Standalone markers are recognized only where the
-standard permits them. A marker encountered inside entropy data is valid only
-after byte stuffing or at a legal restart/EOI boundary.
+The decoder validates SOI, one supported SOF marker, DQT/DHT definitions (one
+DHT segment may carry several tables; the lossless path accepts DC tables 0–3),
+SOS component selectors, DRI restart intervals, the restart-marker sequence, and
+EOI. A restart interval of `0` means “no restarts”. At each restart boundary the
+decoder requires the next `RST0`–`RST7` marker in sequence, resets the DC
+predictors or lossless predictor state, and aligns to the byte boundary; a
+missing, unexpected, or mid-entropy restart marker is a managed error. Both
+sequential and lossless decoding accept any number of scans as long as every
+component is covered exactly once: an interleaved scan (Ns > 1) uses the frame
+MCU grid with `h_i*v_i` blocks per component and a non-interleaved scan (Ns = 1)
+uses the component plane grid from T.81 A.2.3, each scan resetting its DC
+predictors. When `restart_interval` is non-zero the encoders write one DRI
+segment (after the frame header) and an `RST0`–`RST7` marker at every interval
+boundary; the default `0` keeps the single interleaved scan with no DRI.
+
+Segment lengths include their two length bytes and must stay inside the frame.
+APPn and COM are skipped with the same bounds checks. Standalone markers are
+recognized only where the standard permits them. A marker encountered inside
+entropy data is valid only after byte stuffing or at a legal restart/EOI
+boundary. Bytes after EOI are ignored.
 
 ### Process 1 and Process 2/4
 
@@ -178,9 +211,14 @@ Huffman coding, restart handling, and inverse operations. Process 1 is limited
 to 8-bit samples. Process 2/4 supports the DICOM-relevant 8-bit and 12-bit
 precision and rejects 16-bit sequential JPEG rather than truncating it.
 
-The first release uses baseline Huffman coding and emits one sequential scan.
-It does not emit progressive or arithmetic-coded scans. Decoder support is
-limited to the same sequential forms so that acceptance is explicit and testable.
+The first release uses baseline Huffman coding and emits one sequential scan per
+frame. It does not emit progressive or arithmetic-coded scans, and it does not
+accept them: PS3.5 A.4 specifies DICOM JPEG transfer syntaxes for Process 1
+(`.50`), Process 2/4 (`.51`), and Process 14 (`.57`/`.70`); progressive and
+hierarchical JPEG are not part of that family. The decoder accepts sequential
+streams with any number of interleaved or non-interleaved scans and baseline
+streams that carry restart intervals from other encoders, so acceptance stays
+explicit and testable.
 
 ### Process 14 and SV1
 
@@ -234,6 +272,18 @@ without updating this document first.
 - Marker lengths, unsupported markers, truncated segments, SOF/SOS mismatch,
   missing DHT/DQT, duplicate/oversubscribed Huffman tables, and invalid restart
   markers.
+- Restart intervals: decode of DRI/RST streams, `RST0`–`RST7` sequencing, DC and
+  predictor reset, and rejection of missing or mismatched restart markers.
+- Lossless table and scan structure: several tables in one DHT segment, DC
+  selectors `0..=3`, non-interleaved multi-scan streams, and rejection of
+  repeated, unknown, or missing components.
+- Sequential multi-scan structure: 4:4:4 and 4:2:2 streams split into
+  per-component and mixed scans decode to the same samples as the equivalent
+  single interleaved scan, multi-scan plus DRI preserves the reconstructed
+  samples with per-scan restart sequencing, and repeated, unknown, or uncovered
+  components are managed errors.
+- Per-component sampling-factor and quantization-table validation, including
+  rejection of unreferenced or missing quantization tables.
 - Bit stuffing, marker boundaries, canonical Huffman round-trips, and restart
   state reset.
 - DCT/IDCT numerical bounds, quantization tables, zig-zag order, and DC/AC
@@ -250,6 +300,9 @@ without updating this document first.
   round-trips, including signed samples where the DICOM layout permits them.
 - Interleaved and planar RGB normalization, multi-frame ordering, odd-length
   DICOM padding, and metadata consistency.
+- `PALETTE COLOR` round-trips at 8 and 16 bits through Process 14 and SV1, is
+  rejected by the lossy syntaxes, and a `YBR_FULL_422` destination with
+  `convert_colorspace_to_rgb` yields an RGB frame of three bytes per pixel.
 
 ### Interoperability checks
 
@@ -257,12 +310,43 @@ without updating this document first.
   `YBR_FULL`, Baseline `YBR_FULL_422`, and Lossless RGB. A Process 2/4 fixture
   is not present in the reference checkout yet.
 - The built fo-dicom native decoder accepts Rust output for all four transfer
-  syntaxes. Process 1 and Process 2/4 decode with fixed lossy byte deltas of
-  11 and 250 in the smoke fixtures; Process 14 and SV1 are byte-exact,
-  including the 16-bit SV1 fixture.
+  syntaxes. Process 1 and Process 2/4 decode with lossy sample deltas bounded by
+  the fixtures, and Process 14/SV1 are byte-exact, including 16-bit SV1.
+- A Baseline fixture carrying DRI/RST restart markers decodes to the same
+  samples as the reference decoder; the residual differences are `±1` IDCT
+  rounding on 48 of 3,072 samples, not restart-state errors.
+- `PALETTE COLOR` round-trips byte-exactly through `.57`, `.70`, and `.80` in
+  both directions, and the lossy syntaxes reject it.
 - Lossless comparisons are byte/sample exact after the DICOM byte-order and
   planar rules are applied. Lossy comparisons use fixed fixtures and a stated
-  tolerance; visual similarity alone is not an acceptance criterion.
+  tolerance; visual similarity alone is not an acceptance criterion. For
+  `YBR_FULL_422` output the reference decoder performs triangular chroma
+  upsampling (`h2v1`) during its RGB conversion; the decoder follows libjpeg-turbo
+  `jdsample.c` (even columns `(3*c[j] + c[j-1] + 1) >> 2`, odd columns
+  `(3*c[j] + c[j+1] + 2) >> 2`, edges clamped), which brings the RGB comparison to
+  `max=4` on the `PM5644` fixture — the same residual the 4:4:4 control shows
+  without any upsampling, i.e. remaining deltas come from the IDCT and the
+  fixed-point colour conversion, not from the filter. Before the filter the same
+  comparison was `max=78`. The packed `YBR_FULL_422` decode path (no RGB
+  conversion) is unchanged and byte-exact.
+- `smoothing_factor` parity with libjpeg is sample-exact: at `quality=100` a
+  monochrome encode with `smoothing=50` decodes (DCMTK) within `max=1` of the
+  unsmoothed stream — the same bound as `smoothing=0` — while the codestream
+  shrinks (PM5644, 4:2:2, q90: −0.1 % / −1.0 % / −2.8 % for 1 / 25 / 50).
+  Decoding a fo-dicom `SmoothingFactor=50` stream and comparing with fo-dicom's
+  own decode gives `max=3` (64×48) and `max=4` (640×480), the same bound as
+  without smoothing. `smoothing=0` output is byte-identical to the previous
+  release (8 A/B probes across mono/4:4:4/4:2:2, 8/12 bit, with and without DRI).
+- Encoder-written restart intervals are readable by independent toolkits: DCMTK
+  3.7.1 decodes a `.70` stream with `restart_interval = 960` (one MCU row —
+  libijg rejects intervals that are not an integer multiple of the MCU row) to
+  the source samples with 0 differences, and a `.50` stream with an interval of 2
+  to RGB within `max=4`, the same bound as the same stream without restarts.
+- Sample comparisons come from the C# interop harness (`dicomref cmp`), which
+  compares decoded frames sample by sample at 8 or 16 bits instead of byte by
+  byte. The earlier byte metric reported a spurious 255-byte difference whenever
+  a 16-bit sample crossed a 256 boundary; the sample metric reports the real
+  deltas (14 and 13 against the source, 6 between the two decoders).
 - The malformed Process 14 fixture from
   the fo-dicom.Codecs malformed JPEG unit test is
   covered by a Rust regression test that returns a managed error and leaves the
@@ -271,9 +355,29 @@ without updating this document first.
 ## 10. Non-goals and upgrade points
 
 The first release does not promise progressive JPEG, arithmetic coding,
-hierarchical JPEG, 4:2:0 sampling, CMYK/YCCK, palette-color JPEG, or arbitrary
-component counts. These are separate compatibility projects because they alter
-marker validation, color semantics, or the DICOM photometric contract.
+hierarchical JPEG, CMYK/YCCK, palette color in the lossy syntaxes (only the
+lossless paths accept it), or arbitrary component counts. These are separate
+compatibility projects because they alter marker validation, color semantics, or
+the DICOM photometric contract. Within DICOM three of them are not merely
+deferred but excluded by the standard: PS3.5 A.4 defines JPEG transfer syntaxes
+for Process 1, Process 2/4 and Process 14 only (progressive and hierarchical JPEG
+are not among them), and Table 8.2.1-1 admits only `YBR_FULL_422` or `RGB` for
+three-sample lossy JPEG and no `PALETTE COLOR` for the lossy syntaxes. Multi-scan
+sequential JPEG, by contrast, is inside the standard (`A.4` only requires the
+JPEG interchange format) and is implemented, and the decoder also accepts the
+non-DICOM 4:2:0/4:1:1 sampling layouts described in §4. Encoding remains limited
+to the two DICOM sampling configurations, and progressive/arithmetic coding stays
+out of scope: those require a different entropy decoder and coefficient
+progression model, not a parameter.
+
+A known decoder limit sits in the tail blocks: samples of a block that falls
+outside the image are clamped onto the last real column/row instead of being
+discarded. Reconstructing them differently would change the single-scan output
+byte stream, so the clamp is kept; T.81 leaves the content of those padded
+samples undefined, and both this encoder and libjpeg's replicate edges, so the
+difference is not observable for streams written by either (one 960×540 fo-dicom
+stream shows it only on its last row when a smoothing parameter changes that
+row's content).
 
 If deployment later requires native acceleration, it may be added behind the
 same codec boundary after the pure Rust behavior and interoperability matrix are
@@ -287,6 +391,8 @@ implemented transfer syntaxes. The reference checkout still does not contain
 a Process 2/4 sample, so that direction remains covered by the Rust/native
 smoke fixture rather than a checked-in reference fixture.
 The Lossless RGB codestream and the separately named raw RGB fixture differ in
-1,212 bytes (404 RGB samples) in exact 0/255 blocks, so that cross-file check
-is recorded as non-exact rather than treated as decoder proof or failure.
+1,212 bytes (404 RGB samples) in exact 0/255 blocks. Rust and the reference
+decoder reproduce the codestream byte-identically, so the difference is a
+mismatch between the two acceptance fixtures; the cross-file check is recorded
+as non-exact rather than treated as decoder proof or failure.
 

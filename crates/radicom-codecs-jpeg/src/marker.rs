@@ -78,6 +78,10 @@ impl<'a> MarkerReader<'a> {
         self.position
     }
 
+    pub(crate) fn seek(&mut self, position: usize) {
+        self.position = position;
+    }
+
     pub(crate) fn read_segment(&mut self) -> Result<(Marker, Vec<u8>), String> {
         let marker = self.read_marker()?;
         if marker.is_standalone() {
