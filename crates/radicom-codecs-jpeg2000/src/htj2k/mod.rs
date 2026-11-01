@@ -5,5 +5,6 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod cleanup;
 pub(crate) mod mel;
 pub(crate) mod tables;
