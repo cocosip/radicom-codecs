@@ -114,6 +114,26 @@ pub(crate) fn inverse_97(
     height: usize,
     levels: u8,
 ) -> Result<(), String> {
+    inverse_97_scaled(data, width, height, levels, TWO_INV_K)
+}
+
+/// Inverse 9/7 using the OpenJPH high-pass normalisation.
+pub(crate) fn inverse_97_openjpeg(
+    data: &mut [f64],
+    width: usize,
+    height: usize,
+    levels: u8,
+) -> Result<(), String> {
+    inverse_97_scaled(data, width, height, levels, INV_K)
+}
+
+fn inverse_97_scaled(
+    data: &mut [f64],
+    width: usize,
+    height: usize,
+    levels: u8,
+    high_scale: f64,
+) -> Result<(), String> {
     if width == 0 || height == 0 || data.len() != width * height {
         return Err("invalid irreversible wavelet plane".into());
     }
@@ -127,7 +147,7 @@ pub(crate) fn inverse_97(
         heights[level] = (heights[level - 1] + 1) >> 1;
     }
     for level in (0..levels).rev() {
-        inverse_97_2d(data, widths[level], heights[level], width);
+        inverse_97_2d(data, widths[level], heights[level], width, high_scale);
     }
     Ok(())
 }
@@ -358,12 +378,12 @@ fn forward_97_2d(data: &mut [f64], width: usize, height: usize, stride: usize) {
     }
 }
 
-fn inverse_97_2d(data: &mut [f64], width: usize, height: usize, stride: usize) {
+fn inverse_97_2d(data: &mut [f64], width: usize, height: usize, stride: usize, high_scale: f64) {
     if width > 1 {
         let mut row = vec![0f64; width];
         for y in 0..height {
             row.copy_from_slice(&data[y * stride..y * stride + width]);
-            inverse_97_1d(&mut row);
+            inverse_97_1d(&mut row, high_scale);
             data[y * stride..y * stride + width].copy_from_slice(&row);
         }
     }
@@ -373,7 +393,7 @@ fn inverse_97_2d(data: &mut [f64], width: usize, height: usize, stride: usize) {
             for y in 0..height {
                 column[y] = data[y * stride + x];
             }
-            inverse_97_1d(&mut column);
+            inverse_97_1d(&mut column, high_scale);
             for y in 0..height {
                 data[y * stride + x] = column[y];
             }
@@ -423,7 +443,7 @@ fn forward_97_1d(data: &mut [f64]) {
     data.copy_from_slice(&workspace);
 }
 
-fn inverse_97_1d(data: &mut [f64]) {
+fn inverse_97_1d(data: &mut [f64], high_scale: f64) {
     let width = data.len();
     if width <= 1 {
         return;
@@ -440,7 +460,7 @@ fn inverse_97_1d(data: &mut [f64]) {
     data.copy_from_slice(&temp);
     for i in 0..low_count.min(high_count) {
         data[2 * i] *= K;
-        data[2 * i + 1] *= TWO_INV_K;
+        data[2 * i + 1] *= high_scale;
     }
     if low_count > high_count {
         data[(low_count - 1) * 2] *= K;
@@ -543,21 +563,15 @@ mod tests {
 
     #[test]
     fn irreversible_97_reconstructs_with_openjpeg_scaling() {
-        // The 1D analysis scales the high band by K; OpenJPEG's synthesis
-        // scales it by 2/K, so the high band is halved before synthesis in
-        // this transform-only check. The codec path compensates through the
-        // QCD step sizes instead.
+        // OpenJPH's synthesis scales the high band by 1/K, matching the
+        // analysis scale K; classic JPEG 2000 uses 2/K instead.
         for length in [2usize, 3, 8, 17, 32] {
             let source: Vec<f64> = (0..length)
                 .map(|i| ((i * 37 + i * i * 11) % 512) as f64 - 256.0)
                 .collect();
             let mut plane = source.clone();
             forward_97_1d(&mut plane);
-            let sn = (length + 1) >> 1;
-            for value in &mut plane[sn..] {
-                *value /= 2.0;
-            }
-            inverse_97_1d(&mut plane);
+            inverse_97_1d(&mut plane, INV_K);
             for (a, b) in source.iter().zip(&plane) {
                 assert!((a - b).abs() < 0.05, "length={length}: {a} vs {b}");
             }

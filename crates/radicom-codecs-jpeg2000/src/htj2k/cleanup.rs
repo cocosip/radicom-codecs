@@ -1267,20 +1267,20 @@ impl MelWriter {
         if self.run > 0 {
             self.emit_bit(1);
         }
-        self.tmp <<= self.remaining_bits;
+        let mel_tmp = u16::from(self.tmp) << self.remaining_bits;
         let mel_mask = (0xFFu16 << self.remaining_bits) & 0xFF;
         let vlc_mask = 0xFFu16 >> (8 - vlc.used_bits);
         if (mel_mask | vlc_mask) == 0 {
             return;
         }
-        let fuse = u16::from(self.tmp) | vlc.tmp;
-        if (((fuse ^ u16::from(self.tmp)) & mel_mask) | ((fuse ^ vlc.tmp) & vlc_mask)) == 0
+        let fuse = mel_tmp | vlc.tmp;
+        if (((fuse ^ mel_tmp) & mel_mask) | ((fuse ^ vlc.tmp) & vlc_mask)) == 0
             && fuse != 0xFF
             && vlc.position > 1
         {
             self.bytes.push(fuse as u8);
         } else {
-            self.bytes.push(self.tmp);
+            self.bytes.push(mel_tmp as u8);
             vlc.flush_tmp();
         }
     }
