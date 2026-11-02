@@ -142,7 +142,7 @@ fn operate(
         // output samples and the rewritten PI agree (PS3.5 Table 8.2.3-1 note 3).
         let source_ybr =
             src.photometric_interpretation() == Some(PhotometricInterpretation::YbrFull);
-        let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
+        let mut frames = Vec::new();
         for i in 0..src.number_of_frames() {
             let b = src
                 .get_frame(i)
@@ -201,7 +201,7 @@ fn operate(
                 "source and destination pixel layouts differ",
             ));
         }
-        let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
+        let mut frames = Vec::new();
         for i in 0..src.number_of_frames() {
             let b = src
                 .get_frame(i)
@@ -912,6 +912,39 @@ mod facade_tests {
                 .is_err());
             assert!(!target.contains(&Tag::PIXEL_DATA));
         }
+    }
+
+    #[test]
+    fn untrusted_frame_count_does_not_preallocate_the_frame_list() {
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            1,
+            8,
+            1,
+            0,
+            "MONOCHROME2",
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame([7u8])
+            .unwrap();
+        let mut encoded = encode_stream(&source);
+        // An untrusted NumberOfFrames must fail at the first missing frame
+        // instead of sizing a huge Vec up front.
+        encoded.insert_str(Tag::NUMBER_OF_FRAMES, Vr::Is, u32::MAX.to_string());
+        let mut decoded = encoded.clone();
+        decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        decoded.remove(Tag::PIXEL_DATA);
+        let error = JpegLsLosslessCodec
+            .decode(
+                &PixelDataRef::from_dataset(&encoded).unwrap(),
+                &mut PixelData::create_new(&mut decoded).unwrap(),
+                &JpegLsLosslessCodec.default_params(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("frame 1"), "{error}");
+        assert!(!decoded.contains(&Tag::PIXEL_DATA));
     }
 
     #[test]

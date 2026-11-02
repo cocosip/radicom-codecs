@@ -339,8 +339,9 @@ fn operate(
         }
         let layout = Layout::destination(dst)
             .map_err(|m| error(codec, "decode", m))?
-            .rgb_output();
-        let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
+            .rgb_output()
+            .map_err(|m| error(codec, "decode", m))?;
+        let mut frames = Vec::new();
         for i in 0..src.number_of_frames() {
             let b = src
                 .get_frame(i)
@@ -393,7 +394,7 @@ fn operate(
                 "source and destination pixel layouts differ",
             ));
         }
-        let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
+        let mut frames = Vec::new();
         for i in 0..src.number_of_frames() {
             let b = src
                 .get_frame(i)
@@ -410,7 +411,7 @@ fn operate(
             dst.add_frame(frame)
                 .map_err(|e| error(codec, "encode", e.to_string()))?;
         }
-        frame::update_color_metadata(dst, &layout);
+        frame::update_color_metadata(dst, &layout, None);
         Ok(())
     }
 }
@@ -499,8 +500,9 @@ fn operate_ht(
         }
         let layout = Layout::destination(dst)
             .map_err(|m| error(codec, "decode", m))?
-            .rgb_output();
-        let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
+            .rgb_output()
+            .map_err(|m| error(codec, "decode", m))?;
+        let mut frames = Vec::new();
         for i in 0..src.number_of_frames() {
             let b = src
                 .get_frame(i)
@@ -553,7 +555,7 @@ fn operate_ht(
                 "source and destination pixel layouts differ",
             ));
         }
-        let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
+        let mut frames = Vec::new();
         for i in 0..src.number_of_frames() {
             let b = src
                 .get_frame(i)
@@ -570,7 +572,14 @@ fn operate_ht(
             dst.add_frame(frame)
                 .map_err(|e| error(codec, "encode", e.to_string()))?;
         }
-        frame::update_color_metadata(dst, &layout);
+        // A multiple component transform requires the matching label; fo-dicom's
+        // JPEG 2000 codec writes YBR_RCT/YBR_ICT for the same reason.
+        let mct_label = if options.mct && layout.components == 3 {
+            Some(if reversible { "YBR_RCT" } else { "YBR_ICT" })
+        } else {
+            None
+        };
+        frame::update_color_metadata(dst, &layout, mct_label);
         Ok(())
     }
 }
@@ -734,6 +743,47 @@ mod facade_tests {
         decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
         decoded.remove(Tag::PIXEL_DATA);
         decoded.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "YBR_FULL");
+        {
+            let src = PixelDataRef::from_dataset(&encoded).unwrap();
+            let mut dst = PixelData::create_new(&mut decoded).unwrap();
+            Jpeg2000LosslessCodec
+                .decode(&src, &mut dst, &Jpeg2000LosslessCodec.default_params())
+                .unwrap();
+        }
+        assert_eq!(
+            decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "RGB"
+        );
+        assert_eq!(samples(&decoded), raw);
+    }
+
+    #[test]
+    fn decoding_into_a_ybr_full_422_destination_does_not_panic() {
+        // A 4:2:2-labelled native destination sizes frames at two bytes per
+        // pixel; the adapter still emits full RGB, so the frame length has to
+        // be recomputed instead of reusing the subsampled size.
+        let raw: Vec<u8> = (0..8 * 6 * 3).map(|i| (i * 23 + 5) as u8).collect();
+        let mut source = ds(8, 6, 8, 3, 0, "RGB");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(raw.clone())
+            .unwrap();
+        let mut encoded = source.clone();
+        encoded.set_transfer_syntax(std::sync::Arc::new(
+            Jpeg2000LosslessCodec.transfer_syntax().clone(),
+        ));
+        encoded.remove(Tag::PIXEL_DATA);
+        {
+            let src = PixelDataRef::from_dataset(&source).unwrap();
+            let mut dst = PixelData::create_new(&mut encoded).unwrap();
+            Jpeg2000LosslessCodec
+                .encode(&src, &mut dst, &Jpeg2000LosslessCodec.default_params())
+                .unwrap();
+        }
+        let mut decoded = encoded.clone();
+        decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        decoded.remove(Tag::PIXEL_DATA);
+        decoded.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "YBR_FULL_422");
         {
             let src = PixelDataRef::from_dataset(&encoded).unwrap();
             let mut dst = PixelData::create_new(&mut decoded).unwrap();

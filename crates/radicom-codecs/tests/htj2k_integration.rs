@@ -166,6 +166,40 @@ fn lossless_accepts_rpcl_progression() {
 }
 
 #[test]
+fn encoded_color_transform_is_labelled() {
+    let _ = radicom_codecs::install();
+    let raw: Vec<u8> = (0..16 * 12 * 3).map(|i| (i * 13 + 7) as u8).collect();
+    for (syntax, label) in [
+        (syntaxes::HTJ2K_LOSSLESS.clone(), "YBR_RCT"),
+        (syntaxes::HTJ2K_LOSSLESS_RPCL.clone(), "YBR_RCT"),
+        (syntaxes::HTJ2K_LOSSY.clone(), "YBR_ICT"),
+    ] {
+        let mut source = source_dataset(16, 12, 8, 3, false, "RGB");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let compressed = source.clone_with_syntax(syntax.clone(), None).unwrap();
+        assert_eq!(
+            compressed.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            label,
+            "{}",
+            syntax.uid()
+        );
+        // Decoding converts back to RGB samples and relabels the dataset.
+        let decoded = compressed
+            .clone_with_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(), None)
+            .unwrap();
+        assert_eq!(
+            decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "RGB",
+            "{}",
+            syntax.uid()
+        );
+    }
+}
+
+#[test]
 fn rgb_without_color_transform_round_trips_exactly() {
     let _ = radicom_codecs::install();
     let raw: Vec<u8> = (0..16 * 12 * 3).map(|i| (i * 13 + 7) as u8).collect();

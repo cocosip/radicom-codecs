@@ -122,7 +122,7 @@ boundary as numeric fields. The JPEG-LS crate owns their validation and mapping.
 | --- | --- | --- |
 | `near_lossless` | JPEG-LS `NEAR` value | `.80` requires `0`; `.81` accepts `0..=min(255, MAXVAL/2)`, with default `3`; `NEAR=0` is mathematically lossless even when the near-lossless UID is selected |
 | `interleave_mode` | Scan interleave selection | `0` = derive from DICOM storage (planar → line, interleaved → sample); `1` = plane (component) interleaving, accepted for any storage because the adapter de-interleaves the samples; `2` = line; `3` = sample |
-| `color_transformation` | HP1/HP2/HP3 transform selector | `0` = none; `1..=3` apply the CharLS HP transform and write the `mrfx` APP8 segment. Requires three unsigned components and 8 or 16 bits stored, matching CharLS `UnsupportedBitDepthForTransform`. The decoder always honours the segment in the stream and ignores this field |
+| `color_transformation` | HP1/HP2/HP3 transform selector | `0` = none; `1..=3` apply the CharLS HP transform and write the `mrfx` APP8 segment. Requires three unsigned components, 8 or 16 bits stored, and `NEAR=0` (the inverse mixes two components, so NEAR could double), matching CharLS `UnsupportedBitDepthForTransform` and `color_transformation_possible`. The decoder always honours the segment in the stream and ignores this field |
 | `preset_coding_params` | Request custom LSE preset parameters | `0` uses T.87 defaults; non-zero is reserved until a concrete preset structure exists and is rejected with a managed error |
 | `reset_contexts` | Context reset policy | `false` uses the standard reset value; `true` is rejected. It is a per-frame adapter reset request, separate from the DRI restart intervals the decoder already honors |
 | `restart_interval` | DRI restart interval in MCUs | `0` = no restart markers. A non-zero value is written as a DRI segment and the encoder emits `RST0..RST7` at every MCU multiple; the decoder always accepts DRI regardless of this field |
@@ -161,8 +161,8 @@ The first release accepts the following source and destination layouts:
 | ---: | ---: | ---: | ---: | --- | --- |
 | 8 | 2..=8 | 1 | absent/0 | MONOCHROME1/2 | exact or NEAR-bounded |
 | 16 | 2..=16 | 1 | absent/0 | MONOCHROME1/2 | exact or NEAR-bounded |
-| 8 | 2..=8 | 1 | absent/0 | PALETTE COLOR | exact or NEAR-bounded index samples |
-| 16 | 2..=16 | 1 | absent/0 | PALETTE COLOR | exact or NEAR-bounded index samples |
+| 8 | 2..=8 | 1 | absent/0 | PALETTE COLOR | exact index samples (Lossless `.80` only) |
+| 16 | 2..=16 | 1 | absent/0 | PALETTE COLOR | exact index samples (Lossless `.80` only) |
 | 8 | 2..=8 | 3 | 0 | RGB/YBR_FULL | RGB-normalized exact or NEAR-bounded |
 | 8 | 2..=8 | 3 | 1 | RGB | planar-to-interleaved normalization |
 | 16 | 2..=16 | 3 | 0 | RGB/YBR_FULL | RGB-normalized component preservation |
@@ -170,7 +170,9 @@ The first release accepts the following source and destination layouts:
 
 `BitsAllocated` must be 8 or 16, `BitsStored <= BitsAllocated`, dimensions must
 be non-zero, `SamplesPerPixel` must be 1 or 3, and `PixelRepresentation` must
-be 0 or 1. Samples are read in the native DICOM byte order already guaranteed by
+be 0 or 1. PS3.5 Table 8.2.3-1 requires `PixelRepresentation` 0 for RGB,
+YBR_FULL and PALETTE COLOR, so signed samples are accepted only for
+MONOCHROME1/2. Samples are read in the native DICOM byte order already guaranteed by
 `PixelDataRef`. Signed samples preserve their `BitsStored` two's-complement
 bit patterns in the JPEG-LS stream, matching fo-dicom. No sample-value offset is
 applied. On decode the adapter sign-extends to `BitsAllocated`.
@@ -203,10 +205,12 @@ sample `p*factor/factor_max`). The Photometric Interpretation is unchanged, so a
 encoder always writes `0x11` factors because DICOM Pixel Data has no
 per-component sampling.
 
-`PALETTE COLOR` is accepted for one-sample index images (Table 8.2.3-1, 8/16
-`BitsAllocated`) and is passed through exactly, with no colour conversion and no
-Photometric Interpretation rewrite; palette colour lookup tables and
-`PALETTE COLOR` with three samples are outside the codec. `YBR_FULL_422` remains
+`PALETTE COLOR` is accepted for one-sample index images of JPEG-LS Lossless
+only (Table 8.2.3-1, 8/16 `BitsAllocated`): the `.81` near-lossless syntax
+rejects it because NEAR would quantize the LUT indices. It is passed through
+exactly, with no colour conversion and no Photometric Interpretation rewrite;
+palette colour lookup tables and `PALETTE COLOR` with three samples are outside
+the codec. `YBR_FULL_422` remains
 rejected because its subsampled native layout needs a separate unpacking
 contract. `YBR_PARTIAL_*`, YBR_ICT, YBR_RCT, CMYK, and unknown photometric values
 are rejected.
@@ -220,7 +224,8 @@ visible in DICOM metadata:
 - The optional HP1/HP2/HP3 color transform is a coding-domain decoration inside
   the codestream, not a DICOM colour space: it is applied before entropy coding
   and undone after decoding, so samples and Photometric Interpretation are
-  unchanged, and it is rejected for signed or single-component images.
+  unchanged, and it is rejected for signed, single-component, and near-lossless
+  images (the inverse mixes two components, so the error could reach `2*NEAR`).
 - YBR_FULL is converted to RGB before encoding and after decoding. Both paths use
   fo-dicom's full-range coefficients and rounding, with the chroma center at
   `2^(bits-1)`. Codec error bounds apply to the normalized RGB samples, and the
@@ -230,9 +235,11 @@ visible in DICOM metadata:
 - Planar RGB is normalized to interleaved bytes for the core and repacked only
   after a successful decode when the destination explicitly requires planar
   storage.
-- Signed RGB components preserve the two's-complement bit pattern above. Signed
-  YBR_FULL is rejected on both paths because the DICOM YBR-to-RGB conversion is
-  defined for unsigned samples.
+- Signed MONOCHROME samples preserve the two's-complement bit pattern above.
+  Signed RGB, YBR_FULL and PALETTE COLOR are rejected on both paths because
+  Table 8.2.3-1 requires Pixel Representation 0 for those photometric
+  interpretations; the DICOM YBR-to-RGB conversion is also defined for unsigned
+  samples.
 - The codestream's component count and sample precision must match the DICOM
   metadata before the output frame is appended.
 

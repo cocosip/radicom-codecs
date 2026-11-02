@@ -578,7 +578,7 @@ pub(crate) fn decode(
                 .irreversible
                 .take()
                 .ok_or_else(|| "missing irreversible plane".to_string())?;
-            wavelet::inverse_97_openjpeg(
+            wavelet::inverse_97(
                 &mut plane,
                 component.width as usize,
                 component.height as usize,

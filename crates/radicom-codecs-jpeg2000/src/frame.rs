@@ -26,13 +26,22 @@ pub(crate) struct Layout {
 impl Layout {
     /// Decoded three-component output is always full-range RGB; the codestream
     /// may have used RCT/ICT internally, but the adapter exposes RGB samples.
-    pub(crate) fn rgb_output(&self) -> Self {
+    ///
+    /// 4:2:2 destinations size frames at two bytes per pixel, so the frame
+    /// length is recomputed for the three full-resolution components.
+    pub(crate) fn rgb_output(&self) -> Result<Self, String> {
         let mut layout = *self;
         if layout.components == 3 {
             layout.pi = PhotometricInterpretation::Rgb;
             layout.ybr422 = false;
+            layout.frame_len = layout
+                .width
+                .checked_mul(layout.height)
+                .and_then(|n| n.checked_mul(3))
+                .and_then(|n| n.checked_mul((layout.bits_allocated / 8) as usize))
+                .ok_or("frame length overflow")?;
         }
-        layout
+        Ok(layout)
     }
 
     pub(crate) fn source(d: &PixelDataRef<'_>) -> Result<Self, String> {
@@ -427,10 +436,20 @@ pub(crate) fn decode(layout: &Layout, data: &[u8]) -> Result<Vec<u8>, String> {
     layout.write(&planes)
 }
 
-pub(crate) fn update_color_metadata(dst: &mut PixelData<'_>, layout: &Layout) {
+/// Sets the encoded dataset's colour metadata. `mct_label` is the photometric
+/// interpretation an applied multiple component transform requires
+/// (`YBR_RCT`/`YBR_ICT`); without one the codec writes RGB.
+pub(crate) fn update_color_metadata(
+    dst: &mut PixelData<'_>,
+    layout: &Layout,
+    mct_label: Option<&str>,
+) {
     if layout.components == 3 {
-        dst.dataset_mut()
-            .insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "RGB");
+        dst.dataset_mut().insert_str(
+            Tag::PHOTOMETRIC_INTERPRETATION,
+            Vr::Cs,
+            mct_label.unwrap_or("RGB"),
+        );
         dst.dataset_mut()
             .insert_value(Tag::PLANAR_CONFIGURATION, 0u16);
     }

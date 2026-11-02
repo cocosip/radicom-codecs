@@ -17,10 +17,17 @@ pub(crate) const CHROMA_Q: [u8; 64] = [
     99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
 ];
 
-pub(crate) fn scaled_table(base: &[u8; 64], quality: u32) -> [u16; 64] {
+/// Largest quantization entry libjpeg allows when it is not forced to keep the
+/// tables 8-bit (`jpeg_set_quality(..., force_baseline = FALSE)`), which is what
+/// fo-dicom's IJG path always uses.
+pub(crate) const MAX_QUANTIZATION: u16 = 32767;
+
+pub(crate) fn scaled_table(base: &[u8; 64], quality: u32, max_qval: u16) -> [u16; 64] {
     let q = quality.clamp(1, 100);
     let scale = if q < 50 { 5000 / q } else { 200 - q * 2 };
-    std::array::from_fn(|i| (((u32::from(base[i]) * scale + 50) / 100).clamp(1, 255)) as u16)
+    std::array::from_fn(|i| {
+        (((u32::from(base[i]) * scale + 50) / 100).clamp(1, u32::from(max_qval))) as u16
+    })
 }
 
 pub(crate) fn forward(input: &[i32; 64]) -> [i32; 64] {

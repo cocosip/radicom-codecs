@@ -41,9 +41,12 @@ the reference checkout still does not contain a Process 2/4 fixture.
 
 The codec selected by the transfer syntax owns the allowed process. A caller
 cannot use `JpegParams` to turn Process 1 into progressive or lossless JPEG.
-Process 14 accepts predictor selections 1–7; SV1 always uses predictor 1. The
-point transform is accepted only where the selected process and sample depth
-make it valid.
+Process 14 accepts predictor selections 1–7 and a point transform smaller than
+the sample precision. SV1 is Process 14 with selection value 1: it always codes
+with predictor 1 and no point transform, rejects a parameter set carrying
+anything else, and its decoder rejects a codestream whose SOS names another
+predictor or a non-zero point transform, so a lossless UID cannot carry
+transformed (lossy) data.
 
 The following are explicitly outside this document and must fail with a
 managed codec error rather than being silently treated as sequential JPEG:
@@ -155,9 +158,9 @@ must be deterministic and must agree with the bytes written to the destination.
 | `smoothing_factor` | Pre-encoding input smoothing | `0..=100`; ignored by Process 14. Ported bit for bit from libjpeg-turbo `jcsample.c`: `fullsize_smooth_downsample` for undownsampled components and `h2v2_smooth_downsample` for 2×2 chroma. Those are the only two smoothing kernels libjpeg has — for 2×1 and other integer ratios it sets `smoothok = FALSE` and logs `JTRC_SMOOTH_NOTIMPL`, so a 4:2:2 encode smooths luma only, exactly like libjpeg/fo-dicom |
 | `convert_colorspace_to_rgb` | Decode YCbCr/RGB as RGB | reject for signed samples |
 | `sample_factor` | Chroma sampling on encode | `Full` = 4:4:4, `Half` = 4:2:2; lossless forces 4:4:4. Decode additionally accepts any T.81 factor set (4:2:0, 4:1:1, 4:4:0, …) |
-| `predictor` | Process 14 predictor selection | `1..=7`; SV1 overrides to `1` |
-| `point_transform` | Right shift before predictive coding | must fit the selected precision; lossless exact tests use `0` |
-| `restart_interval` | DRI restart interval in MCUs (`0` = none) | `0`..=`u16::MAX`; emitted as one DRI segment plus `RST0`–`RST7`; Process 14 counts one MCU per pixel, Process 1/2/4 one MCU per 8×8 block set |
+| `predictor` | Process 14 predictor selection | `1..=7`; SV1 requires `1` and rejects anything else |
+| `point_transform` | Right shift before predictive coding | must be smaller than the sample precision; SV1 (`.70`) requires `0` |
+| `restart_interval` | DRI restart interval in MCUs (`0` = none) | `0`..=`u16::MAX`; emitted as one DRI segment plus `RST0`–`RST7`; Process 14 counts one MCU per pixel, so a lossless interval must be `0` or an integer multiple of the image width (libijg-based decoders reject an off-row interval); Process 1/2/4 count one MCU per 8×8 block set |
 
 The wrong `CodecParams` variant is rejected before touching the destination.
 Parameters that the selected transfer syntax cannot use are rejected instead
@@ -186,7 +189,11 @@ follow the existing RLE crate conventions, but responsibilities are fixed:
 The decoder validates SOI, one supported SOF marker, DQT/DHT definitions (one
 DHT segment may carry several tables; the lossless path accepts DC tables 0–3),
 SOS component selectors, DRI restart intervals, the restart-marker sequence, and
-EOI. A restart interval of `0` means “no restarts”. At each restart boundary the
+EOI. Before SOS the table and restart segments may appear in any order: T.81 does
+not fix their order, libjpeg writes DQT and DHT ahead of the frame header, and
+the lossless path accepts APP, COM, DQT, DHT, and DRI before or after SOF3 (SOF3
+is still required before the first SOS; a lossless DQT is legal and unused). A
+restart interval of `0` means “no restarts”. At each restart boundary the
 decoder requires the next `RST0`–`RST7` marker in sequence, resets the DC
 predictors or lossless predictor state, and aligns to the byte boundary; a
 missing, unexpected, or mid-entropy restart marker is a managed error. Both
@@ -196,7 +203,10 @@ MCU grid with `h_i*v_i` blocks per component and a non-interleaved scan (Ns = 1)
 uses the component plane grid from T.81 A.2.3, each scan resetting its DC
 predictors. When `restart_interval` is non-zero the encoders write one DRI
 segment (after the frame header) and an `RST0`–`RST7` marker at every interval
-boundary; the default `0` keeps the single interleaved scan with no DRI.
+boundary; the default `0` keeps the single interleaved scan with no DRI. The
+lossless encoder additionally rejects a restart interval that is not a multiple
+of the image width, because one lossless MCU row is the whole image row and
+libijg-based decoders refuse an interval that does not align to it.
 
 Segment lengths include their two length bytes and must stay inside the frame.
 APPn and COM are skipped with the same bounds checks. Standalone markers are
@@ -210,6 +220,15 @@ The sequential path performs level shift, 8×8 DCT, quantization, zig-zag scan,
 Huffman coding, restart handling, and inverse operations. Process 1 is limited
 to 8-bit samples. Process 2/4 supports the DICOM-relevant 8-bit and 12-bit
 precision and rejects 16-bit sequential JPEG rather than truncating it.
+
+Process 1 keeps its quantization tables in the baseline 8-bit range (1–255).
+Process 2/4 follows libjpeg's `jpeg_set_quality(..., force_baseline = FALSE)`,
+which is what fo-dicom's IJG path always calls: entries are clamped to 1–32767
+instead of 1–255, and a table whose largest entry exceeds 255 is written with
+`Pq = 1` (16-bit entries; the precision is per DQT table). The standard tables
+cross that threshold only at quality ≤ 23, so a 12-bit encode at the default
+quality keeps the byte-identical `Pq = 0` form. The decoder accepts `Pq = 0` and
+`Pq = 1`, so 12-bit fo-dicom streams carrying 16-bit tables decode.
 
 The first release uses baseline Huffman coding and emits one sequential scan per
 frame. It does not emit progressive or arithmetic-coded scans, and it does not
@@ -240,8 +259,13 @@ frame context. Panics are not an error path for untrusted codestream data.
 
 The decoder performs checked arithmetic for dimensions, component counts,
 MCU counts, row strides, and output allocation. It rejects frames whose decoded
-size cannot fit the destination or the library's supported buffer size. It does
-not allocate based solely on a compressed length estimate.
+size cannot fit the destination or the library's supported buffer size. Sequential
+decoding checks the SOF header against the destination layout *before* allocating
+the frame buffer, and both decoders reserve fallibly (`try_reserve_exact`), so a
+crafted header such as `65535×65535` returns an error instead of aborting. Frame
+counts are untrusted metadata: the adapters never reserve per-frame containers
+sized by `NumberOfFrames`, they grow them as frames are produced. It does not
+allocate based solely on a compressed length estimate.
 
 The destination is unchanged when validation or decoding fails. Temporary
 buffers are released on every error path, and no frame buffer is retained after
@@ -342,6 +366,16 @@ without updating this document first.
   libijg rejects intervals that are not an integer multiple of the MCU row) to
   the source samples with 0 differences, and a `.50` stream with an interval of 2
   to RGB within `max=4`, the same bound as the same stream without restarts.
+  The lossless encoder enforces the same rule: a Process 14 interval that is not
+  a multiple of the image width is refused with a codec error, and the
+  integration test uses whole-MCU-row intervals only.
+- 16-bit quantization tables: a 12-bit Process 2/4 encode at quality 10 writes
+  DQT `Pq = 1` and re-decodes within tolerance, quality 90 keeps `Pq = 0` and a
+  65-byte-per-table payload (the unchanged default path), and a stream whose
+  `Pq = 0` tables are widened to `Pq = 1` decodes to the same samples.
+- SV1 rejects a non-zero point transform and a predictor other than 1 on both
+  encode and decode; a `.57` stream carrying `Pt != 0` that is relabelled `.70`
+  is a managed error rather than silently lossy data.
 - Sample comparisons come from the C# interop harness (`dicomref cmp`), which
   compares decoded frames sample by sample at 8 or 16 bits instead of byte by
   byte. The earlier byte metric reported a spurious 255-byte difference whenever

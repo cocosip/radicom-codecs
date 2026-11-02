@@ -130,7 +130,7 @@ impl Codec for JpegLossless14Codec {
             self.name(),
             "decode",
         )?;
-        frame::decode_lossless(src, dst, params, self.name())
+        frame::decode_lossless(src, dst, params, lossless::Selection::Process14, self.name())
     }
 }
 
@@ -163,6 +163,23 @@ impl Codec for JpegLossless14Sv1Codec {
             self.name(),
             "encode",
         )?;
+        // SV1 is Process 14 with selection value 1 and no point transform; a
+        // lossless UID must not carry a lossy or higher-order stream.
+        for (invalid, message) in [
+            (params.predictor != 1, "SV1 requires predictor 1"),
+            (
+                params.point_transform != 0,
+                "SV1 requires a zero point transform",
+            ),
+        ] {
+            if invalid {
+                return Err(CodecError::Operation {
+                    codec: self.name().to_owned(),
+                    message: message.to_owned(),
+                }
+                .into());
+            }
+        }
         frame::encode_lossless(src, dst, params, 1, self.name())
     }
 
@@ -179,7 +196,7 @@ impl Codec for JpegLossless14Sv1Codec {
             self.name(),
             "decode",
         )?;
-        frame::decode_lossless(src, dst, params, self.name())
+        frame::decode_lossless(src, dst, params, lossless::Selection::Sv1, self.name())
     }
 }
 
@@ -545,6 +562,80 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(!decoded.contains(&radicom::model::tag::Tag::PIXEL_DATA));
+    }
+
+    #[test]
+    fn rejects_hostile_sof_dimensions_before_allocating() {
+        use radicom::model::tag::Tag;
+
+        // SOF0 declaring 65535x65535: a frame-sized buffer would be ~8.6 GB.
+        // The destination is 1x1, so the frame must be rejected before any
+        // allocation is attempted.
+        let codestream = [
+            0xff, 0xd8, // SOI
+            0xff, 0xc0, 0x00, 0x0b, 0x08, 0xff, 0xff, 0xff, 0xff, 0x01, 0x01, 0x11,
+            0x00, // SOF0: 8-bit, 65535x65535, one component
+            0xff, 0xd9, // EOI
+        ];
+        let mut compressed = dataset(syntaxes::JPEG_PROCESS_1.clone(), 1, 1, 8, 1, None);
+        PixelData::create_new(&mut compressed)
+            .unwrap()
+            .add_frame(codestream)
+            .unwrap();
+        let compressed_view = PixelDataRef::from_dataset(&compressed).unwrap();
+        let mut decoded = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            1,
+            8,
+            1,
+            None,
+        );
+        let error = JpegProcess1Codec
+            .decode(
+                &compressed_view,
+                &mut PixelData::create_new(&mut decoded).unwrap(),
+                &CodecParams::Jpeg(JpegParams::default()),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("layout does not match destination"),
+            "{error}"
+        );
+        assert!(!decoded.contains(&Tag::PIXEL_DATA));
+    }
+
+    #[test]
+    fn does_not_preallocate_for_an_untrusted_frame_count() {
+        use radicom::model::tag::Tag;
+        use radicom::model::vr::Vr;
+
+        let mut compressed = dataset(syntaxes::JPEG_LOSSLESS_PROCESS_14.clone(), 1, 1, 8, 1, None);
+        PixelData::create_new(&mut compressed)
+            .unwrap()
+            .add_frame([0xff, 0xd8, 0xff, 0xd9])
+            .unwrap();
+        // NumberOfFrames is untrusted metadata: trusting it here would reserve
+        // gigabytes before the first frame is even read.
+        compressed.insert_str(Tag::NUMBER_OF_FRAMES, Vr::Is, u32::MAX.to_string());
+        let view = PixelDataRef::from_dataset(&compressed).unwrap();
+        let mut decoded = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            1,
+            8,
+            1,
+            None,
+        );
+        let result = JpegLossless14Codec.decode(
+            &view,
+            &mut PixelData::create_new(&mut decoded).unwrap(),
+            &CodecParams::Jpeg(JpegParams::default()),
+        );
+        assert!(result.is_err());
+        assert!(!decoded.contains(&Tag::PIXEL_DATA));
     }
 
     #[test]

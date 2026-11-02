@@ -44,7 +44,7 @@ impl Codec for RleLosslessCodec {
         }
         let layout = RleLayout::from_pixel_data(src)
             .map_err(|message| operation_error("encode", None, message))?;
-        let mut encoded_frames = Vec::with_capacity(src.number_of_frames() as usize);
+        let mut encoded_frames = Vec::new();
         for frame_index in 0..src.number_of_frames() {
             let buffer = src
                 .get_frame(frame_index)
@@ -91,7 +91,7 @@ impl Codec for RleLosslessCodec {
         }
         let layout = RleLayout::from_pixel_data_mut(dst)
             .map_err(|message| operation_error("decode", None, message))?;
-        let mut decoded_frames = Vec::with_capacity(src.number_of_frames() as usize);
+        let mut decoded_frames = Vec::new();
         for frame_index in 0..src.number_of_frames() {
             let buffer = src
                 .get_frame(frame_index)
@@ -350,6 +350,32 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("CodecParams::None"));
         assert!(!target.contains(&Tag::PIXEL_DATA));
+    }
+
+    #[test]
+    fn does_not_preallocate_for_an_untrusted_frame_count() {
+        let mut compressed = dataset(syntaxes::RLE_LOSSLESS.clone(), 1, 3, 8, 1, None, 1);
+        {
+            let mut pixels = PixelData::create_new(&mut compressed).unwrap();
+            pixels.add_frame([0u8; 64]).unwrap();
+        }
+        // NumberOfFrames is untrusted metadata: trusting it here would reserve
+        // gigabytes before the first frame is even read.
+        compressed.insert_str(Tag::NUMBER_OF_FRAMES, Vr::Is, u32::MAX.to_string());
+        let source = PixelDataRef::from_dataset(&compressed).unwrap();
+        let mut decoded = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            3,
+            8,
+            1,
+            None,
+            1,
+        );
+        let mut target = PixelData::create_new(&mut decoded).unwrap();
+        let result = RleLosslessCodec.decode(&source, &mut target, &CodecParams::None);
+        assert!(result.is_err());
+        assert!(!decoded.contains(&Tag::PIXEL_DATA));
     }
 
     #[test]

@@ -85,8 +85,17 @@ impl Layout {
         if !color::is_supported(pi, components) {
             return Err("unsupported PhotometricInterpretation".into());
         }
-        if rep == 1 && pi == PhotometricInterpretation::YbrFull {
-            return Err("signed YBR_FULL samples are unsupported".into());
+        if rep == 1
+            && matches!(
+                pi,
+                PhotometricInterpretation::YbrFull
+                    | PhotometricInterpretation::Rgb
+                    | PhotometricInterpretation::PaletteColor
+            )
+        {
+            // PS3.5 Table 8.2.3-1 requires Pixel Representation 0 for the
+            // colour PIs, so their samples are never sign extended.
+            return Err("signed RGB, YBR_FULL and PALETTE COLOR samples are unsupported".into());
         }
         if components == 1 && planar != 0 {
             return Err("monochrome cannot be planar".into());
@@ -197,11 +206,22 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
             return Err("signed samples must remain NEAR away from the signed limits".into());
         }
     }
+    if near > 0 && layout.pi == PhotometricInterpretation::PaletteColor {
+        // PS3.5 Table 8.2.3-1 permits PALETTE COLOR only for JPEG-LS Lossless;
+        // NEAR>0 would quantize the LUT indices.
+        return Err("PALETTE COLOR requires lossless JPEG-LS (NEAR=0)".into());
+    }
     let ilv = resolve_interleave(layout, p.interleave_mode)?;
     let color_transformation = u8::try_from(p.color_transformation)
         .map_err(|_| "unknown JPEG-LS color transformation")?;
     if color_transformation > 3 {
         return Err("unknown JPEG-LS color transformation".into());
+    }
+    if color_transformation != 0 && near > 0 {
+        // The inverse is a linear combination of two components, so the
+        // reconstructed error can reach 2*NEAR. CharLS only enables the HP
+        // transforms for lossless coding.
+        return Err("JPEG-LS color transformation requires lossless coding (NEAR=0)".into());
     }
     if color_transformation != 0 && (layout.components != 3 || layout.signed) {
         return Err("color transformation requires three unsigned components".into());
@@ -655,6 +675,83 @@ mod tests {
         }
         for raw in [131, 255, 0, 124] {
             assert!(encode(&layout, &[raw], &params).is_ok(), "sample={raw}");
+        }
+    }
+
+    #[test]
+    fn near_lossless_rejects_palette_color() {
+        // PS3.5 Table 8.2.3-1 allows PALETTE COLOR only for JPEG-LS Lossless
+        // (.80); a NEAR>0 codestream would quantize LUT indices.
+        let mut layout = mono8();
+        layout.pi = PhotometricInterpretation::PaletteColor;
+        let error = encode(
+            &layout,
+            &[7],
+            &JpegLsParams {
+                near_lossless: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("PALETTE COLOR"), "{error}");
+        // Lossless palette coding is the only conforming combination.
+        assert_eq!(
+            decode(
+                &layout,
+                &encode(&layout, &[7], &JpegLsParams::default()).unwrap(),
+                &JpegLsParams::default(),
+                Some(0),
+                false
+            )
+            .unwrap(),
+            [7]
+        );
+    }
+
+    #[test]
+    fn near_lossless_rejects_the_hp_color_transformation() {
+        // The inverse transform is a linear combination of two components, so
+        // NEAR could double; CharLS only enables HP1..3 when NEAR == 0.
+        let layout = rgb_layout(2, 2, 8, 8);
+        let raw = layout.write(&[7u16; 12]).unwrap();
+        for transform in 1..=3u32 {
+            let error = encode(
+                &layout,
+                &raw,
+                &JpegLsParams {
+                    color_transformation: transform,
+                    near_lossless: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("NEAR"), "HP{transform}: {error}");
+            assert!(
+                encode(
+                    &layout,
+                    &raw,
+                    &JpegLsParams {
+                        color_transformation: transform,
+                        ..Default::default()
+                    }
+                )
+                .is_ok(),
+                "HP{transform} must stay available for lossless coding"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_rgb_and_palette_color_are_rejected_at_layout_validation() {
+        // PS3.5 Table 8.2.3-1 requires Pixel Representation 0 for RGB and
+        // PALETTE COLOR, like YBR_FULL.
+        for (pi, components) in [
+            (PhotometricInterpretation::Rgb, 3u16),
+            (PhotometricInterpretation::PaletteColor, 1),
+        ] {
+            let error = Layout::values(1, 1, 8, 8, components, 0, 1, Some(pi)).unwrap_err();
+            assert!(error.contains("signed"), "{pi:?}: {error}");
+            assert!(Layout::values(1, 1, 8, 8, components, 0, 0, Some(pi)).is_ok());
         }
     }
 

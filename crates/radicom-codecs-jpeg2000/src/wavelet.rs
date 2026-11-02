@@ -1,8 +1,7 @@
 //! Reversible 5/3 and irreversible 9/7 discrete wavelet transforms.
 //!
 //! Ported from the pure C# reference implementation, which in turn follows
-//! OpenJPEG's lifting and symmetric-extension conventions (including the
-//! historic `2/K` inverse scaling used by OpenJPEG for 9/7).
+//! OpenJPEG's lifting and symmetric-extension conventions.
 
 const ALPHA: f64 = -1.586_134_342;
 const BETA: f64 = -0.052_980_118;
@@ -10,7 +9,6 @@ const GAMMA: f64 = 0.882_911_075;
 const DELTA: f64 = 0.443_506_852;
 const K: f64 = 1.230_174_105;
 const INV_K: f64 = 1.0 / K;
-const TWO_INV_K: f64 = 1.625_732_422;
 
 pub(crate) fn forward_53(
     data: &mut [i32],
@@ -108,31 +106,13 @@ pub(crate) fn forward_97(
     Ok(())
 }
 
+/// Inverse 9/7 transform. The synthesis high-pass gain is `1/K`, the exact
+/// inverse of the `K` that [`forward_97`] applies; OpenJPEG and OpenJPH agree.
 pub(crate) fn inverse_97(
     data: &mut [f64],
     width: usize,
     height: usize,
     levels: u8,
-) -> Result<(), String> {
-    inverse_97_scaled(data, width, height, levels, TWO_INV_K)
-}
-
-/// Inverse 9/7 using the OpenJPH high-pass normalisation.
-pub(crate) fn inverse_97_openjpeg(
-    data: &mut [f64],
-    width: usize,
-    height: usize,
-    levels: u8,
-) -> Result<(), String> {
-    inverse_97_scaled(data, width, height, levels, INV_K)
-}
-
-fn inverse_97_scaled(
-    data: &mut [f64],
-    width: usize,
-    height: usize,
-    levels: u8,
-    high_scale: f64,
 ) -> Result<(), String> {
     if width == 0 || height == 0 || data.len() != width * height {
         return Err("invalid irreversible wavelet plane".into());
@@ -147,7 +127,7 @@ fn inverse_97_scaled(
         heights[level] = (heights[level - 1] + 1) >> 1;
     }
     for level in (0..levels).rev() {
-        inverse_97_2d(data, widths[level], heights[level], width, high_scale);
+        inverse_97_2d(data, widths[level], heights[level], width, INV_K);
     }
     Ok(())
 }
@@ -558,6 +538,21 @@ mod tests {
             forward_53(&mut plane, w, h, levels, 0, 0).unwrap();
             inverse_53(&mut plane, w, h, levels, 0, 0).unwrap();
             assert_eq!(plane, source, "{w}x{h} levels={levels}");
+        }
+    }
+
+    #[test]
+    fn irreversible_97_round_trips_through_the_classic_inverse() {
+        // The classic 2000 codec decodes with `inverse_97`; it must be the
+        // exact inverse of `forward_97` or detail bands are mis-scaled.
+        for (w, h, levels) in [(8, 8, 1), (17, 13, 2), (32, 32, 3)] {
+            let source: Vec<f64> = pattern(w, h).iter().map(|&v| f64::from(v)).collect();
+            let mut plane = source.clone();
+            forward_97(&mut plane, w, h, levels).unwrap();
+            inverse_97(&mut plane, w, h, levels).unwrap();
+            for (a, b) in source.iter().zip(&plane) {
+                assert!((a - b).abs() < 0.05, "{w}x{h} levels={levels}: {a} vs {b}");
+            }
         }
     }
 

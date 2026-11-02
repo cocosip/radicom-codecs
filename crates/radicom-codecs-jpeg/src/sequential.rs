@@ -5,7 +5,7 @@
 )]
 
 use super::bit::{BitReader, BitWriter};
-use super::dct::{forward, inverse, scaled_table, CHROMA_Q, LUMA_Q, ZIGZAG};
+use super::dct::{forward, inverse, scaled_table, CHROMA_Q, LUMA_Q, MAX_QUANTIZATION, ZIGZAG};
 use super::huffman::HuffmanTable;
 use super::marker::{Marker, MarkerReader, MarkerWriter};
 
@@ -87,12 +87,19 @@ impl Tables {
         } else {
             HuffmanTable::new(&COUNTS_AC_CHROMA, &VALUES_AC_CHROMA)?
         };
+        let max_qval = if extended {
+            MAX_QUANTIZATION
+        } else {
+            255
+        };
         Ok(Self {
             dc: [dc_luma, dc_chroma],
             ac: [ac_luma, ac_chroma],
+            // The extended processes mirror libjpeg's force_baseline = FALSE
+            // (what fo-dicom's IJG path uses), so entries may exceed 255.
             q: [
-                scaled_table(&LUMA_Q, quality),
-                scaled_table(&CHROMA_Q, quality),
+                scaled_table(&LUMA_Q, quality, max_qval),
+                scaled_table(&CHROMA_Q, quality, max_qval),
             ],
         })
     }
@@ -478,7 +485,13 @@ impl SequentialFrame {
             >> 16) as u32
     }
 
-    pub(crate) fn decode(data: &[u8]) -> Result<Self, String> {
+    /// Decode one codestream. `expected` is the destination contract: it is
+    /// checked against the SOF header before the frame buffer is allocated, so a
+    /// hostile SOF cannot request a huge allocation.
+    pub(crate) fn decode_expected(
+        data: &[u8],
+        expected: Option<&FrameExpectation>,
+    ) -> Result<Self, String> {
         let mut r = MarkerReader::new(data);
         expect(&mut r, Marker::Soi)?;
         let mut q = [[0u16; 64]; 2];
@@ -499,12 +512,21 @@ impl SequentialFrame {
                         return Err("JPEG frame has more than one SOF segment".to_owned());
                     }
                     let frame = parse_sof(&payload, marker)?;
+                    if let Some(expected) = expected {
+                        if frame.width != expected.width
+                            || frame.height != expected.height
+                            || frame.components != expected.components
+                            || frame.precision != expected.precision
+                        {
+                            return Err("codestream layout does not match destination".into());
+                        }
+                    }
                     let count = frame
                         .width
                         .checked_mul(frame.height)
                         .and_then(|pixels| pixels.checked_mul(usize::from(frame.components)))
                         .ok_or("JPEG output size overflow")?;
-                    samples = vec![0u16; count];
+                    samples = allocate_samples(count)?;
                     header = Some(frame);
                 }
                 Marker::Sos => {
@@ -574,6 +596,24 @@ impl SequentialFrame {
         frame.sampling = header.sampling;
         Ok(frame)
     }
+
+    /// Decode without a destination contract; the marker and entropy tests use
+    /// this to exercise the codestream layers on their own.
+    #[cfg(test)]
+    pub(crate) fn decode(data: &[u8]) -> Result<Self, String> {
+        Self::decode_expected(data, None)
+    }
+}
+
+/// Destination contract the SOF header must satisfy before a frame buffer is
+/// allocated. A crafted SOF may declare up to 65535x65535, so allocation waits
+/// until the layout is known to fit the caller's destination.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameExpectation {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) components: u8,
+    pub(crate) precision: u8,
 }
 
 /// Frame geometry shared by every scan of a sequential JPEG codestream.
@@ -901,6 +941,15 @@ fn read_value(r: &mut BitReader<'_>, h: &HuffmanTable) -> Result<i32, String> {
         Ok(decode_amplitude(r.read_bits(n)?, n))
     }
 }
+/// Allocate the frame buffer without aborting when the request cannot be met.
+fn allocate_samples(length: usize) -> Result<Vec<u16>, String> {
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(length)
+        .map_err(|_| "JPEG frame is too large to allocate".to_owned())?;
+    samples.resize(length, 0);
+    Ok(samples)
+}
 fn expect(r: &mut MarkerReader<'_>, m: Marker) -> Result<(), String> {
     let (x, p) = r.read_segment()?;
     if x != m || !p.is_empty() {
@@ -935,9 +984,18 @@ fn sos_payload(components: &[u8]) -> Vec<u8> {
 fn dqt_payload(q: &[[u16; 64]; 2]) -> Result<Vec<u8>, String> {
     let mut p = Vec::with_capacity(130);
     for (id, t) in q.iter().enumerate() {
-        p.push(id as u8);
+        // libjpeg emits 16-bit entries (Pq=1) as soon as one table value
+        // exceeds 255; that cannot happen on the baseline path, where the
+        // tables are clamped to 255 like force_baseline = TRUE.
+        let wide = t.iter().any(|&value| value > 255);
+        p.push((u8::from(wide) << 4) | id as u8);
         for &index in &ZIGZAG {
-            p.push(t[index] as u8);
+            let value = t[index];
+            if wide {
+                p.extend(value.to_be_bytes());
+            } else {
+                p.push(value as u8);
+            }
         }
     }
     Ok(p)
@@ -1076,13 +1134,26 @@ fn parse_dqt(p: &[u8], q: &mut [[u16; 64]; 2]) -> Result<(), String> {
     while i < p.len() {
         let info = p[i];
         i += 1;
-        if info >> 4 != 0 || info & 15 > 1 || i + 64 > p.len() {
+        let precision = info >> 4;
+        // Pq=1 (16-bit entries) is what libjpeg writes once a value exceeds
+        // 255 and what fo-dicom emits for low-quality 12-bit encodes.
+        if precision > 1 || info & 15 > 1 {
+            return Err("unsupported DQT".into());
+        }
+        let entry_bytes = 1 + usize::from(precision);
+        if i + 64 * entry_bytes > p.len() {
             return Err("unsupported DQT".into());
         }
         for k in 0..64 {
-            q[usize::from(info & 15)][ZIGZAG[k]] = u16::from(p[i + k]);
+            let value = if precision == 0 {
+                u16::from(p[i + k])
+            } else {
+                let at = i + 2 * k;
+                u16::from_be_bytes([p[at], p[at + 1]])
+            };
+            q[usize::from(info & 15)][ZIGZAG[k]] = value;
         }
-        i += 64;
+        i += 64 * entry_bytes;
     }
     Ok(())
 }
@@ -1224,6 +1295,101 @@ mod tests {
 
         encoded.drain(restart..restart + 2);
         assert!(SequentialFrame::decode(&encoded).is_err());
+    }
+
+    /// (start of the DQT marker, total segment length including the marker)
+    fn dqt_segment(stream: &[u8]) -> (usize, usize) {
+        let start = stream
+            .windows(2)
+            .position(|window| window == [0xff, 0xdb])
+            .unwrap();
+        let length = usize::from(u16::from_be_bytes([stream[start + 2], stream[start + 3]]));
+        (start, 2 + length)
+    }
+
+    /// Per-table `Pq` nibbles in the order the segment carries them.
+    fn dqt_precisions(payload: &[u8]) -> Vec<u8> {
+        let mut precisions = Vec::new();
+        let mut at = 0;
+        while at < payload.len() {
+            let info = payload[at];
+            let precision = info >> 4;
+            precisions.push(precision);
+            at += 1 + 64 * if precision == 0 { 1 } else { 2 };
+        }
+        precisions
+    }
+
+    #[test]
+    fn twelve_bit_quality_ten_emits_sixteen_bit_quantization_tables() {
+        let samples = (0..8 * 8).map(|v| ((v * 53) % 4096) as u16).collect();
+        let frame = SequentialFrame::new(8, 8, 12, 1, samples).unwrap();
+        let encoded = frame
+            .encode_with_smoothing(10, true, false, 0, None)
+            .unwrap();
+        let (start, total) = dqt_segment(&encoded);
+        assert_eq!(
+            dqt_precisions(&encoded[start + 4..start + total]),
+            [1, 1],
+            "a 12-bit table above 255 uses Pq=1, like libjpeg with force_baseline=FALSE"
+        );
+        let decoded = SequentialFrame::decode(&encoded).unwrap();
+        let max = decoded
+            .samples
+            .iter()
+            .zip(frame.samples.iter())
+            .map(|(a, b)| (*a as i32 - *b as i32).abs())
+            .max()
+            .unwrap();
+        assert!(max < 1024, "max={max}");
+    }
+
+    #[test]
+    fn twelve_bit_default_quality_keeps_eight_bit_quantization_tables() {
+        let samples = (0..8 * 8).map(|v| ((v * 53) % 4096) as u16).collect();
+        let frame = SequentialFrame::new(8, 8, 12, 1, samples).unwrap();
+        let encoded = frame
+            .encode_with_smoothing(90, true, false, 0, None)
+            .unwrap();
+        let (start, total) = dqt_segment(&encoded);
+        assert_eq!(dqt_precisions(&encoded[start + 4..start + total]), [0, 0]);
+        // Two tables, one byte per entry: the default path is byte-identical.
+        assert_eq!(total, 2 + 2 + 130);
+    }
+
+    #[test]
+    fn decodes_sixteen_bit_quantization_tables() {
+        let samples = (0..8 * 8).map(|v| ((v * 53) % 4096) as u16).collect();
+        let frame = SequentialFrame::new(8, 8, 12, 1, samples).unwrap();
+        let encoded = frame
+            .encode_with_smoothing(90, true, false, 0, None)
+            .unwrap();
+        let (start, total) = dqt_segment(&encoded);
+        let payload = &encoded[start + 4..start + total];
+        // Same table values, widened to the Pq=1 (16-bit) representation that
+        // libjpeg writes once an entry exceeds 255.
+        let mut wide = Vec::new();
+        let mut at = 0;
+        while at < payload.len() {
+            wide.push(0x10 | (payload[at] & 0x0f));
+            for &value in &payload[at + 1..at + 65] {
+                wide.extend(u16::from(value).to_be_bytes());
+            }
+            at += 65;
+        }
+        let mut stream = encoded[..start].to_vec();
+        stream.extend_from_slice(&[0xff, 0xdb]);
+        stream.extend_from_slice(
+            &u16::try_from(wide.len() + 2)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        stream.extend_from_slice(&wide);
+        stream.extend_from_slice(&encoded[start + total..]);
+        assert_eq!(
+            SequentialFrame::decode(&stream).unwrap(),
+            SequentialFrame::decode(&encoded).unwrap()
+        );
     }
 
     #[test]

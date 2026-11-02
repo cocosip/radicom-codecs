@@ -98,7 +98,9 @@ fn jpeg_lossless_encoder_emits_restart_intervals_and_stays_exact() {
         let plain = restart_stream(dataset.clone(), 0, 0);
         assert_eq!(count_marker(&plain, 0xDD), 0, "no DRI without an interval");
         assert_eq!(count_marker(&plain, 0xD0), 0);
-        for interval in [1u16, 2, 5] {
+        for interval in [cols, cols * 2] {
+            // Process 14 MCU rows are image-wide, so a legal DRI is a multiple
+            // of the width (libijg-based decoders reject anything else).
             let stream = restart_stream(dataset.clone(), 0, interval);
             assert_eq!(count_marker(&stream, 0xDD), 1, "one DRI segment");
             // T.81 A.2.3: a lossless interleaved scan codes one pixel per MCU.
@@ -110,6 +112,72 @@ fn jpeg_lossless_encoder_emits_restart_intervals_and_stays_exact() {
             assert_eq!(rst, expected, "restart markers for interval {interval}");
         }
     }
+}
+
+#[test]
+fn jpeg_lossless_encoder_rejects_restart_interval_off_the_mcu_row() {
+    let _guard = install();
+    let dataset = source(9, 17, 8, 8, 1);
+    let params = JpegParams {
+        restart_interval: 5,
+        ..Default::default()
+    };
+    let error = dataset
+        .clone_with_syntax(
+            syntaxes::JPEG_LOSSLESS_PROCESS_14.clone(),
+            Some(CodecParams::Jpeg(params)),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("multiple of the image width"),
+        "{error}"
+    );
+}
+
+#[test]
+fn jpeg_sv1_encode_rejects_a_point_transform_and_a_foreign_predictor() {
+    let _guard = install();
+    let dataset = source(4, 4, 8, 8, 1);
+    for params in [
+        JpegParams {
+            point_transform: 4,
+            ..Default::default()
+        },
+        JpegParams {
+            predictor: 2,
+            ..Default::default()
+        },
+    ] {
+        let error = dataset
+            .clone_with_syntax(
+                syntaxes::JPEG_LOSSLESS_PROCESS_14_SV1.clone(),
+                Some(CodecParams::Jpeg(params)),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("SV1"), "{error}");
+    }
+}
+
+#[test]
+fn jpeg_sv1_decode_rejects_a_process14_stream_with_a_point_transform() {
+    let _guard = install();
+    let dataset = source(4, 4, 8, 8, 1);
+    let params = JpegParams {
+        point_transform: 4,
+        ..Default::default()
+    };
+    // The .57 codec still allows a point transform; relabel its stream as SV1.
+    let mut compressed = dataset
+        .clone_with_syntax(
+            syntaxes::JPEG_LOSSLESS_PROCESS_14.clone(),
+            Some(CodecParams::Jpeg(params)),
+        )
+        .unwrap();
+    compressed.set_transfer_syntax(syntaxes::JPEG_LOSSLESS_PROCESS_14_SV1.clone());
+    let error = compressed
+        .clone_with_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(), None)
+        .unwrap_err();
+    assert!(error.to_string().contains("point transform"), "{error}");
 }
 
 #[test]

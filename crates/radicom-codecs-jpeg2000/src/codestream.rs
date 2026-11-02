@@ -6,8 +6,8 @@ use crate::marker::{
     SizComp, Sot, EOC, SOD, SOT,
 };
 use crate::quantization::{
-    bit_plane_depth, decode_step_size, encode_step_size, gain_bits, irreversible_steps,
-    reversible_steps, subband_index,
+    bit_plane_depth, decode_step_size, encode_step_size, irreversible_steps, reversible_steps,
+    subband_index,
 };
 use crate::{tier1, tier2, wavelet};
 
@@ -162,8 +162,9 @@ pub(crate) fn encode_with_precincts(
                             let plane = irreversible_plane
                                 .as_ref()
                                 .ok_or_else(|| "missing irreversible plane".to_string())?;
-                            let step = decode_step_size(encoded, precision)
-                                * f64::from(1u32 << gain_bits(band.orientation));
+                            // The QCD already carries the subband norm; the
+                            // 9/7 gain lives in the norm table, not here.
+                            let step = decode_step_size(encoded, precision);
                             for y in 0..height {
                                 for x in 0..width {
                                     let sx = block.x0 as usize + x;
@@ -570,6 +571,30 @@ mod tests {
         let (header, _) = MainHeader::parse(&codestream).unwrap();
         assert_eq!(header.cod.scod, 1);
         assert_eq!(header.cod.style.precincts, precincts);
+    }
+
+    #[test]
+    fn irreversible_codestream_keeps_high_frequency_detail() {
+        // The mean-tolerance test above cannot see a mis-scaled detail band.
+        // A checkerboard concentrates energy in HL/LH/HH, so any relative
+        // error in those bands shows up directly in the reconstruction.
+        let width = 48usize;
+        let height = 40usize;
+        let pattern: Vec<i32> = (0..width * height)
+            .map(|i| if (i + i / width).is_multiple_of(2) { 127 } else { -128 })
+            .collect();
+        let samples = vec![pattern];
+        let mut components =
+            build_components(&samples, width as i32, height as i32, 8, false, 2).unwrap();
+        let codestream = encode(&mut components, false).unwrap();
+        let decoded = decode(&codestream).unwrap();
+        let max = samples[0]
+            .iter()
+            .zip(&decoded[0].samples)
+            .map(|(a, b)| (a - b).abs())
+            .max()
+            .unwrap();
+        assert!(max <= 8, "high-frequency reconstruction error {max}");
     }
 
     #[test]

@@ -68,7 +68,10 @@ consistent.
 `decompositions` selects the DWT level count (0..=32, default 5).
 `employ_color_transform` applies RCT for reversible RGB and ICT for irreversible
 RGB when there are exactly three components; the codec defaults enable it, while
-`HtJ2kParams::default()` in the sibling crate leaves it false. `.202` forces
+`HtJ2kParams::default()` in the sibling crate leaves it false. When the
+transform is applied, the encoded dataset is labelled `YBR_RCT` (`.201`/`.202`)
+or `YBR_ICT` (`.203`), as PS3.5 requires for a codestream whose MCT flag is set;
+decoding converts back and labels the native dataset `RGB`. `.202` forces
 RPCL and validates it on decode; `.201` and `.203` honour the requested
 progression order, with LRCP as the default. `.203` uses OpenJPH's default
 scalar-expounded steps (`baseDelta = 1 / 2^precision`) when `quality` is 0 and

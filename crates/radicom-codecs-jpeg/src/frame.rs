@@ -1,7 +1,7 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
-use super::lossless::LosslessFrame;
-use super::sequential::{fancy_upsample, SequentialFrame};
+use super::lossless::{LosslessFrame, Selection};
+use super::sequential::{fancy_upsample, FrameExpectation, SequentialFrame};
 use radicom::error::{CodecError, Error};
 use radicom::model::tag::Tag;
 use radicom::model::vr::Vr;
@@ -358,7 +358,7 @@ pub(crate) fn encode_sequential(
             "unsupported sequential JPEG photometric interpretation",
         ));
     }
-    let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
+    let mut frames = Vec::new();
     for i in 0..src.number_of_frames() {
         let frame = src
             .get_frame(i)
@@ -423,7 +423,13 @@ pub(crate) fn decode_sequential(
             "decode requires encapsulated source and native destination",
         ));
     }
-    let mut frames = Vec::with_capacity(src.number_of_frames() as usize);
+    let expected = FrameExpectation {
+        width: usize::try_from(dst.width()).unwrap_or(0),
+        height: usize::try_from(dst.height()).unwrap_or(0),
+        components: u8::try_from(dst.samples_per_pixel()).unwrap_or(0),
+        precision: u8::try_from(dst.bits_stored()).unwrap_or(0),
+    };
+    let mut frames = Vec::new();
     for i in 0..src.number_of_frames() {
         let frame_bytes = src
             .get_frame(i)
@@ -431,13 +437,9 @@ pub(crate) fn decode_sequential(
         let bytes = frame_bytes
             .data()
             .map_err(|e| operation_error(codec, &format!("frame {i}: {e}")))?;
-        let frame = SequentialFrame::decode(bytes.as_ref())
+        let frame = SequentialFrame::decode_expected(bytes.as_ref(), Some(&expected))
             .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?;
-        if frame.width != usize::try_from(dst.width()).unwrap_or(0)
-            || frame.height != usize::try_from(dst.height()).unwrap_or(0)
-            || frame.components != u8::try_from(dst.samples_per_pixel()).unwrap_or(0)
-            || frame.precision != u8::try_from(dst.bits_stored()).unwrap_or(0)
-            || (baseline && frame.precision != 8)
+        if (baseline && frame.precision != 8)
             || (!baseline && !matches!(frame.precision, 8 | 12))
         {
             return Err(operation_error(
@@ -545,7 +547,7 @@ pub(crate) fn encode_lossless(
             "point transform must be less than BitsStored",
         ));
     }
-    let mut encoded_frames = Vec::with_capacity(src.number_of_frames() as usize);
+    let mut encoded_frames = Vec::new();
     for frame_index in 0..src.number_of_frames() {
         let buffer = src
             .get_frame(frame_index)
@@ -587,6 +589,7 @@ pub(crate) fn decode_lossless(
     src: &PixelDataRef<'_>,
     dst: &mut PixelData<'_>,
     params: &radicom::pixel::codec::JpegParams,
+    selection: Selection,
     codec: &str,
 ) -> Result<(), Error> {
     if !src.transfer_syntax().is_encapsulated() || dst.transfer_syntax().is_encapsulated() {
@@ -603,7 +606,7 @@ pub(crate) fn decode_lossless(
     }
     let layout =
         Layout::from_destination(dst, true).map_err(|message| operation_error(codec, &message))?;
-    let mut decoded_frames = Vec::with_capacity(src.number_of_frames() as usize);
+    let mut decoded_frames = Vec::new();
     for frame_index in 0..src.number_of_frames() {
         let buffer = src
             .get_frame(frame_index)
@@ -611,7 +614,7 @@ pub(crate) fn decode_lossless(
         let bytes = buffer
             .data()
             .map_err(|error| operation_error(codec, &format!("frame {frame_index}: {error}")))?;
-        let frame = LosslessFrame::decode(bytes.as_ref()).map_err(|message| {
+        let frame = LosslessFrame::decode(bytes.as_ref(), selection).map_err(|message| {
             operation_error(codec, &format!("frame {frame_index}: {message}"))
         })?;
         if frame.width != layout.width

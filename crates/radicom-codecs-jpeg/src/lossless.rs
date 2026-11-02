@@ -7,6 +7,15 @@ use super::marker::{Marker, MarkerReader, MarkerWriter};
 const HUFFMAN_COUNTS: [u8; 16] = [0, 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 const HUFFMAN_VALUES: [u8; 17] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
+/// Scan policy imposed by the transfer syntax that owns the codestream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Selection {
+    /// Process 14 (`.57`): predictors 1..=7 and a point transform are allowed.
+    Process14,
+    /// Process 14, selection value 1 (`.70`): predictor 1, point transform 0.
+    Sv1,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LosslessFrame {
     pub(crate) width: usize,
@@ -93,6 +102,15 @@ impl LosslessFrame {
             if interval == 0 {
                 return Err("JPEG restart interval must be non-zero".to_owned());
             }
+            // A lossless MCU is one sample, so one MCU row is the image width.
+            // libijg-based decoders (DCMTK, fo-dicom) reject a lossless DRI that
+            // is not an integer number of MCU rows, so the encoder refuses it.
+            if !usize::from(interval).is_multiple_of(self.width) {
+                return Err(format!(
+                    "JPEG lossless restart interval {interval} must be a multiple of the image width {}",
+                    self.width
+                ));
+            }
         }
         let effective_precision = self.precision - point_transform;
         let initial = 1i32 << (effective_precision - 1);
@@ -172,39 +190,58 @@ impl LosslessFrame {
         Ok(output.into_bytes())
     }
 
-    pub(crate) fn decode(data: &[u8]) -> Result<Self, String> {
+    pub(crate) fn decode(data: &[u8], selection: Selection) -> Result<Self, String> {
         let mut reader = MarkerReader::new(data);
         expect_marker(&mut reader, Marker::Soi)?;
-        let (width, height, precision, components, component_ids) = loop {
-            let (marker, payload) = reader.read_segment()?;
-            match marker {
-                Marker::Sof3 => break parse_sof(&payload)?,
-                Marker::App(_) | Marker::Com => {}
-                other => return Err(format!("expected JPEG SOF3, got {other:?}")),
-            }
-        };
-        if !(2..=16).contains(&precision) {
-            return Err(format!(
-                "JPEG lossless precision {precision} is outside 2..=16"
-            ));
-        }
-        let expected = width
-            .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(usize::from(components)))
-            .ok_or_else(|| "JPEG sample count overflows usize".to_owned())?;
-        let mut samples = allocate_samples(expected)?;
-        let mut shifted_samples = allocate_samples(expected)?;
         let mut tables: [Option<HuffmanTable>; 4] = [None, None, None, None];
         let mut restart_interval = None;
         let mut decoded = [false; 3];
+        let mut header = None;
+        let mut samples = Vec::new();
+        let mut shifted_samples = Vec::new();
         loop {
             let (marker, payload) = reader.read_segment()?;
             match marker {
+                Marker::Sof3 => {
+                    if header.is_some() {
+                        return Err("JPEG frame has more than one SOF3 segment".to_owned());
+                    }
+                    let (width, height, precision, components, component_ids) =
+                        parse_sof(&payload)?;
+                    if !(2..=16).contains(&precision) {
+                        return Err(format!(
+                            "JPEG lossless precision {precision} is outside 2..=16"
+                        ));
+                    }
+                    let expected = width
+                        .checked_mul(height)
+                        .and_then(|pixels| pixels.checked_mul(usize::from(components)))
+                        .ok_or_else(|| "JPEG sample count overflows usize".to_owned())?;
+                    samples = allocate_samples(expected)?;
+                    shifted_samples = allocate_samples(expected)?;
+                    header = Some((width, height, precision, components, component_ids));
+                }
                 Marker::Dht => parse_dht(&payload, &mut tables)?,
+                // Lossless JPEG carries no quantization table; T.81 fixes no
+                // order for the table segments before SOS (libijg writes DQT
+                // and DHT ahead of SOF), so a DQT is legal and unused here.
+                Marker::Dqt => {}
                 Marker::Dri => restart_interval = parse_restart_interval(&payload)?,
                 Marker::App(_) | Marker::Com => {}
                 Marker::Sos => {
+                    let Some((width, height, precision, components, component_ids)) = header
+                    else {
+                        return Err("missing JPEG SOF3".to_owned());
+                    };
                     let scan = parse_sos(&payload, precision, components, &component_ids)?;
+                    if selection == Selection::Sv1
+                        && (scan.predictor != 1 || scan.point_transform != 0)
+                    {
+                        return Err(format!(
+                            "JPEG SV1 scan uses predictor {} and point transform {}; SV1 requires predictor 1 and point transform 0",
+                            scan.predictor, scan.point_transform
+                        ));
+                    }
                     for &(component, _) in &scan.components {
                         if decoded[usize::from(component)] {
                             return Err(format!(
@@ -233,6 +270,9 @@ impl LosslessFrame {
                 other => return Err(format!("unexpected JPEG marker {other:?}")),
             }
         }
+        let Some((width, height, precision, components, _)) = header else {
+            return Err("missing JPEG SOF3".to_owned());
+        };
         if decoded[..usize::from(components)].iter().any(|&seen| !seen) {
             return Err("JPEG lossless stream does not decode every component".to_owned());
         }
@@ -635,6 +675,12 @@ fn predict(
 mod tests {
     use super::*;
 
+    /// Process 14 accepts every predictor and point transform, so it is the
+    /// widest policy for exercising the marker and entropy layers.
+    fn decode_any(data: &[u8]) -> Result<LosslessFrame, String> {
+        LosslessFrame::decode(data, Selection::Process14)
+    }
+
     fn sample_frame(precision: u8, components: u8) -> LosslessFrame {
         let width = 5;
         let height = 4;
@@ -655,7 +701,7 @@ mod tests {
     fn round_trips_8_bit_predictor_one() {
         let frame = sample_frame(8, 1);
         let encoded = frame.encode(1, 0, None).unwrap();
-        let decoded = LosslessFrame::decode(&encoded).unwrap();
+        let decoded = decode_any(&encoded).unwrap();
         assert_eq!(decoded, frame);
     }
 
@@ -665,7 +711,7 @@ mod tests {
             for predictor in 1..=7 {
                 let frame = sample_frame(precision, 1);
                 let encoded = frame.encode(predictor, 0, None).unwrap();
-                let decoded = LosslessFrame::decode(&encoded).unwrap_or_else(|error| {
+                let decoded = decode_any(&encoded).unwrap_or_else(|error| {
                     panic!("precision={precision} predictor={predictor}: {error}")
                 });
                 assert_eq!(
@@ -677,13 +723,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_restart_interval_that_is_not_a_multiple_of_the_width() {
+        let frame = sample_frame(8, 1);
+        // libijg-based decoders reject a lossless restart interval that is not
+        // an integer number of MCU rows; a lossless MCU row is the image width.
+        let error = frame.encode(1, 0, Some(3)).unwrap_err();
+        assert!(error.contains("multiple of the image width"), "{error}");
+        assert!(frame.encode(1, 0, Some(5)).is_ok());
+    }
+
+    #[test]
     fn round_trips_interleaved_components_across_restart_markers() {
         let frame = sample_frame(8, 3);
-        let encoded = frame.encode(4, 0, Some(3)).unwrap();
+        let encoded = frame.encode(4, 0, Some(5)).unwrap();
         assert!(encoded
             .windows(2)
             .any(|window| (0xd0..=0xd7).contains(&window[1])));
-        assert_eq!(LosslessFrame::decode(&encoded).unwrap(), frame);
+        assert_eq!(decode_any(&encoded).unwrap(), frame);
     }
 
     #[test]
@@ -713,7 +769,7 @@ mod tests {
             stream.write_raw(entropy);
             stream.write_marker(Marker::Eoi).unwrap();
             assert_eq!(
-                LosslessFrame::decode(&stream.into_bytes()).unwrap(),
+                decode_any(&stream.into_bytes()).unwrap(),
                 frame,
                 "table selector {table}"
             );
@@ -727,7 +783,7 @@ mod tests {
             .encode_scans(1, 0, None, &[vec![0], vec![1], vec![2]])
             .unwrap();
         assert_eq!(
-            LosslessFrame::decode(&per_component).unwrap(),
+            decode_any(&per_component).unwrap(),
             frame,
             "one scan per component"
         );
@@ -735,7 +791,7 @@ mod tests {
             .encode_scans(1, 0, None, &[vec![0, 1], vec![2]])
             .unwrap();
         assert_eq!(
-            LosslessFrame::decode(&mixed).unwrap(),
+            decode_any(&mixed).unwrap(),
             frame,
             "interleaved subset scan"
         );
@@ -756,12 +812,12 @@ mod tests {
         assert_eq!(sos.len(), 3);
         let mut repeated = per_component.clone();
         repeated[sos[1] + 5] = 1;
-        let error = LosslessFrame::decode(&repeated).unwrap_err();
+        let error = decode_any(&repeated).unwrap_err();
         assert!(error.contains("more than one scan"), "{error}");
         let missing = frame
             .encode_scans(1, 0, None, &[vec![0], vec![1]])
             .unwrap();
-        let error = LosslessFrame::decode(&missing).unwrap_err();
+        let error = decode_any(&missing).unwrap_err();
         assert!(error.contains("every component"), "{error}");
     }
 
@@ -774,7 +830,28 @@ mod tests {
             .position(|window| window == [0xff, 0xc4])
             .unwrap();
         encoded.drain(dht..dht + 2);
-        assert!(LosslessFrame::decode(&encoded).is_err());
+        assert!(decode_any(&encoded).is_err());
+    }
+
+    #[test]
+    fn accepts_table_segments_before_sof3() {
+        let frame = sample_frame(8, 1);
+        let encoded = frame.encode(1, 0, None).unwrap();
+        let dht = encoded
+            .windows(2)
+            .position(|window| window == [0xff, 0xc4])
+            .unwrap();
+        let dht_length = usize::from(u16::from_be_bytes([encoded[dht + 2], encoded[dht + 3]]));
+        let dht_end = dht + 2 + dht_length;
+        // T.81 fixes no order for the table segments before SOS; libijg writes
+        // DQT and DHT ahead of SOF, so both must be accepted there.
+        let mut stream = encoded[..2].to_vec();
+        stream.extend_from_slice(&[0xff, 0xdb, 0x00, 0x43, 0x00]);
+        stream.extend_from_slice(&[16u8; 64]);
+        stream.extend_from_slice(&encoded[dht..dht_end]);
+        stream.extend_from_slice(&encoded[2..dht]); // SOF3 after the tables
+        stream.extend_from_slice(&encoded[dht_end..]);
+        assert_eq!(decode_any(&stream).unwrap(), frame);
     }
 
     #[test]
@@ -783,7 +860,19 @@ mod tests {
         let encoded = frame.encode(1, 0, None).unwrap();
         let mut with_metadata = vec![0xff, 0xd8, 0xff, 0xe0, 0, 4, 1, 2, 0xff, 0xfe, 0, 3, 7];
         with_metadata.extend_from_slice(&encoded[2..]);
-        assert_eq!(LosslessFrame::decode(&with_metadata).unwrap(), frame);
+        assert_eq!(decode_any(&with_metadata).unwrap(), frame);
+    }
+
+    #[test]
+    fn sv1_selection_rejects_a_point_transform_and_a_foreign_predictor() {
+        let frame = sample_frame(8, 1);
+        let transformed = frame.encode(1, 4, None).unwrap();
+        let predictor_two = frame.encode(2, 0, None).unwrap();
+        for stream in [&transformed, &predictor_two] {
+            let error = LosslessFrame::decode(stream, Selection::Sv1).unwrap_err();
+            assert!(error.contains("SV1"), "{error}");
+            assert!(LosslessFrame::decode(stream, Selection::Process14).is_ok());
+        }
     }
 
     #[test]
@@ -793,7 +882,7 @@ mod tests {
             *sample &= !3;
         }
         let encoded = frame.encode(1, 2, None).unwrap();
-        assert_eq!(LosslessFrame::decode(&encoded).unwrap(), frame);
+        assert_eq!(decode_any(&encoded).unwrap(), frame);
     }
 
     #[test]
@@ -814,6 +903,6 @@ mod tests {
         for (offset, id) in [5usize, 7, 9].into_iter().zip([0u8, 1, 2]) {
             encoded[sos + offset] = id;
         }
-        assert_eq!(LosslessFrame::decode(&encoded).unwrap(), frame);
+        assert_eq!(decode_any(&encoded).unwrap(), frame);
     }
 }

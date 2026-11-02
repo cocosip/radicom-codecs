@@ -208,6 +208,14 @@ The core `PixelData` implementation owns encapsulation fragments and DICOM
 even-length padding, so codec implementations must keep logical codestream length
 separate from DICOM padding.
 
+`HighBit` is read but never shifts samples. PS3.3 requires
+`HighBit = BitsStored - 1`, so conforming frames are right-justified inside
+`BitsStored` and the adapter masks to `BitsStored`, exactly like libjpeg, CharLS,
+OpenJPEG, and fo-dicom's codecs. A non-conforming left-aligned frame must be
+normalized by the caller before transcoding (the `radicom` renderer's
+`BitDepth::normalize` does this); the codecs do not reinterpret the bits, and
+decoded frames keep the dataset's `HighBit` because the output is right-justified.
+
 ## 9. Error and safety rules
 
 All public codec methods return `Result<(), radicom::error::Error>`. External

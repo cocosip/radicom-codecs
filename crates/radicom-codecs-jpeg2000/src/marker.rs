@@ -355,10 +355,20 @@ pub(crate) struct Coc {
     pub(crate) style: CodingStyle,
 }
 
+/// ISO/IEC 15444-1 A.6.2/A.6.4: the component index of COC and QCC is one
+/// byte when the number of components is below 257, and two bytes otherwise.
+fn component_index(c: &mut Cursor<'_>, num_components: usize) -> Result<u16, String> {
+    if num_components < 257 {
+        Ok(u16::from(c.u8()?))
+    } else {
+        c.u16()
+    }
+}
+
 impl Coc {
-    pub(crate) fn parse(payload: &[u8]) -> Result<Self, String> {
+    pub(crate) fn parse(payload: &[u8], num_components: usize) -> Result<Self, String> {
         let mut c = Cursor::new(payload);
-        let component = c.u16()?;
+        let component = component_index(&mut c, num_components)?;
         let scoc = c.u8()?;
         if scoc & 0xFE != 0 {
             return Err("unsupported COC Scoc flags".into());
@@ -459,10 +469,20 @@ impl Quantization {
         }
     }
 
-    /// Quantization step for a subband; style 1 uses one derived value for all.
+    /// Quantization step for a subband. Style 1 stores only the band-0 record;
+    /// ISO/IEC 15444-1 A.6.4 derives the other bands by subtracting one from
+    /// the exponent per resolution level, saturating at zero, and copying the
+    /// mantissa unchanged (OpenJPEG applies the same derivation).
     pub(crate) fn step(&self, subband: usize) -> Option<QStep> {
         if self.style == 1 {
-            self.steps.first().copied()
+            let base = self.steps.first().copied()?;
+            let reduction = if subband == 0 { 0 } else { (subband - 1) / 3 };
+            Some(QStep {
+                exponent: base
+                    .exponent
+                    .saturating_sub(u8::try_from(reduction).unwrap_or(u8::MAX)),
+                mantissa: base.mantissa,
+            })
         } else {
             self.steps.get(subband).copied()
         }
@@ -529,7 +549,14 @@ impl MainHeader {
                     }
                     cod = Some(Cod::parse(c.segment()?)?);
                 }
-                COC => cocs.push(Coc::parse(c.segment()?)?),
+                COC => {
+                    let components = siz
+                        .as_ref()
+                        .ok_or_else(|| "COC appears before SIZ".to_string())?
+                        .comps
+                        .len();
+                    cocs.push(Coc::parse(c.segment()?, components)?);
+                }
                 QCD => {
                     if qcd.is_some() {
                         return Err("duplicate QCD marker".into());
@@ -537,10 +564,19 @@ impl MainHeader {
                     qcd = Some(Quantization::parse(c.segment()?)?);
                 }
                 QCC => {
+                    let components = siz
+                        .as_ref()
+                        .ok_or_else(|| "QCC appears before SIZ".to_string())?
+                        .comps
+                        .len();
                     let payload = c.segment()?;
                     let mut cc = Cursor::new(payload);
-                    let component = cc.u16()?;
-                    qccs.push((component, Quantization::parse(&payload[2..])?));
+                    let component = component_index(&mut cc, components)?;
+                    let offset = cc.position();
+                    qccs.push((
+                        component,
+                        Quantization::parse(&payload[offset..])?,
+                    ));
                 }
                 TLM => {
                     let payload = c.segment()?;
@@ -811,7 +847,10 @@ mod tests {
     }
 
     #[test]
-    fn scalar_derived_quantization_broadcasts_one_step() {
+    fn scalar_derived_quantization_derives_lower_exponents() {
+        // ISO/IEC 15444-1 A.6.4 / OpenJPEG: one SPqcd is stored (band 0) and
+        // every other band derives its exponent by the resolution level,
+        // saturating at zero, with the mantissa copied unchanged.
         let qcd = Quantization {
             guard_bits: 2,
             style: 1,
@@ -824,7 +863,20 @@ mod tests {
         qcd.write(&mut bytes);
         let parsed = Quantization::parse(&bytes[4..]).unwrap();
         assert_eq!(parsed, qcd);
-        assert_eq!(parsed.step(0), parsed.step(15));
+        let exponent = |band| parsed.step(band).unwrap().exponent;
+        assert_eq!(exponent(0), 9);
+        for band in 1..=3 {
+            assert_eq!(exponent(band), 9, "band {band}");
+        }
+        for band in 4..=6 {
+            assert_eq!(exponent(band), 8, "band {band}");
+        }
+        for band in 7..=9 {
+            assert_eq!(exponent(band), 7, "band {band}");
+        }
+        assert_eq!(exponent(30), 0);
+        assert_eq!(exponent(96), 0);
+        assert_eq!(parsed.step(5).unwrap().mantissa, 0x100);
         assert!(Quantization::parse(&[0x21, 0, 1, 0, 2]).is_err());
     }
 
@@ -835,6 +887,85 @@ mod tests {
         assert!(Cod::parse(&[0, 0, 0, 1, 0, 4, 4, 1, 0]).is_err());
         assert!(Quantization::parse(&[0x02]).is_ok());
         assert!(Quantization::parse(&[0x1F]).is_err());
+    }
+
+    #[test]
+    fn one_byte_coc_and_qcc_component_indices_parse() {
+        let data = sample_codestream();
+        let (header, _) = MainHeader::parse(&data).unwrap();
+        let style = &header.cod.style;
+        let qcd = &header.qcd;
+
+        let mut coc = COC.to_be_bytes().to_vec();
+        let mut coc_payload = vec![0u8, 0u8]; // one-byte component index, Scoc 0
+        coc_payload.extend_from_slice(&[
+            style.decompositions,
+            style.code_block_width,
+            style.code_block_height,
+            style.style,
+            style.transform,
+        ]);
+        coc.extend_from_slice(&((2 + coc_payload.len()) as u16).to_be_bytes());
+        coc.extend_from_slice(&coc_payload);
+
+        let mut qcc = QCC.to_be_bytes().to_vec();
+        let mut qcc_payload = vec![0u8, (qcd.guard_bits << 5) | qcd.style];
+        for step in &qcd.steps {
+            if qcd.style == 0 {
+                qcc_payload.push((step.exponent << 3) | (step.mantissa as u8 & 0x07));
+            } else {
+                qcc_payload.extend_from_slice(
+                    &(((u16::from(step.exponent)) << 11) | (step.mantissa & 0x07FF)).to_be_bytes(),
+                );
+            }
+        }
+        qcc.extend_from_slice(&((2 + qcc_payload.len()) as u16).to_be_bytes());
+        qcc.extend_from_slice(&qcc_payload);
+
+        let patched = insert_after_siz(&data, &[coc, qcc]);
+        let (parsed, _) = MainHeader::parse(&patched).unwrap();
+        assert_eq!(parsed.cocs.len(), 1);
+        assert_eq!(parsed.cocs[0].component, 0);
+        assert_eq!(parsed.coding_style(0), style);
+        assert_eq!(parsed.qccs.len(), 1);
+        assert_eq!(parsed.quantization(0).steps, qcd.steps);
+        let decoded = crate::codestream::decode(&patched).unwrap();
+        assert_eq!(decoded.len(), 3);
+    }
+
+    fn sample_codestream() -> Vec<u8> {
+        let width = 16usize;
+        let height = 16usize;
+        let samples: Vec<Vec<i32>> = (0..3)
+            .map(|component| {
+                (0..width * height)
+                    .map(|i| ((i * 7 + component * 13) % 256) as i32 - 128)
+                    .collect()
+            })
+            .collect();
+        let mut components = crate::codestream::build_components(
+            &samples,
+            width as i32,
+            height as i32,
+            8,
+            false,
+            2,
+        )
+        .unwrap();
+        crate::codestream::encode(&mut components, true).unwrap()
+    }
+
+    /// Inserts marker segments directly after the SIZ segment (SOC is two
+    /// bytes, then the SIZ marker and its two-byte length).
+    fn insert_after_siz(codestream: &[u8], segments: &[Vec<u8>]) -> Vec<u8> {
+        let siz_len = u16::from_be_bytes([codestream[4], codestream[5]]) as usize;
+        let end = 4 + siz_len;
+        let mut out = codestream[..end].to_vec();
+        for segment in segments {
+            out.extend_from_slice(segment);
+        }
+        out.extend_from_slice(&codestream[end..]);
+        out
     }
 
     #[test]
