@@ -606,6 +606,12 @@ pub(crate) fn decode_lossless(
     }
     let layout =
         Layout::from_destination(dst, true).map_err(|message| operation_error(codec, &message))?;
+    let expected = FrameExpectation {
+        width: layout.width,
+        height: layout.height,
+        components: layout.components,
+        precision: layout.bits_stored,
+    };
     let mut decoded_frames = Vec::new();
     for frame_index in 0..src.number_of_frames() {
         let buffer = src
@@ -614,9 +620,9 @@ pub(crate) fn decode_lossless(
         let bytes = buffer
             .data()
             .map_err(|error| operation_error(codec, &format!("frame {frame_index}: {error}")))?;
-        let frame = LosslessFrame::decode(bytes.as_ref(), selection).map_err(|message| {
-            operation_error(codec, &format!("frame {frame_index}: {message}"))
-        })?;
+        let frame = LosslessFrame::decode(bytes.as_ref(), selection, Some(&expected)).map_err(
+            |message| operation_error(codec, &format!("frame {frame_index}: {message}")),
+        )?;
         if frame.width != layout.width
             || frame.height != layout.height
             || frame.precision != layout.bits_stored

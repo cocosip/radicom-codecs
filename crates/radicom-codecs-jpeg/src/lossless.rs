@@ -3,6 +3,7 @@
 use super::bit::{BitReader, BitWriter};
 use super::huffman::HuffmanTable;
 use super::marker::{Marker, MarkerReader, MarkerWriter};
+use super::sequential::FrameExpectation;
 
 const HUFFMAN_COUNTS: [u8; 16] = [0, 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 const HUFFMAN_VALUES: [u8; 17] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
@@ -190,7 +191,11 @@ impl LosslessFrame {
         Ok(output.into_bytes())
     }
 
-    pub(crate) fn decode(data: &[u8], selection: Selection) -> Result<Self, String> {
+    pub(crate) fn decode(
+        data: &[u8],
+        selection: Selection,
+        expected: Option<&FrameExpectation>,
+    ) -> Result<Self, String> {
         let mut reader = MarkerReader::new(data);
         expect_marker(&mut reader, Marker::Soi)?;
         let mut tables: [Option<HuffmanTable>; 4] = [None, None, None, None];
@@ -212,6 +217,16 @@ impl LosslessFrame {
                         return Err(format!(
                             "JPEG lossless precision {precision} is outside 2..=16"
                         ));
+                    }
+                    if let Some(expected) = expected {
+                        if width != expected.width
+                            || height != expected.height
+                            || precision != expected.precision
+                            || components != expected.components
+                        {
+                            return Err("codestream layout does not match destination"
+                                .to_owned());
+                        }
                     }
                     let expected = width
                         .checked_mul(height)
@@ -678,7 +693,7 @@ mod tests {
     /// Process 14 accepts every predictor and point transform, so it is the
     /// widest policy for exercising the marker and entropy layers.
     fn decode_any(data: &[u8]) -> Result<LosslessFrame, String> {
-        LosslessFrame::decode(data, Selection::Process14)
+        LosslessFrame::decode(data, Selection::Process14, None)
     }
 
     fn sample_frame(precision: u8, components: u8) -> LosslessFrame {
@@ -869,10 +884,34 @@ mod tests {
         let transformed = frame.encode(1, 4, None).unwrap();
         let predictor_two = frame.encode(2, 0, None).unwrap();
         for stream in [&transformed, &predictor_two] {
-            let error = LosslessFrame::decode(stream, Selection::Sv1).unwrap_err();
+            let error = LosslessFrame::decode(stream, Selection::Sv1, None).unwrap_err();
             assert!(error.contains("SV1"), "{error}");
-            assert!(LosslessFrame::decode(stream, Selection::Process14).is_ok());
+            assert!(LosslessFrame::decode(stream, Selection::Process14, None).is_ok());
         }
+    }
+
+    #[test]
+    fn rejects_a_sof_that_disagrees_with_the_destination() {
+        let frame = sample_frame(8, 1);
+        let encoded = frame.encode(1, 0, None).unwrap();
+        let expected = FrameExpectation {
+            width: 5,
+            height: 4,
+            components: 1,
+            precision: 8,
+        };
+        assert!(LosslessFrame::decode(&encoded, Selection::Process14, Some(&expected)).is_ok());
+        // The destination contract is checked against the SOF header, so a
+        // hostile frame size is refused before its sample buffer is reserved.
+        let hostile = FrameExpectation {
+            width: 65535,
+            height: 65535,
+            components: 1,
+            precision: 8,
+        };
+        let error =
+            LosslessFrame::decode(&encoded, Selection::Process14, Some(&hostile)).unwrap_err();
+        assert!(error.contains("destination"), "{error}");
     }
 
     #[test]

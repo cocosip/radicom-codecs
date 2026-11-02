@@ -113,8 +113,10 @@ a mean-absolute-error tolerance and require a decodable codestream.
    explicit quality table.
 5. Bidirectional fo-dicom fixtures pass for mono and RGB `.201/.202` (exact),
    `.202` with TLM (exact), and `.203` at the default and at `quality = 40`
-   (within one to two samples). Malformed-stream and profile-matrix coverage
-   remains a follow-up.
+   (within one to two samples). That run predates the 9/7 gain corrections, so
+   `.203` needs a re-run; the lossless `.201/.202` cases never use the
+   irreversible scaling and are unaffected. Malformed-stream and profile-matrix
+   coverage remains a follow-up.
 
 The public registry keeps one JPEG 2000 family entry point. The classic and
 HTJ2K codec types remain inside the same crate. The sibling `radicom` boundary

@@ -6,8 +6,8 @@ use crate::marker::{
     SizComp, Sot, EOC, SOD, SOT,
 };
 use crate::quantization::{
-    bit_plane_depth, decode_step_size, encode_step_size, irreversible_steps, reversible_steps,
-    subband_index,
+    bit_plane_depth, decode_step_size, encode_step_size, gain_bits, irreversible_steps,
+    reversible_steps, subband_index,
 };
 use crate::{tier1, tier2, wavelet};
 
@@ -162,9 +162,12 @@ pub(crate) fn encode_with_precincts(
                             let plane = irreversible_plane
                                 .as_ref()
                                 .ok_or_else(|| "missing irreversible plane".to_string())?;
-                            // The QCD already carries the subband norm; the
-                            // 9/7 gain lives in the norm table, not here.
-                            let step = decode_step_size(encoded, precision);
+                            // The QCD carries `1/norm`; the subband's 2-D gain
+                            // multiplies it in the inverse transform of OpenJPEG
+                            // and OpenJPH (E-4), so the coefficient domain here
+                            // uses `gain * 1/norm` as well.
+                            let step = decode_step_size(encoded, precision)
+                                * f64::from(1u32 << gain_bits(band.orientation));
                             for y in 0..height {
                                 for x in 0..width {
                                     let sx = block.x0 as usize + x;
@@ -398,7 +401,8 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
                                 }
                             }
                         } else {
-                            let step = decode_step_size(encoded, component.precision);
+                            let step = decode_step_size(encoded, component.precision)
+                                * f64::from(1u32 << gain_bits(band.orientation));
                             let plane = component
                                 .irreversible
                                 .as_mut()
@@ -571,6 +575,68 @@ mod tests {
         let (header, _) = MainHeader::parse(&codestream).unwrap();
         assert_eq!(header.cod.scod, 1);
         assert_eq!(header.cod.style.precincts, precincts);
+    }
+
+    fn hex_bytes(text: &str) -> Vec<u8> {
+        let digits: Vec<u8> = text
+            .bytes()
+            .filter(|b| b.is_ascii_hexdigit())
+            .collect();
+        digits
+            .chunks(2)
+            .map(|pair| {
+                let high = (pair[0] as char).to_digit(16).unwrap() as u8;
+                let low = (pair[1] as char).to_digit(16).unwrap() as u8;
+                (high << 4) | low
+            })
+            .collect()
+    }
+
+    /// Codestream written by OpenJPEG 2.5.4 (`opj_compress -I -r 1 -n 3`) from a
+    /// 16x16 8-bit ramp, with the samples that same release decodes back. It
+    /// pins the irreversible convention: the QCD carries `1/norm` and the
+    /// inverse transform scales each subband by its `2^gain`, so our decoded
+    /// samples must agree with OpenJPEG's to within rounding.
+    #[test]
+    fn decodes_an_openjpeg_irreversible_codestream() {
+        const CODESTREAM: &str = "
+            ff4fff5100290000000000100000001000000000000000000000001000000010
+            00000000000000000001070101ff52000c00000001000204040000ff5c001142
+            5f5250055005504757d357d35762ff640025000143726561746564206279204f
+            70656e4a5045472076657273696f6e20322e352e34ff90000a00000000013700
+            01ff93c3f013103ca7026cd3b4d93fb45ab28a47bdfd33b627c7e0251f80a47e
+            024021c44f88efd5323a21c3e0ddd507d3bde74f1a36ae378a7c109bdec7d5dd
+            561b72fce54d98bf2403f5065c632d4aa13e863684a2fed246adc7e07d1f8204
+            fcd2c05fd53e9853e72f0a08379b4dc595a64a01cd7bd1dbd42d21347cc538c9
+            507c9e6dd24b7931297eb7ea0bff1f44847a4ad91d263d738a7277d7c8821d29
+            3f4dd011dbf733ad80313679762ceef86474e6db4b3913a75713fdab8e210c8b
+            bf72a4c1098ec5614bee854dfd82f6886aa9b6b0d52a3e181c2a519b9dc96b04
+            3f42ea0073794b193bb26daa4719d8e7d27f7c5aab4c86a6779dcfc0a4b0aad2
+            06042ad2556c88f7bba18a38817df7872ac3d8677f8db2179c4d9f0881beae28
+            6fb66382a74900a213ab3737ffd9";
+        const EXPECTED: &str = "
+            01356a265c914e84b874aade9cd006c4457b376ca15e93c885baeface116d308
+            8a477cb16ea3d895caffbcf126e3184d578cc17eb2e8a5da0fcc0136f3285d1a
+            9dd18ec3f8b5ea1fdc114603386d2a5fe19ed308c5fb2fec215513487d3a6fa4
+            ade318d50a3ffc316623588d4a7fb471f328e61a4f0c407633689d5a8fc381b7
+            38f52a5f1c51864378ad6a9fd491c6fb053a6f2c61965388bd7aafe4a1d60bc7
+            4a7f3c71a66398cd8abef4b1e61bd80d8f4c81b673a8dd9acf04c1f72be81d52
+            5c91c682b8edaadf14d1063bf82d621fa1d693c8fdbaf024e2164c083d722f64
+            e6a3d80ccaff34f1265b184d823f74a9b3e81ddb0f4401376b285c924f84b976";
+        let stream = hex_bytes(CODESTREAM);
+        let expected = hex_bytes(EXPECTED);
+        assert_eq!(expected.len(), 256, "fixture is one 16x16 8-bit frame");
+        let components = decode(&stream).unwrap();
+        assert_eq!(components.len(), 1);
+        let samples = &components[0].samples;
+        assert_eq!(samples.len(), expected.len());
+        let shift = 1i32 << 7;
+        let mut worst = 0;
+        for (index, &reference) in expected.iter().enumerate() {
+            let difference = (samples[index] + shift - i32::from(reference)).abs();
+            worst = worst.max(difference);
+        }
+        assert!(worst <= 1, "decoded samples differ from OpenJPEG by {worst}");
     }
 
     #[test]

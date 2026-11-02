@@ -124,15 +124,19 @@ the distinction between portable tests and native evidence are in
 - [x] Run the independent fo-dicom bidirectional acceptance matrix for `.90`
   and `.91`.
 
-Interop evidence: the bidirectional matrix that compared Rust and
-fo-dicom/OpenJPEG output was run against the previous 9/7 synthesis scaling.
-That scaling was wrong — the classic inverse applied `2/K` where the analysis
-applies `K`, so `1/K` is the exact inverse and is what OpenJPEG and OpenJPH
-use — so the lossy half of the matrix must be re-run before its numbers are
-restated. The lossless `.90` results are unaffected: the 5/3 path never used
-the irreversible scaling. The `.91` encoder also divided coefficients by the
-subband norm times `2^gain` while the QCD declared only the norm; the gain is
-now carried by the norm table alone, matching OpenJPEG.
+Interop evidence: the OpenJPEG 2.5.4 matrix (`node .interop/matrix.js`) passes
+after two scaling corrections. The classic inverse applied `2/K` where the
+analysis applies `K`, so `1/K` is the exact inverse; and the irreversible
+coefficient domain carries each subband's gain (`2^gain`, Equation E-4) in both
+the encoder's quantization step and the decoder's dequantization step, which is
+how OpenJPEG (`two_invK`, compensated by `R_b = prec` in its `tcd.c`) and
+OpenJPH express the same transform. Results: `.90` is byte-exact in both
+directions at 8 and 12 bits; an OpenJPEG `.91` decodes within `mean 0.002 /
+max 1` of OpenJPEG's own output at 8 bits (`0.036 / 1` at 12 bits); and an
+OpenJPEG decode of a Rust `.91` stays within `mean 0.172 / max 2` of the Rust
+decode of the same codestream. An OpenJPEG-written irreversible codestream and
+its reference samples are embedded in a unit test so the convention cannot
+regress silently.
 
 The classic encoder emits one quality layer and does not apply MCT; `rate`,
 `rate_levels`, and `allow_mct` are accepted but do not alter the codestream yet.
@@ -146,15 +150,17 @@ YBR_FULL/YBR_FULL_422 input is normalized to RGB. See
 - [x] Write CAP, optional TLM, RPCL for `.202`, and one quality layer.
 - [x] Apply RCT/ICT by default and label the encoded dataset `YBR_RCT`/`YBR_ICT`.
 - [x] Round-trip lossless HTJ2K exactly and bound `.203` by the quality profile.
-- [ ] Re-run the fo-dicom/OpenJPH interop matrix after the shared 9/7 fix.
+- [ ] Re-run the HTJ2K interop matrix. It needs an OpenJPH or fo-dicom oracle:
+  OpenJPH publishes no Windows binary and this machine has no CMake, so the
+  matrix currently covers `.90` and `.91` only.
 
 ## Next implementation stages
 
 1. **Broader JPEG 2000/HTJ2K coverage:** optional rate control/quality layers,
    classic encoder MCT, and fuzz/property tests for malformed codestreams.
-2. **Interop re-verification:** re-run the `.interop/` matrix for `.90`, `.91`,
-   `.201`, `.202`, and `.203` after the 9/7 scaling correction and the
-   quantization/COC/QCC fixes.
+2. **Interop re-verification:** the `.90`/`.91` half is done against OpenJPEG
+   2.5.4; re-run it after any wavelet, quantization, or COC/QCC change, and add
+   `.201`/`.202`/`.203` once an OpenJPH or fo-dicom oracle is available.
 
 Each stage must pass its focused tests and the previous stages before the next stage starts.
 

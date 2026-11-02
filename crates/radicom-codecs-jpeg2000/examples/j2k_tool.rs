@@ -70,6 +70,12 @@ fn base_dataset(options: &HashMap<String, String>, encapsulated: bool) -> Result
     let rows: u16 = number(options, "rows")?;
     let cols: u16 = number(options, "cols")?;
     let bits: u16 = number(options, "bits")?;
+    // `--stored` separates BitsStored from BitsAllocated, as DICOM does for
+    // 12-bit data stored in 16-bit words.
+    let stored: u16 = match options.get("stored") {
+        Some(value) => value.parse().map_err(|_| "invalid --stored".to_string())?,
+        None => bits,
+    };
     let samples: u16 = number(options, "samples")?;
     let signed = options.contains_key("signed");
     let photometric = required(options, "photometric")?;
@@ -83,8 +89,8 @@ fn base_dataset(options: &HashMap<String, String>, encapsulated: bool) -> Result
         (Tag::ROWS, rows),
         (Tag::COLUMNS, cols),
         (Tag::BITS_ALLOCATED, bits),
-        (Tag::BITS_STORED, bits),
-        (Tag::HIGH_BIT, bits - 1),
+        (Tag::BITS_STORED, stored),
+        (Tag::HIGH_BIT, stored - 1),
         (Tag::SAMPLES_PER_PIXEL, samples),
         (Tag::PIXEL_REPRESENTATION, u16::from(signed)),
     ] {
