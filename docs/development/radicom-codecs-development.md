@@ -136,7 +136,10 @@ max 1` of OpenJPEG's own output at 8 bits (`0.036 / 1` at 12 bits); and an
 OpenJPEG decode of a Rust `.91` stays within `mean 0.172 / max 2` of the Rust
 decode of the same codestream. An OpenJPEG-written irreversible codestream and
 its reference samples are embedded in a unit test so the convention cannot
-regress silently.
+regress silently. A second, DICOM-level matrix (`node .interop/dicom-matrix.js`)
+drives the real `fo-dicom.Codecs` 5.16.7 transcoder over the same syntaxes and
+agrees: `.90` is exact in both directions at 8 and 12 bits, a fo-dicom `.91`
+decodes within `max 1`, and fo-dicom decodes a Rust `.91` within `max 2`.
 
 The classic encoder emits one quality layer and does not apply MCT; `rate`,
 `rate_levels`, and `allow_mct` are accepted but do not alter the codestream yet.
@@ -150,17 +153,31 @@ YBR_FULL/YBR_FULL_422 input is normalized to RGB. See
 - [x] Write CAP, optional TLM, RPCL for `.202`, and one quality layer.
 - [x] Apply RCT/ICT by default and label the encoded dataset `YBR_RCT`/`YBR_ICT`.
 - [x] Round-trip lossless HTJ2K exactly and bound `.203` by the quality profile.
-- [ ] Re-run the HTJ2K interop matrix. It needs an OpenJPH or fo-dicom oracle:
-  OpenJPH publishes no Windows binary and this machine has no CMake, so the
-  matrix currently covers `.90` and `.91` only.
+- [x] Run the HTJ2K interop matrix against a real HTJ2K encoder/decoder. No
+  OpenJPH Windows binary is published and this machine has no CMake, so the
+  oracle is fo-dicom.Codecs 5.16.7 (OpenJPH via P/Invoke) driven from a small C#
+  harness (`.interop/dicomref`, git-ignored). It covers mono `.201`/`.202`/`.203`
+  at 8 bits and `.201` at 12 bits in both directions, all sample-exact.
+
+### Codec interop matrix against fo-dicom.Codecs
+
+`node .interop/dicom-matrix.js` encodes a raw frame with one codec, decodes the
+codestream with both, and compares the two decodes; it then repeats the other
+direction. Lossless syntaxes must also reproduce the source exactly. Results
+(mono, 64×48, 8-bit unless noted):
+`.5` (8 and 16 bits), `.57` (16), `.70` (12 stored in 16), `.80` (8 and 12),
+`.81`, `.90` (8 and 12), `.201` (8 and 12), `.202`, and `.203` are sample-exact
+in both directions. `.50` and `.51` (12 stored in 16) agree within one sample,
+and `.91` (8 and 12) within two.
 
 ## Next implementation stages
 
 1. **Broader JPEG 2000/HTJ2K coverage:** optional rate control/quality layers,
    classic encoder MCT, and fuzz/property tests for malformed codestreams.
-2. **Interop re-verification:** the `.90`/`.91` half is done against OpenJPEG
-   2.5.4; re-run it after any wavelet, quantization, or COC/QCC change, and add
-   `.201`/`.202`/`.203` once an OpenJPH or fo-dicom oracle is available.
+2. **Interop re-verification:** both matrices are done — OpenJPEG 2.5.4 for
+   `.90`/`.91` and fo-dicom.Codecs 5.16.7 for every syntax. Re-run them after any
+   wavelet, quantization, or COC/QCC change. RGB and profile-matrix coverage for
+   HTJ2K is the remaining gap.
 
 Each stage must pass its focused tests and the previous stages before the next stage starts.
 

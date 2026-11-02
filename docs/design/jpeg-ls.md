@@ -587,6 +587,8 @@ Each stage ends with its own focused tests and keeps earlier stages passing.
 - Lossless comparisons are byte/sample exact after DICOM native byte order and
   planar rules. Near-lossless comparisons report maximum absolute sample error,
   not only visual similarity.
+- The DICOM-level fo-dicom.Codecs 5.16.7 matrix (`node .interop/dicom-matrix.js`)
+  is sample-exact in both directions for `.80` at 8 and 12 bits and for `.81`.
 - The acceptance matrix records external file fixtures separately from
   local unit and property checks; a successful Rust round trip alone is not
   claimed as cross-implementation proof.

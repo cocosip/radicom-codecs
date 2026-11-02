@@ -353,6 +353,10 @@ without updating this document first.
   fixed-point colour conversion, not from the filter. Before the filter the same
   comparison was `max=78`. The packed `YBR_FULL_422` decode path (no RGB
   conversion) is unchanged and byte-exact.
+- The DICOM-level fo-dicom.Codecs 5.16.7 matrix (`node .interop/dicom-matrix.js`)
+  agrees in both directions: `.57` (16-bit) and `.70` (12 bits stored in 16) are
+  sample-exact, and `.50` (8-bit) and `.51` (12 bits stored in 16) stay within
+  one sample of fo-dicom's own decode of the same codestream.
 - `smoothing_factor` parity with libjpeg is sample-exact: at `quality=100` a
   monochrome encode with `smoothing=50` decodes (DCMTK) within `max=1` of the
   unsmoothed stream — the same bound as `smoothing=0` — while the codestream

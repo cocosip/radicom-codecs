@@ -40,9 +40,13 @@ JP2/JPT wrappers, partial YBR, palette/CMYK, unknown photometric
 interpretations, and unsupported Part 2 extensions fail with managed errors.
 
 SIZ width/height, component count, precision, signedness, and decoded byte size
-are checked against the destination before HT decoding. The check uses checked
-arithmetic and the actual destination capacity, covering the overrun regression
-in fo-dicom's `HtJpeg2000GeometryUnitTest`.
+are checked against the destination before HT decoding. The precision may lie
+between the destination's `BitsStored` and `BitsAllocated`: fo-dicom's OpenJPH
+encoder writes `BitsAllocated` into SIZ for a 12-bit dataset, so the samples are
+re-centred on the destination's level shift, and values that do not fit
+`BitsStored` are refused rather than clamped. The check uses checked arithmetic
+and the actual destination capacity, covering the overrun regression in
+fo-dicom's `HtJpeg2000GeometryUnitTest`.
 
 ## HT block pipeline
 
@@ -111,12 +115,12 @@ a mean-absolute-error tolerance and require a decodable codestream.
 4. Irreversible quantization and `.203` tolerance tests are implemented,
    including OpenJPH-compatible 9/7 analysis and synthesis scaling and the
    explicit quality table.
-5. Bidirectional fo-dicom fixtures pass for mono and RGB `.201/.202` (exact),
-   `.202` with TLM (exact), and `.203` at the default and at `quality = 40`
-   (within one to two samples). That run predates the 9/7 gain corrections, so
-   `.203` needs a re-run; the lossless `.201/.202` cases never use the
-   irreversible scaling and are unaffected. Malformed-stream and profile-matrix
-   coverage remains a follow-up.
+5. The fo-dicom.Codecs 5.16.7 DICOM-level matrix (`.interop/dicomref`, C#)
+   passes in both directions for mono `.201`/`.202`/`.203` at 8 bits and `.201`
+   at 12 bits stored in 16: each codec's decode of the other's codestream is
+   sample-exact, and both decoders agree exactly on the same codestream. That
+   run replaces the earlier fo-dicom fixture pass, which predated the 9/7 gain
+   corrections. RGB and profile-matrix coverage remains a follow-up.
 
 The public registry keeps one JPEG 2000 family entry point. The classic and
 HTJ2K codec types remain inside the same crate. The sibling `radicom` boundary

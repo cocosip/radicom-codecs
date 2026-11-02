@@ -7,6 +7,7 @@ use radicom::{
 };
 
 use crate::codestream;
+use crate::geometry::Component;
 use crate::htj2k::codestream as ht_codestream;
 
 #[derive(Clone, Copy, Debug)]
@@ -395,22 +396,51 @@ pub(crate) fn encode_ht(
     ht_codestream::encode(&mut components, options)
 }
 
+/// Re-centres samples when a codestream carries a wider precision than the
+/// destination's `BitsStored`. fo-dicom's OpenJPH encoder writes `BitsAllocated`
+/// into SIZ, so a 12-bit dataset arrives in a 16-bit codestream. Values that do
+/// not fit the stored precision are refused instead of clamped.
+fn align_precision(components: &mut [Component], layout: &Layout) -> Result<(), String> {
+    let precision = components[0].precision;
+    if precision == layout.bits_stored {
+        return Ok(());
+    }
+    if layout.signed {
+        return Err("codestream layout does not match destination".into());
+    }
+    let shift = (1i32 << (i32::from(precision) - 1)) - (1i32 << (i32::from(layout.bits_stored) - 1));
+    let limit = 1i32 << (i32::from(layout.bits_stored) - 1);
+    for component in components.iter_mut() {
+        for sample in &mut component.samples {
+            let value = *sample + shift;
+            if value < -limit || value >= limit {
+                return Err("codestream samples do not fit the destination Bits Stored".into());
+            }
+            *sample = value;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn decode_ht(
     layout: &Layout,
     data: &[u8],
     expected_progression: Option<u8>,
 ) -> Result<Vec<u8>, String> {
-    let components = ht_codestream::decode(data, expected_progression)?;
+    let mut components = ht_codestream::decode(data, expected_progression)?;
     if components.len() != layout.components as usize {
         return Err("codestream component count does not match destination".into());
     }
+    let precision = components[0].precision;
     if components[0].width as usize != layout.width
         || components[0].height as usize != layout.height
-        || components[0].precision != layout.bits_stored
+        || precision < layout.bits_stored
+        || u16::from(precision) > layout.bits_allocated
         || components[0].signed != layout.signed
     {
         return Err("codestream layout does not match destination".into());
     }
+    align_precision(&mut components, layout)?;
     let planes: Vec<Vec<i32>> = components
         .iter()
         .map(|component| component.samples.clone())
@@ -418,17 +448,20 @@ pub(crate) fn decode_ht(
     layout.write(&planes)
 }
 pub(crate) fn decode(layout: &Layout, data: &[u8]) -> Result<Vec<u8>, String> {
-    let components = codestream::decode(data)?;
+    let mut components = codestream::decode(data)?;
     if components.len() != layout.components as usize {
         return Err("codestream component count does not match destination".into());
     }
+    let precision = components[0].precision;
     if components[0].width as usize != layout.width
         || components[0].height as usize != layout.height
-        || components[0].precision != layout.bits_stored
+        || precision < layout.bits_stored
+        || u16::from(precision) > layout.bits_allocated
         || components[0].signed != layout.signed
     {
         return Err("codestream layout does not match destination".into());
     }
+    align_precision(&mut components, layout)?;
     let planes: Vec<Vec<i32>> = components
         .iter()
         .map(|component| component.samples.clone())
@@ -510,4 +543,57 @@ mod tests {
             assert_eq!(plane[0], 0);
         }
     }
+
+    fn full_width_codestream(values: &[i32]) -> Vec<u8> {
+        let width = 32;
+        let height = 8;
+        let centered: Vec<i32> = values.iter().map(|value| value - 32768).collect();
+        let mut components = crate::codestream::build_components(
+            &[centered],
+            width,
+            height,
+            16,
+            false,
+            2,
+        )
+        .unwrap();
+        crate::codestream::encode(&mut components, true).unwrap()
+    }
+
+    fn narrow_layout() -> Layout {
+        Layout {
+            width: 32,
+            height: 8,
+            bits_allocated: 16,
+            bits_stored: 12,
+            components: 1,
+            planar: 0,
+            signed: false,
+            pi: PhotometricInterpretation::Monochrome2,
+            frame_len: 32 * 8 * 2,
+            ybr422: false,
+        }
+    }
+
+    #[test]
+    fn decodes_a_full_width_codestream_into_a_narrower_destination() {
+        // fo-dicom's OpenJPH encoder writes BitsAllocated (16) as the SIZ
+        // precision, so a 12-bit dataset arrives in a 16-bit codestream; the
+        // samples must be re-centred on the destination's level shift.
+        let values: Vec<i32> = (0..(32 * 8)).map(|i| (i * 37) % 4096).collect();
+        let bytes = decode(&narrow_layout(), &full_width_codestream(&values)).unwrap();
+        for (index, value) in values.iter().enumerate() {
+            let stored = i32::from(u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]));
+            assert_eq!(stored, *value, "sample {index}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_full_width_codestream_whose_samples_do_not_fit() {
+        let values: Vec<i32> = (0..(32 * 8)).map(|i| 4095 + (i % 900)).collect();
+        let error = decode(&narrow_layout(), &full_width_codestream(&values)).unwrap_err();
+        assert!(error.contains("do not fit"), "{error}");
+    }
 }
+
+
