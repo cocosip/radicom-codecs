@@ -1,0 +1,16 @@
+[package]
+name = "radicom-codecs-tool"
+description = "Command-line DICOM image compression tool built on radicom-codecs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "radicom-compress"
+path = "src/main.rs"
+
+[dependencies]
+radicom.workspace = true
+radicom-codecs = { path = "../radicom-codecs", version = "0.2.0" }

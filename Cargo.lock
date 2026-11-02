@@ -327,6 +327,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "radicom-codecs-tool"
+version = "0.2.0"
+dependencies = [
+ "radicom",
+ "radicom-codecs",
+]
+
+[[package]]
 name = "radicom-dict"
 version = "0.2.0"
 

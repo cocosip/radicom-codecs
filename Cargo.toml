@@ -6,6 +6,7 @@ members = [
     "crates/radicom-codecs-jpeg",
     "crates/radicom-codecs-jpeg-ls",
     "crates/radicom-codecs-jpeg2000",
+    "crates/radicom-codecs-tool",
 ]
 
 [workspace.package]
