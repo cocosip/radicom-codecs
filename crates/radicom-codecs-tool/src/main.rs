@@ -2,7 +2,7 @@
 //! implemented by `radicom-codecs`, or into one selected format.
 //!
 //! Usage:
-//!   radicom-compress `<input-file>` [--output-dir <directory>] [--format <suffix>]
+//!   radicom-compress `<input-file>` [--output-dir `<directory>`] [--format `<suffix>`]
 
 use std::path::PathBuf;
 

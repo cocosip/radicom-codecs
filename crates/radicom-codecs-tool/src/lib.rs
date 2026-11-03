@@ -134,7 +134,7 @@ pub struct CompressionOutcome {
     pub status: Status,
     /// Bytes written; `0` when the target failed.
     pub output_size: u64,
-    /// Compression note, "already <format>; copied", or the failure text.
+    /// Compression note, "already `<format>`; copied", or the failure text.
     pub message: String,
 }
 
