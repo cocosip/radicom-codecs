@@ -96,6 +96,16 @@ fn registry_transcodes_jpeg_ls_multiframe_signed_and_planar_layouts() {
                     .map(|i| pixels.get_frame(i).unwrap().data().unwrap().to_vec())
                     .collect::<Vec<_>>()
             };
+            if allocated == 16 {
+                // PS3.5 Table 7.1-1: encapsulated Pixel Data uses OB even for
+                // 16-bit samples; the codec rewrites the OW element that
+                // PixelData::add_frame creates.
+                assert_eq!(
+                    compressed.item(&Tag::PIXEL_DATA).unwrap().vr(),
+                    Vr::Ob,
+                    "encapsulated PixelData must be OB"
+                );
+            }
             compressed.remove(Tag::PIXEL_DATA);
             let fragments = compressed.insert_fragments(Tag::PIXEL_DATA, Vr::Ob);
             let mut offsets = Vec::new();

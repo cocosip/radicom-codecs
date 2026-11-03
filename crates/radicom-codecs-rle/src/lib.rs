@@ -8,9 +8,23 @@ mod segment;
 use frame::{decode_frame, encode_frame};
 use layout::RleLayout;
 use radicom::error::{CodecError, Error};
+use radicom::model::item::{DicomFragmentSequence, DicomItem};
+use radicom::model::tag::Tag;
 use radicom::model::transfer_syntax::{syntaxes, TransferSyntax};
+use radicom::model::vr::Vr;
 use radicom::pixel::codec::{Codec, CodecParams};
 use radicom::pixel::{PixelData, PixelDataRef};
+
+/// Upper bound for one decoded frame or one RLE segment allocation.
+///
+/// A 64-byte header plus a few compressed bytes must never let declared pixel
+/// metadata allocate gigabytes. The limit is deliberately below common
+/// container memory ceilings; a legitimate frame above it needs a larger
+/// deployment-specific budget.
+///
+/// ponytail: fixed 1 GiB ceiling; make it configurable only when a deployment
+/// has a verified large-frame need.
+const MAX_DECODED_BYTES: usize = 1 << 30;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RleLosslessCodec;
@@ -31,6 +45,13 @@ impl Codec for RleLosslessCodec {
         params: &CodecParams,
     ) -> Result<(), Error> {
         ensure_params(params, "encode")?;
+        if src.transfer_syntax().is_encapsulated() {
+            return Err(operation_error(
+                "encode",
+                None,
+                "source transfer syntax must be native",
+            ));
+        }
         if dst.transfer_syntax().uid() != self.transfer_syntax().uid() {
             return Err(operation_error(
                 "encode",
@@ -52,15 +73,17 @@ impl Codec for RleLosslessCodec {
             let bytes = buffer
                 .data()
                 .map_err(|error| operation_error("encode", Some(frame_index), error.to_string()))?;
-            encoded_frames.push(
+            encoded_frames.push((
+                frame_index,
                 encode_frame(&layout, bytes.as_ref())
                     .map_err(|message| operation_error("encode", Some(frame_index), message))?,
-            );
+            ));
         }
-        for frame in encoded_frames {
+        for (frame_index, frame) in encoded_frames {
             dst.add_frame(frame)
-                .map_err(|error| operation_error("encode", None, error.to_string()))?;
+                .map_err(|error| operation_error("encode", Some(frame_index), error.to_string()))?;
         }
+        set_encapsulated_pixel_data_vr_to_ob(dst);
         Ok(())
     }
 
@@ -99,17 +122,38 @@ impl Codec for RleLosslessCodec {
             let bytes = buffer
                 .data()
                 .map_err(|error| operation_error("decode", Some(frame_index), error.to_string()))?;
-            decoded_frames.push(
+            decoded_frames.push((
+                frame_index,
                 decode_frame(&layout, bytes.as_ref())
                     .map_err(|message| operation_error("decode", Some(frame_index), message))?,
-            );
+            ));
         }
-        for frame in decoded_frames {
+        for (frame_index, frame) in decoded_frames {
             dst.add_frame(frame)
-                .map_err(|error| operation_error("decode", None, error.to_string()))?;
+                .map_err(|error| operation_error("decode", Some(frame_index), error.to_string()))?;
         }
+        set_encapsulated_pixel_data_vr_to_ob(dst);
         Ok(())
     }
+}
+
+/// PS3.5 8.2.2 requires OB for encapsulated Pixel Data. The core picks OW from
+/// `BitsAllocated` when it first appends a 16-bit frame; rebuild the fragment
+/// sequence with the correct VR while preserving the offset table and buffers.
+fn set_encapsulated_pixel_data_vr_to_ob(dst: &mut PixelData<'_>) {
+    let Some(DicomItem::Fragments(fragments)) = dst.dataset().item(&Tag::PIXEL_DATA) else {
+        return;
+    };
+    if fragments.vr() == Vr::Ob {
+        return;
+    }
+    let mut corrected = DicomFragmentSequence::new(Tag::PIXEL_DATA, Vr::Ob);
+    for fragment in fragments.fragments() {
+        corrected.push_fragment_raw(fragment.clone());
+    }
+    corrected.set_offset_table(fragments.offset_table().to_vec());
+    dst.dataset_mut()
+        .insert_or_update(DicomItem::Fragments(corrected));
 }
 
 fn ensure_params(params: &CodecParams, operation: &str) -> Result<(), Error> {
@@ -145,6 +189,7 @@ mod tests {
     use radicom::model::transfer_syntax::syntaxes;
     use radicom::model::vr::Vr;
     use radicom::pixel::{PixelData, PixelDataRef};
+    use radicom::DicomItem;
 
     fn dataset(
         syntax: Arc<TransferSyntax>,
@@ -400,6 +445,164 @@ mod tests {
             .decode(&source, &mut target, &CodecParams::None)
             .unwrap_err();
         assert!(error.to_string().contains("RLE Lossless"));
+        assert!(!decoded.contains(&Tag::PIXEL_DATA));
+    }
+
+    #[test]
+    fn rejects_an_encapsulated_source() {
+        let mut compressed = dataset(syntaxes::RLE_LOSSLESS.clone(), 1, 1, 8, 1, None, 1);
+        {
+            let mut pixels = PixelData::create_new(&mut compressed).unwrap();
+            pixels.add_frame([0u8; 64]).unwrap();
+        }
+        let source = PixelDataRef::from_dataset(&compressed).unwrap();
+        let mut target = dataset(syntaxes::RLE_LOSSLESS.clone(), 1, 1, 8, 1, None, 1);
+        let mut target_pixels = PixelData::create_new(&mut target).unwrap();
+        let error = RleLosslessCodec
+            .encode(&source, &mut target_pixels, &CodecParams::None)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("source transfer syntax must be native"),
+            "{error}"
+        );
+        assert!(!target.contains(&Tag::PIXEL_DATA));
+    }
+
+    #[test]
+    fn rejects_pixel_representation_outside_zero_and_one() {
+        let mut raw = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            1,
+            8,
+            1,
+            None,
+            1,
+        );
+        raw.insert_value(Tag::PIXEL_REPRESENTATION, 2u16);
+        PixelData::create_new(&mut raw)
+            .unwrap()
+            .add_frame([7])
+            .unwrap();
+        let source = PixelDataRef::from_dataset(&raw).unwrap();
+        let mut compressed = dataset(syntaxes::RLE_LOSSLESS.clone(), 1, 1, 8, 1, None, 1);
+        let mut target = PixelData::create_new(&mut compressed).unwrap();
+        let error = RleLosslessCodec
+            .encode(&source, &mut target, &CodecParams::None)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("PixelRepresentation 2"),
+            "{error}"
+        );
+        assert!(!compressed.contains(&Tag::PIXEL_DATA));
+    }
+
+    #[test]
+    fn encodes_encapsulated_16_bit_pixel_data_as_ob() {
+        let frame = vec![0x12, 0x34, 0xAB, 0xCD];
+        let (actual, compressed) = round_trip(1, 2, 16, 1, None, std::slice::from_ref(&frame));
+        assert_eq!(actual, vec![frame]);
+        let item = compressed.item(&Tag::PIXEL_DATA).expect("pixel data");
+        assert!(matches!(item, DicomItem::Fragments(_)), "{item:?}");
+        assert_eq!(item.vr(), Vr::Ob);
+    }
+
+    #[test]
+    fn round_trips_fifteen_segments() {
+        let frame: Vec<u8> = (0..60).map(|value| value as u8).collect();
+        let (actual, compressed) = round_trip(2, 2, 8, 15, None, std::slice::from_ref(&frame));
+        assert_eq!(actual, vec![frame]);
+        let view = PixelDataRef::from_dataset(&compressed).unwrap();
+        let frame = view.get_frame(0).unwrap();
+        let bytes = frame.data().unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 15);
+    }
+
+    #[test]
+    fn rejects_sixteen_segments() {
+        let mut raw = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            1,
+            8,
+            16,
+            None,
+            1,
+        );
+        PixelData::create_new(&mut raw)
+            .unwrap()
+            .add_frame([0u8; 16])
+            .unwrap();
+        let source = PixelDataRef::from_dataset(&raw).unwrap();
+        let mut compressed = dataset(syntaxes::RLE_LOSSLESS.clone(), 1, 1, 8, 16, None, 1);
+        let mut target = PixelData::create_new(&mut compressed).unwrap();
+        let error = RleLosslessCodec
+            .encode(&source, &mut target, &CodecParams::None)
+            .unwrap_err();
+        assert!(error.to_string().contains("segment count 16"), "{error}");
+        assert!(!compressed.contains(&Tag::PIXEL_DATA));
+    }
+
+    #[test]
+    fn rejects_a_declared_frame_size_before_allocating_it() {
+        let mut compressed = dataset(syntaxes::RLE_LOSSLESS.clone(), 1000, 1000, 8, 1, None, 1);
+        {
+            let mut frame = vec![0u8; 64];
+            frame[0] = 1;
+            frame[4] = 64;
+            frame.extend_from_slice(&[0x00, 0x2a]);
+            PixelData::create_new(&mut compressed)
+                .unwrap()
+                .add_frame(frame)
+                .unwrap();
+        }
+        let source = PixelDataRef::from_dataset(&compressed).unwrap();
+        let mut decoded = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1000,
+            1000,
+            8,
+            1,
+            None,
+            1,
+        );
+        let mut target = PixelData::create_new(&mut decoded).unwrap();
+        let error = RleLosslessCodec
+            .decode(&source, &mut target, &CodecParams::None)
+            .unwrap_err();
+        assert!(error.to_string().contains("expansion"), "{error}");
+        assert!(!decoded.contains(&Tag::PIXEL_DATA));
+    }
+
+    #[test]
+    fn does_not_append_a_first_frame_when_a_later_frame_fails() {
+        let mut first = vec![0u8; 68];
+        first[0] = 1;
+        first[4] = 64;
+        first[64..].copy_from_slice(&[2, 1, 2, 3]);
+        let mut compressed = dataset(syntaxes::RLE_LOSSLESS.clone(), 1, 3, 8, 1, None, 2);
+        {
+            let mut pixels = PixelData::create_new(&mut compressed).unwrap();
+            pixels.add_frame(first).unwrap();
+            pixels.add_frame(vec![0u8; 10]).unwrap();
+        }
+        let source = PixelDataRef::from_dataset(&compressed).unwrap();
+        let mut decoded = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            3,
+            8,
+            1,
+            None,
+            2,
+        );
+        let mut target = PixelData::create_new(&mut decoded).unwrap();
+        let error = RleLosslessCodec
+            .decode(&source, &mut target, &CodecParams::None)
+            .unwrap_err();
+        assert!(error.to_string().contains("frame 1"), "{error}");
         assert!(!decoded.contains(&Tag::PIXEL_DATA));
     }
 }

@@ -157,9 +157,6 @@ impl Siz {
         if xtsiz == 0 || ytsiz == 0 || xtosiz > xosiz || ytosiz > yosiz {
             return Err("invalid tile bounds".into());
         }
-        if xtsiz > xsiz - xosiz || ytsiz > ysiz - yosiz {
-            return Err("tile size exceeds image".into());
-        }
         let mut comps = Vec::with_capacity(usize::from(csiz));
         for _ in 0..csiz {
             let ssiz = c.u8()?;
@@ -168,8 +165,8 @@ impl Siz {
             if xrsiz == 0 || yrsiz == 0 {
                 return Err("zero component subsampling".into());
             }
-            if (ssiz & 0x7F) + 1 > 38 {
-                return Err("component precision exceeds 38 bits".into());
+            if (ssiz & 0x7F) + 1 > 31 {
+                return Err("component precision exceeds 31 bits".into());
             }
             comps.push(SizComp { ssiz, xrsiz, yrsiz });
         }
@@ -510,6 +507,27 @@ impl Quantization {
     }
 }
 
+/// CAP `Ccap` value for an HTJ2K codestream. OpenJPH writes the magnitude
+/// bound `B` of its default step table, which is `precision + 2` for both the
+/// reversible and the irreversible transform; bit 5 marks the irreversible
+/// transform and the low five bits carry the bound bucket. fo-dicom writes
+/// 0x0002 (8-bit lossless), 0x000A (16-bit lossless) and 0x002A (16-bit lossy).
+pub(crate) fn cap_ccap(precision: u8, reversible: bool) -> u16 {
+    let magnitude_bound = u32::from(precision) + 2;
+    let bucket = if magnitude_bound <= 8 {
+        0
+    } else if magnitude_bound < 28 {
+        magnitude_bound - 8
+    } else {
+        13 + (magnitude_bound >> 2)
+    };
+    let mut ccap = (bucket as u16) & 0x1F;
+    if !reversible {
+        ccap |= 0x20;
+    }
+    ccap
+}
+
 /// Parsed main header (SOC through the last main-header marker).
 #[derive(Debug, Clone)]
 pub(crate) struct MainHeader {
@@ -518,8 +536,8 @@ pub(crate) struct MainHeader {
     pub(crate) cocs: Vec<Coc>,
     pub(crate) qcd: Quantization,
     pub(crate) qccs: Vec<(u16, Quantization)>,
-    #[allow(dead_code)]
-    pub(crate) tile_part_offsets: Vec<(u32, u64)>,
+    /// A CAP segment was present (used by the HTJ2K profile).
+    pub(crate) cap: bool,
 }
 
 impl MainHeader {
@@ -533,7 +551,7 @@ impl MainHeader {
         let mut cocs = Vec::new();
         let mut qcd = None;
         let mut qccs = Vec::new();
-        let mut tile_part_offsets = Vec::new();
+        let mut cap = false;
         loop {
             let marker = c.marker()?;
             match marker {
@@ -576,10 +594,13 @@ impl MainHeader {
                     qccs.push((component, Quantization::parse(&payload[offset..])?));
                 }
                 TLM => {
-                    let payload = c.segment()?;
-                    parse_tlm(payload, &mut tile_part_offsets)?;
+                    // There is no consumer for the tile-part length table: the
+                    // tile stream is walked through its SOT segments. Only the
+                    // bounded segment length is validated.
+                    c.segment()?;
                 }
                 CAP => {
+                    cap = true;
                     c.segment()?;
                 }
                 COM => {
@@ -591,7 +612,7 @@ impl MainHeader {
                 SOT => {
                     // SOT has a fixed 10-byte length and belongs to the tile
                     // stream, so rewind and hand control to the caller.
-                    return finish_header(c, siz, cod, cocs, qcd, qccs, tile_part_offsets);
+                    return finish_header(c, siz, cod, cocs, qcd, qccs, cap);
                 }
                 EOC => return Err("codestream has no tile data".into()),
                 other => {
@@ -616,6 +637,61 @@ impl MainHeader {
             .map(|coc| &coc.style)
             .unwrap_or(&self.cod.style)
     }
+
+    /// Applies one marker from a tile-part header (T.800 A.4.2). Tile-part
+    /// values replace the main-header value for the same component.
+    pub(crate) fn apply_tile_part_header(
+        &mut self,
+        marker: u16,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let components = self.siz.comps.len();
+        match marker {
+            COC => {
+                let coc = Coc::parse(payload, components)?;
+                if coc.style.decompositions != self.cod.style.decompositions {
+                    return Err("per-component decomposition levels are not supported".into());
+                }
+                if coc.style.code_block_width != self.cod.style.code_block_width
+                    || coc.style.code_block_height != self.cod.style.code_block_height
+                {
+                    return Err("per-component code-block sizes are not supported".into());
+                }
+                self.cocs
+                    .retain(|existing| existing.component != coc.component);
+                self.cocs.push(coc);
+            }
+            QCC => {
+                let mut c = Cursor::new(payload);
+                let component = component_index(&mut c, components)?;
+                let offset = c.position();
+                let quantization = Quantization::parse(&payload[offset..])?;
+                let levels = self
+                    .cocs
+                    .iter()
+                    .find(|coc| coc.component == component)
+                    .map(|coc| coc.style.decompositions)
+                    .unwrap_or(self.cod.style.decompositions);
+                let required = if quantization.style == 1 {
+                    1
+                } else {
+                    crate::quantization::subband_count(levels)
+                };
+                if quantization.steps.len() < required {
+                    return Err(
+                        "QCC has fewer steps than the decomposition level count requires".into(),
+                    );
+                }
+                self.qccs.retain(|(existing, _)| *existing != component);
+                self.qccs.push((component, quantization));
+            }
+            // Comment, packet-length and packed packet headers do not affect
+            // this decoder; their lengths are validated by the caller.
+            COM | PLT | PPT => {}
+            other => return Err(format!("unsupported tile-part header marker 0x{other:04X}")),
+        }
+        Ok(())
+    }
 }
 
 fn finish_header(
@@ -625,7 +701,7 @@ fn finish_header(
     cocs: Vec<Coc>,
     qcd: Option<Quantization>,
     qccs: Vec<(u16, Quantization)>,
-    tile_part_offsets: Vec<(u32, u64)>,
+    cap: bool,
 ) -> Result<(MainHeader, usize), String> {
     let siz = siz.ok_or("missing SIZ marker")?;
     let cod = cod.ok_or("missing COD marker")?;
@@ -678,40 +754,10 @@ fn finish_header(
             cocs,
             qcd,
             qccs,
-            tile_part_offsets,
+            cap,
         },
         position,
     ))
-}
-
-fn parse_tlm(payload: &[u8], out: &mut Vec<(u32, u64)>) -> Result<(), String> {
-    let mut c = Cursor::new(payload);
-    let _ztlm = c.u8()?;
-    let stlm = c.u8()?;
-    let st = usize::from((stlm >> 4) & 0x03);
-    let sp = usize::from((stlm >> 6) & 0x01);
-    let length_bytes = (sp + 1) * 2;
-    let entry_size = st + length_bytes;
-    if entry_size == 0 {
-        return Err("invalid TLM entry size".into());
-    }
-    while c.remaining() >= entry_size {
-        let index = if st == 0 {
-            out.len() as u32
-        } else {
-            let mut value = 0u32;
-            for _ in 0..st {
-                value = (value << 8) | u32::from(c.u8()?);
-            }
-            value
-        };
-        let mut length = 0u64;
-        for _ in 0..length_bytes {
-            length = (length << 8) | u64::from(c.u8()?);
-        }
-        out.push((index, length));
-    }
-    Ok(())
 }
 
 /// Tile-part header returned by the tile scanner.
@@ -755,10 +801,11 @@ pub(crate) fn write_sod(out: &mut Vec<u8>) {
     out.extend_from_slice(&SOD.to_be_bytes());
 }
 
-pub(crate) fn write_cap(out: &mut Vec<u8>) {
+pub(crate) fn write_cap(out: &mut Vec<u8>, ccap: u16) {
     out.extend_from_slice(&CAP.to_be_bytes());
     out.extend_from_slice(&8u16.to_be_bytes());
-    out.extend_from_slice(&[0x00, 0x02, 0x00, 0x00, 0x00, 0x02]);
+    out.extend_from_slice(&[0x00, 0x02, 0x00, 0x00]); // Pcap: JPH capability bit 15
+    out.extend_from_slice(&ccap.to_be_bytes());
 }
 
 /// Writes a single-entry tile-part length table: `Ztlm = 1`, `Stlm` carries
@@ -943,7 +990,7 @@ mod tests {
         let mut components =
             crate::codestream::build_components(&samples, width as i32, height as i32, 8, false, 2)
                 .unwrap();
-        crate::codestream::encode(&mut components, true).unwrap()
+        crate::codestream::encode_with_mct(&mut components, true, false).unwrap()
     }
 
     /// Inserts marker segments directly after the SIZ segment (SOC is two
@@ -965,5 +1012,55 @@ mod tests {
         write_soc(&mut bytes);
         sample_siz().write(&mut bytes);
         assert!(MainHeader::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn cap_ccap_matches_the_fo_dicom_reference_values() {
+        assert_eq!(cap_ccap(8, true), 0x0002);
+        assert_eq!(cap_ccap(12, true), 0x0006);
+        assert_eq!(cap_ccap(16, true), 0x000A);
+        assert_eq!(cap_ccap(8, false), 0x0022);
+        assert_eq!(cap_ccap(16, false), 0x002A);
+    }
+
+    #[test]
+    fn siz_precision_is_limited_to_31_bits() {
+        let mut siz = sample_siz();
+        siz.comps[0].ssiz = 30; // 31-bit samples
+        let mut bytes = Vec::new();
+        siz.write(&mut bytes);
+        assert!(Siz::parse(&bytes[4..]).is_ok());
+        siz.comps[0].ssiz = 31; // 32-bit samples
+        let mut bytes = Vec::new();
+        siz.write(&mut bytes);
+        let error = Siz::parse(&bytes[4..]).unwrap_err();
+        assert!(error.contains("precision"), "{error}");
+    }
+
+    #[test]
+    fn a_cap_segment_is_recorded_on_the_main_header() {
+        let stream = sample_codestream();
+        let mut cap = Vec::new();
+        write_cap(&mut cap, 0x0002);
+        let patched = insert_after_siz(&stream, &[cap]);
+        let (header, _) = MainHeader::parse(&patched).unwrap();
+        assert!(header.cap);
+        assert!(!MainHeader::parse(&stream).unwrap().0.cap);
+    }
+
+    #[test]
+    fn a_41_byte_siz_with_maximum_dimensions_is_stopped_by_the_sample_cap() {
+        let mut siz = sample_siz();
+        siz.xsiz = 65535;
+        siz.ysiz = 65535;
+        siz.xtsiz = 65535;
+        siz.ytsiz = 65535;
+        let mut bytes = Vec::new();
+        siz.write(&mut bytes);
+        assert_eq!(bytes.len(), 43, "SIZ segment is 41 bytes plus the marker");
+        let parsed = Siz::parse(&bytes[4..]).unwrap();
+        assert_eq!((parsed.xsiz, parsed.ysiz), (65535, 65535));
+        let error = crate::geometry::checked_area(65535, 65535).unwrap_err();
+        assert!(error.contains("sample count"), "{error}");
     }
 }

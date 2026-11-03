@@ -145,6 +145,10 @@ impl LosslessFrame {
             output.write_segment(Marker::Sos, &sos_payload(scan, predictor, point_transform)?)?;
             let mut entropy = BitWriter::default();
             let mut restart_index = 0u8;
+            // T.81 G.1.2: the first row of a scan or restart interval uses the
+            // one-dimensional predictor (libjpeg's first-row undifferencer), so
+            // every interval needs its own first row, not just the first sample.
+            let mut interval_start_row = 0usize;
             for pixel in 0..self.width * self.height {
                 let x = pixel % self.width;
                 let y = pixel / self.width;
@@ -156,6 +160,7 @@ impl LosslessFrame {
                     output_bytes(&mut output, entropy.take_bytes());
                     output.write_marker(Marker::Restart(restart_index))?;
                     restart_index = (restart_index + 1) & 7;
+                    interval_start_row = y;
                 }
                 for &component in scan {
                     let index = pixel * usize::from(self.components) + usize::from(component);
@@ -170,7 +175,7 @@ impl LosslessFrame {
                         usize::from(component),
                         predictor,
                         initial,
-                        restart_pixel,
+                        y == interval_start_row,
                     );
                     let difference = encode_difference(shifted - prediction, effective_precision);
                     let category = category(difference);
@@ -226,12 +231,17 @@ impl LosslessFrame {
                             return Err("codestream layout does not match destination".to_owned());
                         }
                     }
-                    let expected = width
-                        .checked_mul(height)
-                        .and_then(|pixels| pixels.checked_mul(usize::from(components)))
-                        .ok_or_else(|| "JPEG sample count overflows usize".to_owned())?;
-                    samples = allocate_samples(expected)?;
-                    shifted_samples = allocate_samples(expected)?;
+                    let count = (width as u64) * (height as u64) * u64::from(components);
+                    if count > crate::MAX_DECODED_SAMPLES {
+                        return Err(format!(
+                            "JPEG SOF3 declares {count} samples, above the {} sample limit",
+                            crate::MAX_DECODED_SAMPLES
+                        ));
+                    }
+                    let count = usize::try_from(count)
+                        .map_err(|_| "JPEG sample count overflows usize".to_owned())?;
+                    samples = allocate_samples(count)?;
+                    shifted_samples = allocate_samples(count)?;
                     header = Some((width, height, precision, components, component_ids));
                 }
                 Marker::Dht => parse_dht(&payload, &mut tables)?,
@@ -325,6 +335,10 @@ fn decode_scan(
         .ok_or_else(|| "JPEG sample count overflows usize".to_owned())?;
     let stride = usize::from(components);
     let mut restart_index = 0u8;
+    // Each interval gets its own first row: libjpeg restores the first-row
+    // undifferencer in process_restart (jddiffct.c), so the one-dimensional
+    // predictor covers the whole row after a restart marker.
+    let mut interval_start_row = 0usize;
     for mcu in 0..mcus {
         let x = mcu % width;
         let y = mcu / width;
@@ -342,6 +356,7 @@ fn decode_scan(
                 ));
             }
             restart_index = (restart_index + 1) & 7;
+            interval_start_row = y;
         }
         for &(component, table) in &scan.components {
             let huffman = tables[usize::from(table)]
@@ -358,7 +373,7 @@ fn decode_scan(
                 usize::from(component),
                 scan.predictor,
                 initial,
-                restart,
+                y == interval_start_row,
             );
             let category = huffman.decode(&mut bits)?;
             if category > effective_precision + 1 {
@@ -482,8 +497,9 @@ fn parse_dht(payload: &[u8], tables: &mut [Option<HuffmanTable>; 4]) -> Result<(
     while position < payload.len() {
         let info = payload[position];
         position += 1;
-        if info >> 4 != 0 {
-            return Err("JPEG lossless only supports DC Huffman tables".to_owned());
+        let class = info >> 4;
+        if class > 1 {
+            return Err(format!("JPEG Huffman table class {class} is invalid"));
         }
         let id = usize::from(info & 0x0f);
         if id > 3 {
@@ -503,7 +519,12 @@ fn parse_dht(payload: &[u8], tables: &mut [Option<HuffmanTable>; 4]) -> Result<(
             .get(position..position + total)
             .ok_or_else(|| "JPEG DHT payload has an invalid symbol count".to_owned())?;
         position += total;
-        tables[id] = Some(HuffmanTable::new(counts, values)?);
+        let table = HuffmanTable::new(counts, values)?;
+        // Lossless scans only reference DC tables; an AC table in the DHT
+        // segment is legal (T.81 B.2.4.2) and simply unused.
+        if class == 0 {
+            tables[id] = Some(table);
+        }
     }
     if tables.iter().all(Option::is_none) {
         return Err("JPEG lossless stream has no DC Huffman table".to_owned());
@@ -637,9 +658,8 @@ fn predict(
     component: usize,
     predictor: u8,
     initial: i32,
-    reset: bool,
+    first_row: bool,
 ) -> i32 {
-    let first_row = reset || y == 0;
     let stride = usize::from(components);
     if first_row {
         return if x == 0 {
@@ -748,6 +768,65 @@ mod tests {
             .windows(2)
             .any(|window| (0xd0..=0xd7).contains(&window[1])));
         assert_eq!(decode_any(&encoded).unwrap(), frame);
+    }
+
+    /// Hand-computed T.81 G.1.2 fixture: 2x2, 8-bit, predictor 4, DRI=2 (one
+    /// MCU row). Samples are 10 20 / 30 40, initial predictor `1<<7` = 128.
+    /// Row 0 is the first row of the scan: x0 codes 10-128 = -118, x1 codes
+    /// 20-10 = 10. RST0. Row 1 is the first row of the next interval: x0 codes
+    /// 30-128 = -98 and x1 codes 40-30 = 10. DCMTK 3.7.1 decodes these bytes to
+    /// exactly those four samples.
+    ///
+    /// The point of the fixture is that the second row does *not* use the 2-D
+    /// predictor (which would code x1 as 40-(30+20-10)=0): a decoder that only
+    /// restarts the predictor for the first pixel diverges here.
+    const P4_DRI2_FIXTURE: &[u8] = &[
+        0xff, 0xd8, 0xff, 0xc3, 0x00, 0x0b, 0x08, 0x00, 0x02, 0x00, 0x02, 0x01, 0x01, 0x11, 0x00,
+        0xff, 0xc4, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0xff, 0xdd, 0x00, 0x04, 0x00, 0x02, 0xff,
+        0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x04, 0x00, 0x00, 0x38, 0x92, 0x57, 0xff, 0xd0, 0x39,
+        0xd2, 0x57, 0xff, 0xd9,
+    ];
+
+    #[test]
+    fn restarts_use_the_scan_first_row_for_the_whole_interval() {
+        let frame = LosslessFrame::new(2, 2, 8, 1, vec![10, 20, 30, 40]).unwrap();
+        // Encoder: the stream must be the reference codestream byte for byte.
+        assert_eq!(frame.encode(4, 0, Some(2)).unwrap(), P4_DRI2_FIXTURE);
+        // Decoder: the reference codestream must reconstruct the samples.
+        assert_eq!(decode_any(P4_DRI2_FIXTURE).unwrap().samples, frame.samples);
+    }
+
+    #[test]
+    fn accepts_unused_ac_huffman_tables() {
+        let frame = sample_frame(8, 1);
+        let encoded = frame.encode(4, 0, None).unwrap();
+        let sos = encoded
+            .windows(2)
+            .position(|window| window == [0xff, 0xda])
+            .unwrap();
+        // One AC table (class 1, id 0) with a single code of length 1.
+        let dht = [0x10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00];
+        let mut stream = Vec::with_capacity(encoded.len() + dht.len() + 4);
+        stream.extend_from_slice(&encoded[..sos]);
+        stream.extend_from_slice(&[0xff, 0xc4, 0x00, dht.len() as u8 + 2]);
+        stream.extend_from_slice(&dht);
+        stream.extend_from_slice(&encoded[sos..]);
+        assert_eq!(decode_any(&stream).unwrap(), frame);
+    }
+
+    #[test]
+    fn rejects_an_oversized_sof3_before_allocating() {
+        let mut stream = MarkerWriter::default();
+        stream.write_marker(Marker::Soi).unwrap();
+        // 65535x65535 single component: 4.29e9 samples, well above 1<<28.
+        stream
+            .write_segment(Marker::Sof3, &[8, 0xff, 0xff, 0xff, 0xff, 1, 1, 0x11, 0])
+            .unwrap();
+        stream.write_marker(Marker::Eoi).unwrap();
+        let error = decode_any(&stream.into_bytes()).unwrap_err();
+        assert!(error.contains("sample limit"), "{error}");
     }
 
     #[test]

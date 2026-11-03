@@ -403,6 +403,9 @@ pub(crate) fn decode(
     if source_ybr && layout.signed {
         return Err("signed YBR_FULL samples are unsupported".into());
     }
+    // Reject an oversized declared frame before any plane or sample buffer is
+    // allocated (design §10).
+    crate::checked_sample_count(layout.width, layout.height, layout.components as usize)?;
     let DecodedPlanes {
         planes,
         geometry,
@@ -444,7 +447,7 @@ fn decode_planes(
         return Err("codestream layout does not match destination".into());
     }
     let first = &h.scans[0];
-    if first.scan.point_transform != 0 || first.scan.near > layout.maxval() / 2 {
+    if first.scan.point_transform != 0 {
         return Err("unsupported JPEG-LS scan parameters".into());
     }
     if expected_near.is_some_and(|near| first.scan.near != near) {
@@ -453,9 +456,6 @@ fn decode_planes(
     if first.scan.ilv > 2 || first.scan.ilv != 0 && layout.components == 1 {
         return Err("invalid JPEG-LS interleave mode".into());
     }
-    let preset = h
-        .preset
-        .unwrap_or(Preset::defaults(layout.maxval(), first.scan.near)?);
     let geometry = plane_geometry(&h.frame, &h.sampling)?;
     if first.scan.ilv == 2
         && geometry
@@ -477,13 +477,13 @@ fn decode_planes(
                 width: plane_grid.columns,
                 height: plane_grid.lines,
                 components: 1,
-                maxval: preset.maxval,
+                maxval: entry.preset.maxval,
                 near: first.scan.near,
                 ilv: 0,
-                preset,
+                preset: entry.preset,
             };
             planes[entry.component] =
-                decode_scan(cfg, &data[entry.start..entry.end], h.restart_interval)?;
+                decode_scan(cfg, &data[entry.start..entry.end], entry.restart_interval)?;
         }
         planes
     } else if first.scan.ilv == 1 && layout.components > 1 {
@@ -493,10 +493,10 @@ fn decode_planes(
             width: layout.width,
             height: layout.height,
             components: layout.components as usize,
-            maxval: preset.maxval,
+            maxval: entry.preset.maxval,
             near: first.scan.near,
             ilv: 1,
-            preset,
+            preset: entry.preset,
         };
         let planes: Vec<(usize, usize, usize)> = geometry
             .iter()
@@ -506,19 +506,19 @@ fn decode_planes(
             cfg,
             &planes,
             &data[entry.start..entry.end],
-            h.restart_interval,
+            entry.restart_interval,
         )?
     } else {
         let cfg = ScanConfig {
             width: layout.width,
             height: layout.height,
             components: layout.components as usize,
-            maxval: preset.maxval,
+            maxval: entry.preset.maxval,
             near: first.scan.near,
             ilv: first.scan.ilv,
-            preset,
+            preset: entry.preset,
         };
-        let samples = decode_scan(cfg, &data[entry.start..entry.end], h.restart_interval)?;
+        let samples = decode_scan(cfg, &data[entry.start..entry.end], entry.restart_interval)?;
         let components = layout.components as usize;
         (0..components)
             .map(|index| {
@@ -821,6 +821,112 @@ mod tests {
     }
 
     #[test]
+    fn tolerates_zero_padding_before_eoi() {
+        let mut layout = mono8();
+        layout.width = 4;
+        layout.height = 1;
+        layout.frame_len = 4;
+        let raw = [3u8, 91, 200, 17];
+        let encoded = encode(&layout, &raw, &JpegLsParams::default()).unwrap();
+        let eoi = encoded.len() - 2;
+        let mut padded = encoded[..eoi].to_vec();
+        padded.extend([0, 0xff, 0xd9]);
+        assert_eq!(
+            decode(&layout, &padded, &JpegLsParams::default(), Some(0), false).unwrap(),
+            raw
+        );
+        // Only zero padding is tolerated; another entropy byte is an error.
+        let mut bad = encoded[..eoi].to_vec();
+        bad.extend([1, 0xff, 0xd9]);
+        assert!(decode(&layout, &bad, &JpegLsParams::default(), Some(0), false).is_err());
+    }
+
+    #[test]
+    fn rejects_a_scan_point_transform_but_ignores_the_ah_nibble() {
+        let layout = mono8();
+        let encoded = encode(&layout, &[7], &JpegLsParams::default()).unwrap();
+        // SOS payload: Ns, component id, mapping, NEAR, ILV, Ah|Al.
+        let sos = encoded
+            .windows(2)
+            .position(|window| window == [0xff, 0xda])
+            .unwrap();
+        let point = sos + 4 + 5;
+        let mut substituted = encoded.clone();
+        substituted[point] = 1; // Al = 1
+        assert!(
+            decode(&layout, &substituted, &JpegLsParams::default(), None, false)
+                .unwrap_err()
+                .contains("unsupported JPEG-LS scan parameters")
+        );
+        // T.87 C.2.3 ignores Ah; only Al matters.
+        substituted[point] = 0xf0;
+        assert!(decode(&layout, &substituted, &JpegLsParams::default(), None, false).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_declared_frame_above_the_sample_limit() {
+        // `65535 x 65535 x 3` is 12.8 GiB of samples from a 40-byte
+        // codestream; the guard must fire before any plane is allocated.
+        let layout = rgb_layout(65535, 65535, 8, 8);
+        let frame = FrameHeader {
+            precision: 8,
+            width: 65535,
+            height: 65535,
+            components: 3,
+        };
+        let mut encoded = Vec::new();
+        write_soi(&mut encoded);
+        write_sof55(&mut encoded, &frame).unwrap();
+        write_sos(&mut encoded, 3, 0, 2).unwrap();
+        write_eoi(&mut encoded);
+        let error = decode(&layout, &encoded, &JpegLsParams::default(), None, false).unwrap_err();
+        assert!(error.contains("sample limit"), "{error}");
+    }
+
+    #[test]
+    fn mutations_of_multiscan_and_restart_streams_never_panic() {
+        let mut layout = rgb_layout(2, 2, 8, 8);
+        layout.frame_len = 12;
+        let raw: Vec<u8> = (0..12).map(|i| (i * 23 + 3) as u8).collect();
+        let streams = [1u32, 2].map(|mode| {
+            encode(
+                &layout,
+                &raw,
+                &JpegLsParams {
+                    interleave_mode: mode,
+                    restart_interval: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        });
+        for stream in streams {
+            for end in 0..stream.len() {
+                let result = std::panic::catch_unwind(|| {
+                    decode(
+                        &layout,
+                        &stream[..end],
+                        &JpegLsParams::default(),
+                        None,
+                        false,
+                    )
+                });
+                assert!(result.is_ok(), "truncation at {end}");
+            }
+            for index in 0..stream.len() {
+                for value in [0x00, 0x01, 0x7f, 0x80, 0xff] {
+                    let mut bytes = stream.clone();
+                    bytes[index] = value;
+                    let result = std::panic::catch_unwind(|| {
+                        decode(&layout, &bytes, &JpegLsParams::default(), None, false)
+                    });
+                    assert!(result.is_ok(), "index={index} value={value}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn decodes_a_scan_split_by_restart_markers() {
         use crate::{marker::write_dri, scan::encode_restart_scan};
         let mut layout = mono8();
@@ -869,6 +975,144 @@ mod tests {
         no_dri.extend(&entropy);
         write_eoi(&mut no_dri);
         assert!(decode(&layout, &no_dri, &JpegLsParams::default(), Some(0), false).is_err());
+    }
+
+    #[test]
+    fn a_dri_between_scans_applies_to_the_following_scan() {
+        use crate::{
+            marker::{write_dri, write_sof55, write_soi, write_sos_ids},
+            scan::{encode_restart_scan, encode_scan},
+        };
+        let layout = rgb_layout(2, 2, 8, 8);
+        let raw = [10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let preset = Preset::defaults(255, 0).unwrap();
+        let cfg = ScanConfig {
+            width: 2,
+            height: 2,
+            components: 1,
+            maxval: 255,
+            near: 0,
+            ilv: 0,
+            preset,
+        };
+        let plane = |component: usize| -> Vec<u16> {
+            (0..12)
+                .step_by(3)
+                .map(|index| u16::from(raw[index + component]))
+                .collect()
+        };
+        let first = encode_scan(cfg, &plane(0)).unwrap();
+        // The middle plane has two lines (one MCU each), so interval 1
+        // inserts one restart marker; the DRI also applies to the last scan.
+        let second = encode_restart_scan(cfg, &plane(1), 1).unwrap();
+        let third = encode_restart_scan(cfg, &plane(2), 1).unwrap();
+        let frame = FrameHeader {
+            precision: 8,
+            width: 2,
+            height: 2,
+            components: 3,
+        };
+        let stream = |with_dri: bool| {
+            let mut encoded = Vec::new();
+            write_soi(&mut encoded);
+            write_sof55(&mut encoded, &frame).unwrap();
+            write_sos_ids(&mut encoded, &[1], 0, 0).unwrap();
+            encoded.extend(&first);
+            if with_dri {
+                write_dri(&mut encoded, 1);
+            }
+            write_sos_ids(&mut encoded, &[2], 0, 0).unwrap();
+            encoded.extend(&second);
+            write_sos_ids(&mut encoded, &[3], 0, 0).unwrap();
+            encoded.extend(&third);
+            write_eoi(&mut encoded);
+            encoded
+        };
+        assert_eq!(
+            decode(
+                &layout,
+                &stream(true),
+                &JpegLsParams::default(),
+                None,
+                false
+            )
+            .unwrap(),
+            raw
+        );
+        // Without the DRI the restart marker in the second scan is illegal,
+        // which proves the between-scan DRI reached that scan.
+        assert!(decode(
+            &layout,
+            &stream(false),
+            &JpegLsParams::default(),
+            None,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_lse_between_scans_applies_to_the_following_scans() {
+        use crate::{
+            marker::{write_eoi, write_sof55, write_soi, write_sos_ids},
+            scan::encode_scan,
+        };
+        let layout = rgb_layout(2, 2, 8, 8);
+        let raw = [3u8, 7, 1, 12, 4, 9, 0, 15, 6, 2, 11, 13];
+        let plane = |component: usize| -> Vec<u16> {
+            (0..12)
+                .step_by(3)
+                .map(|index| u16::from(raw[index + component]))
+                .collect()
+        };
+        let cfg = |preset: Preset| ScanConfig {
+            width: 2,
+            height: 2,
+            components: 1,
+            maxval: preset.maxval,
+            near: 0,
+            ilv: 0,
+            preset,
+        };
+        let defaults = Preset::defaults(255, 0).unwrap();
+        // MAXVAL 15 changes the Golomb parameters, so a decoder that ignores
+        // the LSE cannot decode the last two scans.
+        let custom = Preset::defaults(15, 0).unwrap();
+        let frame = FrameHeader {
+            precision: 8,
+            width: 2,
+            height: 2,
+            components: 3,
+        };
+        let mut encoded = Vec::new();
+        write_soi(&mut encoded);
+        write_sof55(&mut encoded, &frame).unwrap();
+        write_sos_ids(&mut encoded, &[1], 0, 0).unwrap();
+        encoded.extend(&encode_scan(cfg(defaults), &plane(0)).unwrap());
+        // LSE id 1: MAXVAL 15; zero fields select the T.87 defaults for it.
+        let lse = [0xff, 0xf8, 0x00, 0x0d, 1, 0, 15, 0, 0, 0, 0, 0, 0, 0, 0];
+        encoded.extend(lse);
+        write_sos_ids(&mut encoded, &[2], 0, 0).unwrap();
+        encoded.extend(&encode_scan(cfg(custom), &plane(1)).unwrap());
+        write_sos_ids(&mut encoded, &[3], 0, 0).unwrap();
+        encoded.extend(&encode_scan(cfg(custom), &plane(2)).unwrap());
+        write_eoi(&mut encoded);
+        assert_eq!(
+            decode(&layout, &encoded, &JpegLsParams::default(), None, false).unwrap(),
+            raw
+        );
+        // Without the LSE the scans no longer decode to the original samples:
+        // the between-scan LSE reached the last two scans.
+        let mut without = encoded.clone();
+        let at = without
+            .windows(2)
+            .position(|window| window == [0xff, 0xf8])
+            .unwrap();
+        without.drain(at..at + lse.len());
+        assert!(
+            decode(&layout, &without, &JpegLsParams::default(), None, false)
+                .map_or(true, |samples| samples != raw)
+        );
     }
 
     #[test]
@@ -1223,15 +1467,26 @@ mod tests {
             false
         )
         .is_ok());
-        let error = decode(
+        // A DRI larger than the MCU count still means one segment.
+        assert!(decode(
             &layout,
-            &with_dri(63),
+            &with_dri(128),
             &JpegLsParams::default(),
             Some(0),
-            false,
+            false
         )
-        .unwrap_err();
-        assert!(error.contains("restart marker count"), "{error}");
+        .is_ok());
+        for interval in [32u16, 63] {
+            let error = decode(
+                &layout,
+                &with_dri(interval),
+                &JpegLsParams::default(),
+                Some(0),
+                false,
+            )
+            .unwrap_err();
+            assert!(error.contains("restart marker count"), "{error}");
+        }
     }
 
     /// Three-component RGB layout with the given allocation.

@@ -1,3 +1,5 @@
+use super::preset::Preset;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FrameHeader {
     pub precision: u8,
@@ -10,6 +12,7 @@ pub(crate) struct ScanHeader {
     pub components: u8,
     pub near: u16,
     pub ilv: u8,
+    /// Point transform `Al`; the `Ah` nibble is ignored (T.87 C.2.3).
     pub point_transform: u8,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +24,12 @@ pub(crate) struct ScanEntry {
     pub end: usize,
     /// Component index of a plane-interleaved scan in the frame component order.
     pub component: usize,
+    /// Preset in force for this scan. A later `LSE` replaces the previous one
+    /// and may appear between scans (T.87 C.2.4.1).
+    pub preset: Preset,
+    /// DRI restart interval in force for this scan; a `DRI` between scans
+    /// updates it for the following scans.
+    pub restart_interval: u32,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedHeader {
@@ -30,9 +39,15 @@ pub(crate) struct ParsedHeader {
     /// CharLS colour transform from an APP8 `mrfx` segment; 0 means none.
     pub color_transformation: u8,
     pub scans: Vec<ScanEntry>,
-    pub preset: Option<super::preset::Preset>,
-    /// DRI restart interval counted in MCUs; 0 means no restart markers.
-    pub restart_interval: u32,
+}
+#[derive(Default)]
+struct HeaderState {
+    frame: Option<FrameHeader>,
+    frame_ids: Option<Vec<u8>>,
+    sampling: Option<Vec<(u8, u8)>>,
+    color_transformation: Option<u8>,
+    preset: Option<Preset>,
+    restart_interval: u32,
 }
 fn marker(out: &mut Vec<u8>, code: u8) {
     out.extend([0xff, code]);
@@ -100,48 +115,37 @@ pub(crate) fn write_color_transform(out: &mut Vec<u8>, transform: u8) -> Result<
     }
     segment(out, 0xe8, &[b'm', b'r', b'f', b'x', transform])
 }
-#[allow(unused_assignments)]
-pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
-    if data.get(..2) != Some(&[0xff, 0xd8]) {
-        return Err("missing SOI".into());
+/// Reads one marker at `p` (which must point at the `0xFF` start byte),
+/// skipping fill bytes. Returns the marker code and the position after it.
+fn read_marker(data: &[u8], p: usize) -> Result<(u8, usize), String> {
+    if data.get(p) != Some(&0xff) {
+        return Err("expected marker".into());
     }
-    let mut p = 2;
-    let mut frame = None;
-    let mut frame_ids: Option<Vec<u8>> = None;
-    let mut sampling_factors: Option<Vec<(u8, u8)>> = None;
-    let mut color_transformation: Option<u8> = None;
-    let mut preset = None;
-    let mut restart_interval = 0u32;
-    let mut first_sos = None;
-    loop {
-        if p + 2 > data.len() {
-            return Err("truncated marker".into());
-        }
-        if data[p] != 0xff {
-            return Err("expected marker".into());
-        }
-        while p < data.len() && data[p] == 0xff {
-            p += 1
-        }
-        let code = *data.get(p).ok_or("truncated marker code")?;
-        p += 1;
-        if code == 0xd9 {
-            return Err("missing SOS".into());
-        }
-        if code == 0xda {
-            first_sos = Some(p);
-            break;
-        }
-        let n = u16::from_be_bytes([
-            *data.get(p).ok_or("truncated segment")?,
-            *data.get(p + 1).ok_or("truncated segment")?,
-        ]) as usize;
-        p += 2;
-        if n < 2 {
-            return Err("invalid segment length".into());
-        }
-        let end = p.checked_add(n - 2).ok_or("segment overflow")?;
-        let q = data.get(p..end).ok_or("truncated segment payload")?;
+    let mut q = p;
+    while q < data.len() && data[q] == 0xff {
+        q += 1;
+    }
+    let code = *data.get(q).ok_or("truncated marker code")?;
+    Ok((code, q + 1))
+}
+
+/// Reads a marker segment's length and payload; returns `(payload, next)`.
+fn read_segment_payload(data: &[u8], p: usize) -> Result<(&[u8], usize), String> {
+    let n = u16::from_be_bytes([
+        *data.get(p).ok_or("truncated segment")?,
+        *data.get(p + 1).ok_or("truncated segment")?,
+    ]) as usize;
+    if n < 2 {
+        return Err("invalid segment length".into());
+    }
+    let start = p + 2;
+    let end = start.checked_add(n - 2).ok_or("segment overflow")?;
+    let q = data.get(start..end).ok_or("truncated segment payload")?;
+    Ok((q, end))
+}
+
+impl HeaderState {
+    fn apply(&mut self, code: u8, q: &[u8]) -> Result<(), String> {
         match code {
             0xf7 => {
                 if q.len() < 6 {
@@ -179,12 +183,12 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
                     }
                     sampling.push((hs, vs));
                 }
-                if frame.is_some() {
+                if self.frame.is_some() {
                     return Err("duplicate SOF55".into());
                 }
-                frame_ids = Some(ids);
-                sampling_factors = Some(sampling);
-                frame = Some(f)
+                self.frame_ids = Some(ids);
+                self.sampling = Some(sampling);
+                self.frame = Some(f)
             }
             0xf8 => {
                 if q.len() != 11 || q[0] != 1 {
@@ -197,10 +201,10 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
                     u16::from_be_bytes([q[7], q[8]]),
                     u16::from_be_bytes([q[9], q[10]]),
                 ];
-                if preset.is_some() {
-                    return Err("duplicate LSE".into());
-                }
-                preset = Some(super::preset::Preset {
+                // T.87 C.2.4.1: a later specification for the same table id
+                // replaces the previous one; the LSE may appear before any
+                // scan, including between scans.
+                self.preset = Some(Preset {
                     maxval: vals[0],
                     t1: vals[1],
                     t2: vals[2],
@@ -215,27 +219,53 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
                 if q[4] > 3 {
                     return Err("unknown JPEG-LS color transformation".into());
                 }
-                if color_transformation.is_some_and(|value| value != q[4]) {
+                if self.color_transformation.is_some_and(|value| value != q[4]) {
                     return Err("conflicting JPEG-LS color transformation".into());
                 }
-                color_transformation = Some(q[4]);
+                self.color_transformation = Some(q[4]);
             }
             // T.87 C.2.5: the restart interval is carried in 2, 3 or 4 bytes.
             0xdd => {
                 if !(2..=4).contains(&q.len()) {
                     return Err("invalid DRI segment".into());
                 }
-                restart_interval = q.iter().fold(0u32, |v, b| (v << 8) | u32::from(*b));
+                self.restart_interval = q.iter().fold(0u32, |v, b| (v << 8) | u32::from(*b));
             }
             0xe0..=0xef | 0xfe => {}
             _ => return Err(format!("unsupported marker ff{code:02x}")),
         }
-        p = end
+        Ok(())
     }
-    let frame = frame.ok_or("missing SOF55")?;
-    let frame_ids = frame_ids.ok_or("missing SOF55")?;
-    let sampling = sampling_factors.ok_or("missing SOF55")?;
-    let color_transformation = color_transformation.unwrap_or(0);
+}
+
+/// Parses the codestream header and every scan header.
+///
+/// Marker segments are accepted where T.81 B.2.4.1 allows tables and
+/// miscellaneous segments, including between scans; an LSE or DRI found there
+/// applies to the following scans (T.87 C.2.4.1, C.2.5).
+pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
+    if data.get(..2) != Some(&[0xff, 0xd8]) {
+        return Err("missing SOI".into());
+    }
+    let mut state = HeaderState::default();
+    let mut p = 2usize;
+    // Header segments before the first scan: SOF55, LSE, DRI, APPn and COM.
+    let mut at = loop {
+        let (code, after_code) = read_marker(data, p)?;
+        match code {
+            0xd9 => return Err("missing SOS".into()),
+            0xda => break after_code,
+            _ => {
+                let (q, end) = read_segment_payload(data, after_code)?;
+                state.apply(code, q)?;
+                p = end;
+            }
+        }
+    };
+    let frame = state.frame.ok_or("missing SOF55")?;
+    let frame_ids = state.frame_ids.take().ok_or("missing SOF55")?;
+    let sampling = state.sampling.take().ok_or("missing SOF55")?;
+    let color_transformation = state.color_transformation.unwrap_or(0);
     if color_transformation != 0 && frame.components != 3 {
         return Err("color transformation requires three components".into());
     }
@@ -244,25 +274,46 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
         return Err("color transformation requires 8 or 16 bit precision".into());
     }
 
-    // Each SOS opens a scan whose entropy ends at the next SOS or EOI. T.87
-    // B.4 allows one scan per component (plane interleaved) or a single
-    // interleaved scan for all components.
+    // Each SOS opens a scan whose entropy ends at the next marker. T.87 B.4
+    // allows one scan per component (plane interleaved) or a single interleaved
+    // scan for all components. Marker segments may sit between scans (T.81
+    // B.2.4.1); they update the header state for the following scans.
+    let maximum = ((1u32 << frame.precision) - 1) as u16;
     let mut scans = Vec::new();
-    let mut at = first_sos.ok_or("missing SOS")?;
     loop {
         let (scan, ids, after) = read_sos(data, at)?;
-        let (end, next, code_at) = scan_end(data, after)?;
+        let preset = match state.preset {
+            Some(raw) => raw.resolve(maximum, scan.near)?,
+            None => Preset::defaults(maximum, scan.near)?,
+        };
+        let restart_interval = state.restart_interval;
+        let (end, _code, marker_at) = scan_end(data, after)?;
         scans.push(ScanEntry {
             scan,
             ids,
             start: after,
             end,
             component: 0,
+            preset,
+            restart_interval,
         });
-        if next == 0xd9 {
-            break;
+        let mut next_sos = None;
+        let mut p = marker_at;
+        loop {
+            let (next, after_code) = read_marker(data, p)?;
+            if next == 0xd9 {
+                break;
+            }
+            if next == 0xda {
+                next_sos = Some(after_code);
+                break;
+            }
+            let (q, end) = read_segment_payload(data, after_code)?;
+            state.apply(next, q)?;
+            p = end;
         }
-        at = code_at + 1;
+        let Some(next) = next_sos else { break };
+        at = next;
     }
 
     let (near, ilv, point_transform) = {
@@ -308,23 +359,30 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
         if first.ids != frame_ids {
             return Err("SOS component ids do not match SOF55".into());
         }
-        // T.87 C.2.3: sample interleaving is allowed only when every component
-        // in the scan has the same number of columns and lines.
-        if ilv == 2 && sampling.iter().any(|factor| *factor != sampling[0]) {
-            return Err("sample interleaving requires equal component dimensions".into());
+        // T.87 C.2.3: sample interleaving is allowed only when the components
+        // have an identical number of columns and lines. Comparing the
+        // sampling factors is not enough: with a 1-pixel dimension, different
+        // factors still produce the same plane size.
+        if ilv == 2 {
+            let hmax = u32::from(sampling.iter().map(|f| f.0).max().unwrap_or(1));
+            let vmax = u32::from(sampling.iter().map(|f| f.1).max().unwrap_or(1));
+            let plane = |(hs, vs): &(u8, u8)| {
+                (
+                    (u32::from(frame.width) * u32::from(*hs)).div_ceil(hmax),
+                    (u32::from(frame.height) * u32::from(*vs)).div_ceil(vmax),
+                )
+            };
+            let first = plane(&sampling[0]);
+            if sampling.iter().any(|factor| plane(factor) != first) {
+                return Err("sample interleaving requires equal component dimensions".into());
+            }
         }
     }
-    let maximum = ((1u32 << frame.precision) - 1) as u16;
-    let preset = preset
-        .map(|value| value.resolve(maximum, near))
-        .transpose()?;
     Ok(ParsedHeader {
         frame,
         sampling,
         color_transformation,
         scans,
-        preset,
-        restart_interval,
     })
 }
 
@@ -370,16 +428,19 @@ fn read_sos(data: &[u8], p: usize) -> Result<(ScanHeader, Vec<u8>, usize), Strin
         components: ns,
         near: u16::from(q[base]),
         ilv,
-        point_transform: q[base + 2],
+        // T.87 C.2.3 ignores the high nibble (`Ah`); only the point transform
+        // `Al` has meaning, and it must be zero for the supported process.
+        point_transform: q[base + 2] & 0x0f,
     };
     Ok((scan, ids, end))
 }
 
 /// Finds the marker that ends the entropy starting at `start`.
 ///
-/// Returns `(entropy_end, marker_code, marker_code_index)`. A `0xFF` followed
-/// by a high-bit-clear byte is bit-stuffed data (T.87 C.2), not a marker, and
-/// `RSTm` beats stay inside the scan.
+/// Returns `(entropy_end, marker_code, marker_start)`. A `0xFF` followed by a
+/// high-bit-clear byte is bit-stuffed data (T.87 C.2), not a marker, and
+/// `RSTm` beats stay inside the scan. Any other marker ends the scan; the
+/// caller decides whether it is SOS/EOI or a segment between scans.
 fn scan_end(data: &[u8], start: usize) -> Result<(usize, u8, usize), String> {
     let mut i = start;
     while i < data.len() {
@@ -392,7 +453,7 @@ fn scan_end(data: &[u8], start: usize) -> Result<(usize, u8, usize), String> {
             j += 1
         }
         let c = *data.get(j).ok_or("truncated scan marker")?;
-        if c == 0 || c & 0x80 == 0 {
+        if c & 0x80 == 0 {
             i = j + 1;
             continue;
         }
@@ -400,12 +461,9 @@ fn scan_end(data: &[u8], start: usize) -> Result<(usize, u8, usize), String> {
             i = j + 1;
             continue;
         }
-        if c == 0xd9 || c == 0xda {
-            // All consecutive 0xff bytes before the marker code are fill
-            // bytes, so none belong to the entropy payload.
-            return Ok((i, c, j));
-        }
-        return Err(format!("unexpected marker ff{c:02x} in scan"));
+        // All consecutive 0xff bytes before the marker code are fill bytes,
+        // so none belong to the entropy payload.
+        return Ok((i, c, i));
     }
     Err("missing EOI".into())
 }
@@ -547,7 +605,7 @@ mod tests {
     fn resolves_zero_lse_fields_and_checks_near_thresholds() {
         let p = [1, 0, 255, 0, 0, 0, 0, 0, 0, 0, 8];
         let parsed = parse_header(&header_with_segments(&[(0xf8, &p)], 3)).unwrap();
-        let preset = parsed.preset.unwrap();
+        let preset = parsed.scans[0].preset;
         assert_eq!(
             [preset.t1, preset.t2, preset.t3, preset.reset],
             [12, 22, 42, 8]
@@ -584,12 +642,20 @@ mod tests {
         assert_eq!(parsed.scans[0].end, scan_start + 1);
     }
 
-    /// Minimal codestream with explicit `(horizontal, vertical)` sampling
-    /// factors, one interleaved scan and no entropy.
-    fn header_with_sampling(sampling: &[(u8, u8)], ilv: u8) -> Vec<u8> {
+    /// Minimal codestream with an explicit size, `(horizontal, vertical)` sampling
+    /// factors, one scan and no entropy.
+    fn header_with_sampling_size(
+        width: u16,
+        height: u16,
+        sampling: &[(u8, u8)],
+        ilv: u8,
+    ) -> Vec<u8> {
         let mut bytes = Vec::new();
         write_soi(&mut bytes);
-        let mut payload = vec![8, 0, 1, 0, 1, sampling.len() as u8];
+        let mut payload = vec![8];
+        payload.extend(height.to_be_bytes());
+        payload.extend(width.to_be_bytes());
+        payload.push(sampling.len() as u8);
         for (index, (hs, vs)) in sampling.iter().enumerate() {
             payload.extend([index as u8 + 1, (hs << 4) | vs, 0]);
         }
@@ -597,6 +663,10 @@ mod tests {
         write_sos(&mut bytes, sampling.len() as u8, 0, ilv).unwrap();
         bytes.extend([0x00, 0xff, 0xd9]);
         bytes
+    }
+
+    fn header_with_sampling(sampling: &[(u8, u8)], ilv: u8) -> Vec<u8> {
+        header_with_sampling_size(1, 1, sampling, ilv)
     }
 
     #[test]
@@ -621,13 +691,109 @@ mod tests {
     #[test]
     fn rejects_sample_interleaving_of_unequal_components() {
         // T.87 C.2.3: sample interleaving needs identical columns and lines.
-        assert!(
-            parse_header(&header_with_sampling(&[(2, 4), (2, 1), (1, 2)], 2))
-                .unwrap_err()
-                .contains("sample interleaving requires equal component dimensions")
-        );
+        assert!(parse_header(&header_with_sampling_size(
+            4,
+            4,
+            &[(2, 4), (2, 1), (1, 2)],
+            2
+        ))
+        .unwrap_err()
+        .contains("sample interleaving requires equal component dimensions"));
         // Line interleaving carries sub-sampled components, so it stays legal.
-        assert!(parse_header(&header_with_sampling(&[(2, 4), (2, 1), (1, 2)], 1)).is_ok());
+        assert!(parse_header(&header_with_sampling_size(
+            4,
+            4,
+            &[(2, 4), (2, 1), (1, 2)],
+            1
+        ))
+        .is_ok());
+        // With a 1-pixel dimension the plane sizes coincide even though the
+        // sampling factors differ; the check must compare dimensions.
+        assert!(parse_header(&header_with_sampling(&[(2, 4), (1, 1), (1, 1)], 2)).is_ok());
+    }
+
+    fn sos_offsets(bytes: &[u8]) -> Vec<usize> {
+        bytes
+            .windows(2)
+            .enumerate()
+            .filter(|(_, window)| window[0] == 0xff && window[1] == 0xda)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// T.87 C.2.4.1: repeated LSE specifications replace the previous one; the
+    /// last LSE before a scan decides its thresholds, and an LSE may appear
+    /// between scans.
+    #[test]
+    fn a_later_lse_replaces_the_previous_one() {
+        let lse = |t1: u16| {
+            let mut q = vec![1u8, 0, 0];
+            for value in [t1, 9, 21] {
+                q.extend(value.to_be_bytes());
+            }
+            q.extend(0u16.to_be_bytes());
+            q
+        };
+        // Two LSEs before the first scan: the second wins.
+        let repeated = header_with_segments(&[(0xf8, &lse(5)[..]), (0xf8, &lse(7)[..])], 0);
+        assert_eq!(parse_header(&repeated).unwrap().scans[0].preset.t1, 7);
+
+        // An LSE between scans applies to the following scans only.
+        let base = multi_scan(&[&[1], &[2], &[3]], 0, 0);
+        let sos = sos_offsets(&base);
+        let mut inserted = base[..sos[1]].to_vec();
+        segment(&mut inserted, 0xf8, &lse(7)).unwrap();
+        inserted.extend(&base[sos[1]..]);
+        let parsed = parse_header(&inserted).unwrap();
+        assert_eq!(parsed.scans[0].preset.t1, 3);
+        assert_eq!(parsed.scans[1].preset.t1, 7);
+        assert_eq!(parsed.scans[2].preset.t1, 7);
+
+        // A replacement is still validated after the overwrite.
+        assert!(
+            parse_header(&header_with_segments(&[(0xf8, &lse(200)[..])], 0))
+                .unwrap_err()
+                .contains("invalid JPEG-LS preset")
+        );
+    }
+
+    /// T.81 B.2.4.1 allows tables and miscellaneous marker segments between
+    /// scans; a DRI found there applies to the following scans.
+    #[test]
+    fn accepts_segments_between_scans_and_updates_the_restart_interval() {
+        let base = multi_scan(&[&[1], &[2], &[3]], 0, 0);
+        let sos = sos_offsets(&base);
+        let mut bytes = base[..sos[1]].to_vec();
+        segment(&mut bytes, 0xe1, &[0, 0]).unwrap();
+        segment(&mut bytes, 0xfe, b"between scans").unwrap();
+        segment(&mut bytes, 0xdd, &[0, 7]).unwrap();
+        bytes.extend(&base[sos[1]..sos[2]]);
+        segment(&mut bytes, 0xe1, &[1, 2, 3]).unwrap();
+        bytes.extend(&base[sos[2]..]);
+        let parsed = parse_header(&bytes).unwrap();
+        assert_eq!(parsed.scans.len(), 3);
+        assert_eq!(parsed.scans[0].restart_interval, 0);
+        assert_eq!(parsed.scans[1].restart_interval, 7);
+        assert_eq!(parsed.scans[2].restart_interval, 7);
+    }
+
+    /// T.87 C.2.3 ignores the `Ah` nibble; only the `Al` point transform is
+    /// kept (and must be zero for the supported process).
+    #[test]
+    fn ignores_the_sos_ah_nibble() {
+        let mut bytes = header_with_segments(&[], 0);
+        let point_transform = bytes.len() - 3;
+        assert_eq!(&bytes[bytes.len() - 2..], [0xff, 0xd9]);
+        bytes[point_transform] = 0xf0;
+        assert_eq!(
+            parse_header(&bytes).unwrap().scans[0].scan.point_transform,
+            0
+        );
+        bytes[point_transform] = 0x01;
+        assert_eq!(
+            parse_header(&bytes).unwrap().scans[0].scan.point_transform,
+            1
+        );
     }
 
     #[test]
@@ -727,14 +893,17 @@ mod tests {
     #[test]
     fn parses_dri_restart_intervals_of_two_three_and_four_bytes() {
         let two = header_with_segments(&[(0xdd, &[0, 3])], 0);
-        assert_eq!(parse_header(&two).unwrap().restart_interval, 3);
+        assert_eq!(parse_header(&two).unwrap().scans[0].restart_interval, 3);
         let three = header_with_segments(&[(0xdd, &[1, 0, 0])], 0);
-        assert_eq!(parse_header(&three).unwrap().restart_interval, 0x1_0000);
+        assert_eq!(
+            parse_header(&three).unwrap().scans[0].restart_interval,
+            0x1_0000
+        );
         let four = header_with_segments(&[(0xdd, &[0, 0, 0, 7])], 0);
-        assert_eq!(parse_header(&four).unwrap().restart_interval, 7);
+        assert_eq!(parse_header(&four).unwrap().scans[0].restart_interval, 7);
         // Zero disables restarts and an impossible length is rejected.
         let zero = header_with_segments(&[(0xdd, &[0, 0])], 0);
-        assert_eq!(parse_header(&zero).unwrap().restart_interval, 0);
+        assert_eq!(parse_header(&zero).unwrap().scans[0].restart_interval, 0);
         let short = header_with_segments(&[(0xdd, &[3])], 0);
         assert!(parse_header(&short).is_err());
         let long = header_with_segments(&[(0xdd, &[0, 0, 0, 0, 3])], 0);

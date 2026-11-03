@@ -571,6 +571,9 @@ pub(crate) fn decode_scan(
     scan: &[u8],
     restart_interval: u32,
 ) -> Result<Vec<u16>, String> {
+    // Also reached through decoded scan configs; reject oversized buffers
+    // before the sample vector is allocated (design §10).
+    crate::checked_sample_count(c.width, c.height, c.components)?;
     if c.components == 0 || c.components > 3 || c.ilv > 2 {
         return Err("unsupported interleave mode".into());
     }
@@ -986,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_entropy_bytes_after_the_expected_samples() {
+    fn decoder_rejects_trailing_entropy_data_but_tolerates_zero_padding() {
         let preset = Preset::defaults(255, 0).unwrap();
         let cfg = ScanConfig {
             width: 1,
@@ -998,9 +1001,14 @@ mod tests {
             preset,
         };
         let values = [7u16];
+        // A non-zero byte after the expected samples is undecoded entropy.
         let mut encoded = encode_scan(cfg, &values).unwrap();
-        encoded.push(0);
+        encoded.push(1);
         assert!(decode_scan(cfg, &encoded, 0).is_err());
+        // A zero byte is the padding fo-dicom/CharLS leave before the marker.
+        let mut padded = encode_scan(cfg, &values).unwrap();
+        padded.push(0);
+        assert_eq!(decode_scan(cfg, &padded, 0).unwrap(), values);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use radicom::error::Error;
 use radicom::io::file::DicomFile;
 use radicom::model::transfer_syntax::TransferSyntax;
-use radicom::pixel::codec::{CodecParams, J2kParams};
+use radicom::pixel::codec::CodecParams;
 use radicom::pixel::PIXEL_DATA;
 
 /// One compression target.
@@ -88,13 +88,9 @@ pub fn target_formats() -> Vec<TargetFormat> {
             "JPEG 2000 Lossy",
             "j2k_lossy",
             syntaxes::JPEG_2000_LOSSY.clone(),
-            // Mirrors the reference tool's lossy parameter choice. The classic
-            // encoder currently emits one layer and ignores `rate`.
-            Some(CodecParams::Jpeg2000(J2kParams {
-                irreversible: true,
-                rate: 16,
-                ..J2kParams::default()
-            })),
+            // The classic encoder emits one fixed-quality layer; non-default
+            // `rate`/`rate_levels` are rejected, so use the codec defaults.
+            None,
         ),
         format(
             "HTJ2K Lossless",

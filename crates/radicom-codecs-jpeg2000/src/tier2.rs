@@ -605,6 +605,9 @@ pub(crate) fn decode_packets(
             });
         }
     }
+    if offset != data.len() {
+        return Err("tile data has trailing bytes".into());
+    }
     Ok(())
 }
 

@@ -38,6 +38,8 @@ fn frame_bytes(dataset: &Dataset, index: u32) -> Vec<u8> {
 fn ht_params(progression_order: ProgressionOrder) -> CodecParams {
     CodecParams::HtJpeg2000(HtJ2kParams {
         irreversible: false,
+        // These tests exercise the no-MCT path; the codec default is MCT.
+        employ_color_transform: false,
         progression_order,
         ..Default::default()
     })
@@ -224,7 +226,85 @@ fn rgb_without_color_transform_round_trips_exactly() {
     assert_eq!(frame_bytes(&decoded, 0), raw);
 }
 #[test]
-fn honour_decomposition_level_parameter() {
+fn transcodes_multiple_frames() {
+    let _ = radicom_codecs::install();
+    let first: Vec<u8> = (0..24 * 16).map(|i| (i * 11 + 1) as u8).collect();
+    let second: Vec<u8> = (0..24 * 16).map(|i| (i * 23 + 5) as u8).collect();
+    let mut source = source_dataset(24, 16, 8, 1, false, "MONOCHROME2");
+    {
+        let mut pixel = PixelData::create_new(&mut source).unwrap();
+        pixel.add_frame(&first).unwrap();
+        pixel.add_frame(&second).unwrap();
+    }
+    let compressed = source
+        .clone_with_syntax(
+            syntaxes::HTJ2K_LOSSLESS.clone(),
+            Some(ht_params(ProgressionOrder::Lrcp)),
+        )
+        .unwrap();
+    let decoded = compressed
+        .clone_with_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(), None)
+        .unwrap();
+    assert_eq!(frame_bytes(&decoded, 0), first);
+    assert_eq!(frame_bytes(&decoded, 1), second);
+}
+
+#[test]
+fn encapsulated_16_bit_pixel_data_uses_ob() {
+    let _ = radicom_codecs::install();
+    let raw: Vec<u8> = (0..16 * 12).flat_map(|v: u16| v.to_le_bytes()).collect();
+    let mut source = source_dataset(16, 12, 16, 1, false, "MONOCHROME2");
+    PixelData::create_new(&mut source)
+        .unwrap()
+        .add_frame(&raw)
+        .unwrap();
+    let compressed = source
+        .clone_with_syntax(
+            syntaxes::HTJ2K_LOSSLESS.clone(),
+            Some(ht_params(ProgressionOrder::Lrcp)),
+        )
+        .unwrap();
+    match compressed.item(&Tag::PIXEL_DATA).unwrap() {
+        radicom::model::item::DicomItem::Fragments(sequence) => {
+            assert_eq!(sequence.vr(), Vr::Ob)
+        }
+        other => panic!("expected a fragment sequence, got {other:?}"),
+    }
+    let decoded = compressed
+        .clone_with_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(), None)
+        .unwrap();
+    assert_eq!(frame_bytes(&decoded, 0), raw);
+}
+
+#[test]
+fn pcrl_and_cprl_progressions_are_rejected() {
+    let _ = radicom_codecs::install();
+    let raw: Vec<u8> = (0..16 * 12).map(|i| (i * 3 + 1) as u8).collect();
+    for progression_order in [ProgressionOrder::Pcrl, ProgressionOrder::Cprl] {
+        let mut source = source_dataset(16, 12, 8, 1, false, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let error = source
+            .clone_with_syntax(
+                syntaxes::HTJ2K_LOSSLESS_RPCL.clone(),
+                Some(CodecParams::HtJpeg2000(HtJ2kParams {
+                    irreversible: false,
+                    progression_order,
+                    ..Default::default()
+                })),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("PCRL"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn honours_decomposition_level_parameter() {
     let _ = radicom_codecs::install();
     let raw: Vec<u8> = (0..24 * 16).map(|i| (i * 17 + 9) as u8).collect();
     for decompositions in [0u32, 1, 3] {

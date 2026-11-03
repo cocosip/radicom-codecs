@@ -205,7 +205,7 @@ impl Tier1Encoder {
                         .encode(significant, zero_context(flags, self.orientation));
                     self.flags[index] |= VISITED;
                     if significant {
-                        self.set_significant(x, y, index);
+                        self.set_significant(x, y, index, false);
                     }
                 }
             }
@@ -283,7 +283,7 @@ impl Tier1Encoder {
                             .encode(significant, zero_context(flags, self.orientation));
                     }
                     if significant {
-                        self.set_significant(x, y, index);
+                        self.set_significant(x, y, index, self.style & 0x20 != 0);
                     }
                     self.flags[index] &= !VISITED;
                 }
@@ -291,11 +291,17 @@ impl Tier1Encoder {
         }
     }
 
-    fn set_significant(&mut self, x: usize, y: usize, index: usize) {
+    fn set_significant(&mut self, x: usize, y: usize, index: usize, uniform_sign: bool) {
         let sign = self.data[index] < 0;
-        let context = sign_context(self.flags[index]);
-        let prediction = sign_prediction(self.flags[index]);
-        self.mq.encode(sign ^ prediction, context);
+        if uniform_sign {
+            // SEGSYM: signs of coefficients that become significant in the
+            // cleanup pass use the uniform context, without prediction.
+            self.mq.encode(sign, CTX_UNIFORM);
+        } else {
+            let context = sign_context(self.flags[index]);
+            let prediction = sign_prediction(self.flags[index]);
+            self.mq.encode(sign ^ prediction, context);
+        }
         if sign {
             self.flags[index] |= SIGN;
         }
@@ -343,6 +349,7 @@ struct Tier1Decoder {
     orientation: u8,
     style: u8,
     bit_plane: i32,
+    in_cleanup: bool,
 }
 
 impl Tier1Decoder {
@@ -356,6 +363,7 @@ impl Tier1Decoder {
             orientation,
             style,
             bit_plane: 0,
+            in_cleanup: false,
         }
     }
 
@@ -402,12 +410,9 @@ impl Tier1Decoder {
                 0 => self.decode_sigpass(&mut mq, &mut raw, lazy),
                 1 => self.decode_refpass(&mut mq, &mut raw, lazy),
                 _ => {
+                    self.in_cleanup = true;
                     self.decode_cleanup(&mut mq)?;
-                    if self.style & 0x20 != 0 {
-                        for _ in 0..4 {
-                            let _ = mq.decode(CTX_UNIFORM);
-                        }
-                    }
+                    self.in_cleanup = false;
                 }
             }
             if self.style & 0x02 != 0 && !lazy {
@@ -543,6 +548,13 @@ impl Tier1Decoder {
     }
 
     fn set_significant_mq(&mut self, x: usize, y: usize, index: usize, mq: &mut MqDecoder<'_>) {
+        if self.style & 0x20 != 0 && self.in_cleanup {
+            // SEGSYM: signs of coefficients that become significant in the
+            // cleanup pass are coded with the uniform context.
+            let sign_bit = mq.decode(CTX_UNIFORM);
+            self.set_significant_value(x, y, index, sign_bit);
+            return;
+        }
         let sign_bit =
             mq.decode(sign_context(self.flags[index])) ^ sign_prediction(self.flags[index]);
         self.set_significant_value(x, y, index, sign_bit);
@@ -822,6 +834,35 @@ mod tests {
         let encoded = encode_code_block(&[0i32; 16], 4, 4, 0, 0).unwrap();
         assert_eq!(encoded.pass_count, 0);
         assert!(encoded.data.is_empty());
+    }
+
+    #[test]
+    fn reset_vertical_causal_and_sign_segment_styles_round_trip() {
+        for style in [0x02u8, 0x08, 0x20, 0x02 | 0x20] {
+            for (width, height, orientation) in [(13, 9, 3), (32, 24, 1), (17, 17, 0)] {
+                let values = pattern(width, height);
+                let coefficients: Vec<i32> = values.iter().map(|v| v * 64).collect();
+                let encoded =
+                    encode_code_block(&coefficients, width, height, orientation, style).unwrap();
+                let segment = crate::geometry::CodeBlockSegment {
+                    data: encoded.data.clone(),
+                    pass_count: encoded.pass_count,
+                };
+                let decoded = decode_code_block(
+                    &[segment],
+                    width,
+                    height,
+                    orientation,
+                    encoded.max_bit_plane,
+                    style,
+                )
+                .unwrap();
+                assert_eq!(
+                    decoded, values,
+                    "style=0x{style:02X} {width}x{height} orient={orientation}"
+                );
+            }
+        }
     }
 
     #[test]

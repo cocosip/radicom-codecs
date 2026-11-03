@@ -211,6 +211,22 @@ The core `PixelData` implementation owns encapsulation fragments and DICOM
 even-length padding, so codec implementations must keep logical codestream length
 separate from DICOM padding.
 
+### 8.1 Multi-frame metadata ordering
+
+A codec that rewrites a metadata value used by the frame-size calculation must
+do so **before** it appends any decoded frame. `PixelData::add_frame` places
+frame `n` at `n * uncompressed_frame_size()` using the dataset metadata at that
+moment and trims the previous frame to that boundary. `uncompressed_frame_size()`
+depends on `PhotometricInterpretation` when the layout is subsampled:
+`YBR_FULL_422` is two bytes per pixel, while the RGB result of a converted decode
+is three. Updating `PhotometricInterpretation` to `RGB` after the append loop
+therefore leaves frame 2 at a two-thirds offset: a two-frame 4x4 decode holds 80
+bytes instead of 96 and `get_frame(1)` fails. A codec that converts
+`YBR_FULL`/`YBR_FULL_422` to RGB, or that changes `BitsAllocated` or the planar
+layout, updates the destination metadata before the first `add_frame`.
+Encoding may update metadata after appending because encapsulated fragments are
+positioned by their own lengths, not by `uncompressed_frame_size()`.
+
 `HighBit` is read but never shifts samples. PS3.3 requires
 `HighBit = BitsStored - 1`, so conforming frames are right-justified inside
 `BitsStored` and the adapter masks to `BitsStored`, exactly like libjpeg, CharLS,
@@ -237,6 +253,50 @@ No codec may panic on malformed input. Native libraries, P/Invoke, build scripts
 that compile C/C++, runtime native fallback, and vendored third-party codec
 engines are forbidden.
 
+### 9.1 Decode allocation limits
+
+A decode path must reject an implausible declared frame before allocating it.
+The unified caps apply per frame (not per dataset):
+
+| Family | Unified cap |
+| --- | --- |
+| RLE | `frame_length <= 128 * (payload_len - 64)` and `<= 1 GiB` |
+| JPEG | `width * height * samples_per_pixel <= 2^28` samples |
+| JPEG-LS | `width * height * samples_per_pixel <= 2^28` samples |
+| JPEG 2000 / HTJ2K | sum of all component samples `<= 2^28` |
+
+The `128x` RLE factor is the PackBits maximum expansion: one input control byte
+can produce at most 128 output bytes, so a 64-byte-header payload cannot expand
+past that bound. JPEG's `u16` SOF dimensions do not bound a frame on their own
+(65535 x 65535 is far above `2^28` samples). Exceeding a cap returns
+`Error::Codec` with the codec, operation, and declared size; the decoder must not
+allocate the declared frame first. Checked `usize`/`u64` arithmetic is necessary
+but not sufficient, because a valid yet huge declaration still exhausts memory.
+Each family document records the constant name and the exact error text.
+
+### 9.2 Trailing bytes after the codestream
+
+After the final EOI/EOC marker a decoder accepts at most one trailing `0x00`
+byte — the DICOM even-length pad — and nothing else. JPEG-LS additionally
+accepts one `0x00` between the last scan and EOI, as T.87 padding allows. Any
+other trailing byte returns `Error::Codec`. Silently ignoring trailing data
+would accept spliced or concatenated codestreams that the DICOM single-frame
+fragment model does not represent, and would hide a misaligned fragment
+boundary.
+
+### 9.3 Unimplemented parameters
+
+A parameter must never be silently ignored. If a field is exposed but the
+implementation cannot honor a non-default value, the codec returns `Error::Codec`
+naming the codec, the operation, the field, and the value. Default values keep
+the documented default behavior. Examples: `J2kParams::rate` and `rate_levels`
+default to `20` and an empty list (the single-layer default); a non-default rate
+is an explicit "not implemented" error until multi-layer rate control exists.
+`encode_signed_as_unsigned = true` is rejected explicitly. Layout and colour
+fields (`allow_mct`, `update_photometric_interpretation`,
+`employ_color_transform`) must change the codestream and metadata, or be
+rejected; they are never accepted and ignored.
+
 ## 10. Verification and compatibility gates
 
 Every family has four test layers:
@@ -262,6 +322,35 @@ Acceptance rules are:
   managed error behavior;
 - all registry rows: both `can_transcode(raw, compressed)` and
   `can_transcode(compressed, raw)` are true after registration.
+
+### 10.1 Interop harnesses (development-only, git-ignored)
+
+The C# oracles and the Rust harness live under `.interop/` and are not part of
+the published crates. The harness pins the same `radicom = "0.1.0"` registry
+version as the workspace; pointing it at a local `radicom` checkout gives the
+dependency graph two incompatible `radicom` versions and breaks the `Codec`
+trait impls.
+
+```powershell
+dotnet build .interop/dicomref/dicomref.csproj
+dotnet build -c Release .interop/j2k-oracle/j2k-oracle.csproj
+cargo build --manifest-path .interop/rustharness/Cargo.toml
+cargo build -p radicom-codecs-jpeg2000 --example j2k_tool
+bash .interop/run_matrix.sh
+bash .interop/run_extra.sh
+pwsh .interop/run-j2k-interop.ps1
+pwsh .interop/run-ht-interop.ps1
+```
+
+`run_matrix.sh` and `run_extra.sh` drive `.interop/rustharness` against
+`.interop/dicomref`; the two `pwsh` scripts drive the J2K/HT examples against
+`.interop/j2k-oracle`. Both shell scripts read some fixtures from an external
+`fo-dicom.Codecs/Tests/Acceptance` checkout (`$FIX` at the top of the script);
+when that tree is absent those entries are skipped, not silently passed.
+
+Older family-document revisions quote `node .interop/matrix.js` or
+`node .interop/dicom-matrix.js`. Those JavaScript matrices are not part of this
+repository; the commands above are the supported way to reproduce the matrices.
 
 ## 11. Implementation order and release boundary
 

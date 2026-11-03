@@ -211,6 +211,34 @@ pub(crate) struct PrecinctBand {
     pub(crate) code_blocks: Vec<CodeBlock>,
 }
 
+/// Upper bound for the number of samples of one image (all components
+/// together), checked before any per-component allocation.
+pub(crate) const MAX_SAMPLES: u64 = 1 << 28;
+
+/// Validates an image area and returns it as a sample count.
+pub(crate) fn checked_area(width: u64, height: u64) -> Result<u64, String> {
+    let area = width
+        .checked_mul(height)
+        .ok_or_else(|| "image area overflows".to_string())?;
+    if area > MAX_SAMPLES {
+        return Err("image exceeds the supported sample count".into());
+    }
+    Ok(area)
+}
+
+/// Validates the total sample count of a multi-component image. Every
+/// component has the full image area because subsampling is rejected.
+pub(crate) fn checked_total(width: u64, height: u64, components: usize) -> Result<u64, String> {
+    let area = checked_area(width, height)?;
+    let total = area
+        .checked_mul(components as u64)
+        .ok_or_else(|| "image sample count overflows".to_string())?;
+    if total > MAX_SAMPLES {
+        return Err("image exceeds the supported sample count".into());
+    }
+    Ok(area)
+}
+
 /// One component of one tile.
 #[derive(Debug, Clone)]
 pub(crate) struct Component {
@@ -241,8 +269,9 @@ impl Component {
         levels: i32,
         precision: u8,
         signed: bool,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        let area = checked_area(width.max(0) as u64, height.max(0) as u64)?;
+        Ok(Self {
             index,
             x0,
             y0,
@@ -251,12 +280,12 @@ impl Component {
             levels,
             precision,
             signed,
-            coefficients: vec![0; (width.max(0) * height.max(0)) as usize],
+            coefficients: vec![0; area as usize],
             irreversible: None,
             samples: Vec::new(),
             float_samples: None,
             bands: BTreeMap::new(),
-        }
+        })
     }
 
     #[cfg(test)]
@@ -551,7 +580,7 @@ mod tests {
 
     #[test]
     fn builds_single_precinct_code_blocks() {
-        let mut c = Component::new(0, 0, 0, 65, 49, 2, 8, false);
+        let mut c = Component::new(0, 0, 0, 65, 49, 2, 8, false).unwrap();
         c.build_code_blocks(64, 64, None).unwrap();
         assert_eq!(c.precincts(0), vec![0]);
         assert_eq!(c.precincts(2), vec![0]);
@@ -562,9 +591,23 @@ mod tests {
 
     #[test]
     fn multi_precinct_geometry_is_supported() {
-        let mut c = Component::new(0, 0, 0, 128, 128, 1, 8, false);
+        let mut c = Component::new(0, 0, 0, 128, 128, 1, 8, false).unwrap();
         c.build_code_blocks(32, 32, Some(&[(5, 5), (5, 5)]))
             .unwrap();
         assert!(c.precincts(1).len() > 1);
+    }
+
+    #[test]
+    fn oversized_geometry_is_rejected_before_allocation() {
+        assert!(Component::new(0, 0, 0, 65535, 65535, 5, 8, false).is_err());
+        assert!(checked_total(65535, 65535, 3).is_err());
+        assert!(checked_total(16384, 16384, 1).is_ok());
+        assert!(checked_total(16384, 16384, 2).is_err());
+    }
+
+    #[test]
+    fn precinct_exponent_beyond_the_standard_is_rejected() {
+        let mut c = Component::new(0, 0, 0, 32, 32, 0, 8, false).unwrap();
+        assert!(c.build_code_blocks(64, 64, Some(&[(16, 5)])).is_err());
     }
 }

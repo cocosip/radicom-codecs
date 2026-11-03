@@ -27,7 +27,9 @@ performs a read-only assertion before registration.
 All three types implement the existing `Codec` trait and accept only
 `CodecParams::HtJpeg2000(HtJ2kParams)`. `.201/.202` force reversible 5/3,
 `.203` forces irreversible 9/7, and `.202` forces RPCL regardless of a
-caller-supplied progression value.
+caller-supplied progression value. PCRL and CPRL are not implemented: requesting
+them on encode, or decoding a codestream that declares them, fails with an
+explicit error instead of producing packets in the wrong order.
 
 ## DICOM and shared codestream contract
 
@@ -40,13 +42,16 @@ JP2/JPT wrappers, partial YBR, palette/CMYK, unknown photometric
 interpretations, and unsupported Part 2 extensions fail with managed errors.
 
 SIZ width/height, component count, precision, signedness, and decoded byte size
-are checked against the destination before HT decoding. The precision may lie
-between the destination's `BitsStored` and `BitsAllocated`: fo-dicom's OpenJPH
-encoder writes `BitsAllocated` into SIZ for a 12-bit dataset, so the samples are
-re-centred on the destination's level shift, and values that do not fit
-`BitsStored` are refused rather than clamped. The check uses checked arithmetic
-and the actual destination capacity, covering the overrun regression in
-fo-dicom's `HtJpeg2000GeometryUnitTest`.
+are checked against the destination before HT decoding, with checked `u64`
+arithmetic and the shared `1 << 28` sample cap over all components, so a
+malformed maximum-size SIZ is rejected before any allocation. The precision may
+lie between the destination's `BitsStored` and `BitsAllocated`: fo-dicom's
+OpenJPH encoder writes `BitsAllocated` into SIZ for a 12-bit dataset, so unsigned
+samples are re-centred on the destination's level shift; signed samples are not
+level shifted and are only range-checked. Lossless codestreams refuse values
+that do not fit `BitsStored`; irreversible (lossy) reconstruction overshoot is
+clamped. The check uses the actual destination capacity, covering the overrun
+regression in fo-dicom's `HtJpeg2000GeometryUnitTest`.
 
 ## HT block pipeline
 
@@ -62,26 +67,40 @@ code-block style in COD/COC. Each code block is encoded or decoded independently
 6. Tier-2 inclusion/zero-bit-plane tag trees and progression packets.
 
 Classic MQ and HT block coders share no state. The declared code-block style
-selects the coder; the DICOM HTJ2K profiles require HT blocks and reject a
-legacy block style when it is encountered. TLM markers are optional on encode
-and accepted on decode when their bounded lengths and tile-part offsets are
-consistent.
+selects the coder; the DICOM HTJ2K profiles require HT blocks, so a codestream
+without the HT bit, or with any other unsupported style bit, is rejected. The
+HT decoder accepts only RESET/VSC/SEGSYM together with the HT bit. TLM markers
+are optional on encode and accepted on decode when their bounded segment lengths
+are consistent; there is no consumer for the table itself, so its entries are
+validated for length and otherwise ignored. HTJ2K codestreams with explicit
+precinct sizes (`Scod` precinct bit or COC precincts) are rejected instead of
+being silently decoded as one precinct per resolution.
+
+The encoder writes a CAP segment with the profile's `Pcap` and a `Ccap[0]` value
+derived from the declared precision and the transform: `Bp = B - 8` for the
+magnitude bound `B = precision + 2` (bucket 0 when `B <= 8`), with bit 5 set for
+the irreversible transform. This reproduces fo-dicom/OpenJPH's 0x0002 (8-bit
+lossless), 0x000A (16-bit lossless) and 0x002A (16-bit lossy) values.
 
 ## Parameters and progression
 
 `decompositions` selects the DWT level count (0..=32, default 5).
 `employ_color_transform` applies RCT for reversible RGB and ICT for irreversible
-RGB when there are exactly three components; the codec defaults enable it, while
-`HtJ2kParams::default()` in the sibling crate leaves it false. When the
-transform is applied, the encoded dataset is labelled `YBR_RCT` (`.201`/`.202`)
-or `YBR_ICT` (`.203`), as PS3.5 requires for a codestream whose MCT flag is set;
-decoding converts back and labels the native dataset `RGB`. `.202` forces
+RGB when there are exactly three components. The codec `default_params()`
+enables it for fo-dicom/OpenJPH parity. `HtJ2kParams::default()` in radicom
+0.1.0 still has it false; the accompanying core fix changes that default to
+true, and until that release callers should use `default_params()` (or set the
+flag explicitly) when MCT is required. With it enabled, the encoded dataset is
+labelled `YBR_RCT` (`.201`/`.202`) or `YBR_ICT` (`.203`), as PS3.5 requires for
+a codestream whose MCT flag is set; decoding converts back and labels the
+native dataset `RGB`. `.202` forces
 RPCL and validates it on decode; `.201` and `.203` honour the requested
-progression order, with LRCP as the default. `.203` uses OpenJPH's default
-scalar-expounded steps (`baseDelta = 1 / 2^precision`) when `quality` is 0 and
-the fo-dicom quality table for `quality` 1..=100, which is pinned to the
-reference `CreateQualityScalarExpoundedSteps` output. `insert_tlm_markers` emits
-a one-entry TLM before SOT and is accepted and parsed on decode.
+progression order when it is LRCP/RLCP/RPCL, with LRCP as the default, and
+reject PCRL/CPRL. `.203` uses OpenJPH's default scalar-expounded steps
+(`baseDelta = 1 / 2^precision`) when `quality` is 0 and the fo-dicom quality
+table for `quality` 1..=100, which is pinned to the reference
+`CreateQualityScalarExpoundedSteps` output. `insert_tlm_markers` emits a
+one-entry TLM before SOT and is accepted and parsed on decode.
 
 The reference encoder is the native
 `Native/Common/OpenJPH/interface/ojph_interface.cpp`
@@ -115,7 +134,11 @@ a mean-absolute-error tolerance and require a decodable codestream.
 4. Irreversible quantization and `.203` tolerance tests are implemented,
    including OpenJPH-compatible 9/7 analysis and synthesis scaling and the
    explicit quality table.
-5. The fo-dicom.Codecs 5.16.7 DICOM-level matrix (`.interop/dicomref`, C#)
+5. Rejection tests cover PCRL/CPRL encode and decode, unsupported style bits,
+   explicit precinct codestreams, multi-layer codestreams, TLM layout, and
+   Ccap values; signed 12-in-16 decode and multi-frame transcoding are covered
+   through the DICOM adapter.
+6. The fo-dicom.Codecs 5.16.7 DICOM-level matrix (`.interop/dicomref`, C#)
    passes in both directions for mono `.201`/`.202`/`.203` at 8 bits and `.201`
    at 12 bits stored in 16: each codec's decode of the other's codestream is
    sample-exact, and both decoders agree exactly on the same codestream. That

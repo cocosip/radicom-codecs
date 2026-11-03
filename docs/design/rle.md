@@ -150,6 +150,12 @@ byte; the decoder must handle that padding without adding a decoded sample.
 Every encoded segment is padded to an even byte length. The encoder inserts one
 zero byte after an odd-length segment. Segment offsets include that padding.
 
+A frame that is itself odd length is non-conforming: the core/reader applies
+DICOM even-length padding before this codec sees the frame. The RLE layer does
+not try to distinguish that frame-level padding from a logical payload byte,
+because the original length is no longer available here; handling it is the
+core/file layer's responsibility.
+
 ## 5. PackBits segment coding
 
 The segment stream is a sequence of signed 8-bit control values.
@@ -183,8 +189,12 @@ encoder never emits it.
 
 ### 5.4 Encoder packetization
 
-The encoder must use the same deterministic packetization as the existing
-PureCodecs implementation so reference packetization tests remain useful:
+The encoder uses the same deterministic packetization as the existing
+PureCodecs implementation, with one deliberate exception: a one- or two-byte
+run at the end of a segment is emitted as a literal (item 6) instead of a
+repeat. Both forms are valid PackBits and decode identically, but the bytes
+differ from fo-dicom's `Flush` for a two-byte tail. Reference packetization
+tests remain useful for every other input:
 
 1. Delay a repeat run until the next byte is known.
 2. Runs of one or two equal bytes remain in the literal buffer.
@@ -288,11 +298,15 @@ public boundary.
 7. Add one zero byte after every odd-length segment and record the padded offset.
 8. Write the header and append all segments.
 9. After every frame succeeds, append the encoded frames to `dst` with
-   `dst.add_frame` so the core owns encapsulated-fragment padding.
+   `dst.add_frame` so the core owns encapsulated-fragment padding, then set the
+   encapsulated Pixel Data VR to OB as required by PS3.5 8.2.2 (the core
+   initially chooses OW from `BitsAllocated`).
 
 The encoder must not update source metadata. The destination transfer syntax is
 already selected by the caller; if it is not the RLE syntax, return a managed
 metadata error instead of silently writing an RLE frame into another syntax.
+An encapsulated source is rejected as well: the encoder only accepts native
+samples, so the caller must decode a compressed source first.
 
 ## 9. Decode algorithm
 
@@ -314,6 +328,11 @@ bytes, except for `BitsAllocated` 1 where it is
 `ceil(rows * columns * samples_per_pixel / 8)`. `dst.add_frame` handles any final
 DICOM padding and frame storage details.
 
+Before allocating a decoded frame or segment, the decoder rejects a declared
+size above `1 << 30` bytes or above 128 times the compressed payload size. One
+PackBits input byte cannot expand beyond that bound, so every legal frame passes
+while a tiny frame cannot request a multi-GB allocation.
+
 ## 10. Error conditions
 
 The decoder must reject:
@@ -328,6 +347,8 @@ The decoder must reject:
 - repeat control without its repeated byte;
 - a run that produces more than `pixel_count` bytes;
 - a segment that produces fewer than `pixel_count` bytes;
+- a declared decoded frame or segment size above the 1 GiB limit or the 128x
+  expansion bound of the compressed input;
 - arithmetic overflow while calculating frame or output sizes;
 - a destination layout incompatible with the source frame.
 

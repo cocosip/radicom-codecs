@@ -490,9 +490,9 @@ impl SequentialFrame {
     ) -> Result<Self, String> {
         let mut r = MarkerReader::new(data);
         expect(&mut r, Marker::Soi)?;
-        let mut q = [[0u16; 64]; 2];
-        let mut dcs: [Option<HuffmanTable>; 2] = [None, None];
-        let mut acs: [Option<HuffmanTable>; 2] = [None, None];
+        let mut q = [[0u16; 64]; 4];
+        let mut dcs: [Option<HuffmanTable>; 4] = [None, None, None, None];
+        let mut acs: [Option<HuffmanTable>; 4] = [None, None, None, None];
         let mut restart_interval = None;
         let mut header = None;
         let mut samples = Vec::new();
@@ -517,11 +517,16 @@ impl SequentialFrame {
                             return Err("codestream layout does not match destination".into());
                         }
                     }
-                    let count = frame
-                        .width
-                        .checked_mul(frame.height)
-                        .and_then(|pixels| pixels.checked_mul(usize::from(frame.components)))
-                        .ok_or("JPEG output size overflow")?;
+                    let count =
+                        (frame.width as u64) * (frame.height as u64) * u64::from(frame.components);
+                    if count > crate::MAX_DECODED_SAMPLES {
+                        return Err(format!(
+                            "JPEG SOF declares {count} samples, above the {} sample limit",
+                            crate::MAX_DECODED_SAMPLES
+                        ));
+                    }
+                    let count = usize::try_from(count)
+                        .map_err(|_| "JPEG output size overflows usize".to_owned())?;
                     samples = allocate_samples(count)?;
                     header = Some(frame);
                 }
@@ -544,7 +549,7 @@ impl SequentialFrame {
                                 "missing JPEG quantization table {qid} for component {component}"
                             ));
                         }
-                        if dc_selector > 1 || ac_selector > 1 {
+                        if dc_selector > 3 || ac_selector > 3 {
                             return Err("unsupported JPEG Huffman table selector".into());
                         }
                         let dc = dcs[usize::from(dc_selector)].as_ref().ok_or_else(|| {
@@ -622,6 +627,9 @@ struct FrameHeader {
     sampling: [(u8, u8); 3],
     qids: [u8; 3],
     ids: [u8; 3],
+    /// T.81 Table F.1: baseline DC differences use categories 0..=11, the
+    /// extended processes allow 0..=15.
+    max_dc_category: u8,
 }
 
 /// Frame-level (horizontal, vertical) sampling maxima; T.81 A.2.3 normalizes
@@ -784,7 +792,7 @@ fn decode_scan(
     start: usize,
     scan: &[(u8, &HuffmanTable, &HuffmanTable)],
     frame: &FrameHeader,
-    q: &[[u16; 64]; 2],
+    q: &[[u16; 64]; 4],
     restart_interval: Option<u16>,
     samples: &mut [u16],
 ) -> Result<usize, String> {
@@ -804,7 +812,7 @@ fn decode_scan(
         interleaved,
         frame.sampling[usize::from(scan[0].0)],
     );
-    let mut prev = [0i32; 3];
+    let mut prev = [0i64; 3];
     let mut mcu = 0usize;
     let mut restart_index = 0u8;
     for my in 0..mcu_h {
@@ -822,7 +830,7 @@ fn decode_scan(
                         ));
                     }
                     restart_index = (restart_index + 1) & 7;
-                    prev = [0i32; 3];
+                    prev = [0i64; 3];
                 }
             }
             mcu += 1;
@@ -840,9 +848,13 @@ fn decode_scan(
                         let block_x = mx * blocks_x + local_x;
                         let block_y = my * blocks_y + local_y;
                         let mut quant = [0i32; 64];
-                        let dc = read_value(&mut bits, dc_table)?;
-                        prev[c] += dc;
-                        quant[0] = prev[c];
+                        let dc = read_value(&mut bits, dc_table, frame.max_dc_category)?;
+                        prev[c] = prev[c]
+                            .checked_add(i64::from(dc))
+                            .ok_or_else(|| "JPEG DC predictor overflows i64".to_owned())?;
+                        quant[0] = i32::try_from(prev[c]).map_err(|_| {
+                            "JPEG DC coefficient is outside the i32 range".to_owned()
+                        })?;
                         let mut k = 1;
                         while k < 64 {
                             let sym = ac_table.decode(&mut bits)?;
@@ -867,7 +879,11 @@ fn decode_scan(
                         }
                         let mut coeff = [0i32; 64];
                         for i in 0..64 {
-                            coeff[i] = quant[i] * i32::from(q[usize::from(frame.qids[c])][i]);
+                            let value =
+                                i64::from(quant[i]) * i64::from(q[usize::from(frame.qids[c])][i]);
+                            coeff[i] = i32::try_from(value).map_err(|_| {
+                                "JPEG dequantized coefficient is outside the i32 range".to_owned()
+                            })?;
                         }
                         let block = inverse(&coeff);
                         // ponytail: trailing blocks clamp out-of-plane samples onto
@@ -929,8 +945,13 @@ fn write_value(w: &mut BitWriter, h: &HuffmanTable, v: i32) -> Result<(), String
         Ok(())
     }
 }
-fn read_value(r: &mut BitReader<'_>, h: &HuffmanTable) -> Result<i32, String> {
+fn read_value(r: &mut BitReader<'_>, h: &HuffmanTable, max_category: u8) -> Result<i32, String> {
     let n = h.decode(r)?;
+    if n > max_category {
+        return Err(format!(
+            "JPEG DC category {n} exceeds the {max_category} limit"
+        ));
+    }
     if n == 0 {
         Ok(0)
     } else {
@@ -1032,7 +1053,7 @@ fn dht_payload(extended: bool) -> Vec<u8> {
     }
     p
 }
-fn parse_sof(p: &[u8], _: Marker) -> Result<FrameHeader, String> {
+fn parse_sof(p: &[u8], marker: Marker) -> Result<FrameHeader, String> {
     if p.len() < 6 {
         return Err("truncated SOF".into());
     }
@@ -1050,7 +1071,7 @@ fn parse_sof(p: &[u8], _: Marker) -> Result<FrameHeader, String> {
     let mut component_ids = [0u8; 3];
     let mut sampling = [(1u8, 1u8); 3];
     for (i, c) in p[6..].chunks_exact(3).enumerate() {
-        if c[2] > 1 || component_ids[..i].contains(&c[0]) {
+        if c[2] > 3 || component_ids[..i].contains(&c[0]) {
             return Err("JPEG SOF component definitions are invalid".into());
         }
         qids[i] = c[2];
@@ -1087,6 +1108,7 @@ fn parse_sof(p: &[u8], _: Marker) -> Result<FrameHeader, String> {
         sampling,
         qids,
         ids: component_ids,
+        max_dc_category: if marker == Marker::Sof0 { 11 } else { 15 },
     })
 }
 fn parse_dri(p: &[u8]) -> Result<Option<u16>, String> {
@@ -1125,7 +1147,7 @@ fn parse_sos(p: &[u8], component_ids: &[u8]) -> Result<Vec<(u8, u8, u8)>, String
     }
     Ok(selectors)
 }
-fn parse_dqt(p: &[u8], q: &mut [[u16; 64]; 2]) -> Result<(), String> {
+fn parse_dqt(p: &[u8], q: &mut [[u16; 64]; 4]) -> Result<(), String> {
     let mut i = 0;
     while i < p.len() {
         let info = p[i];
@@ -1133,7 +1155,7 @@ fn parse_dqt(p: &[u8], q: &mut [[u16; 64]; 2]) -> Result<(), String> {
         let precision = info >> 4;
         // Pq=1 (16-bit entries) is what libjpeg writes once a value exceeds
         // 255 and what fo-dicom emits for low-quality 12-bit encodes.
-        if precision > 1 || info & 15 > 1 {
+        if precision > 1 || info & 15 > 3 {
             return Err("unsupported DQT".into());
         }
         let entry_bytes = 1 + usize::from(precision);
@@ -1155,8 +1177,8 @@ fn parse_dqt(p: &[u8], q: &mut [[u16; 64]; 2]) -> Result<(), String> {
 }
 fn parse_dht(
     p: &[u8],
-    dc: &mut [Option<HuffmanTable>; 2],
-    ac: &mut [Option<HuffmanTable>; 2],
+    dc: &mut [Option<HuffmanTable>; 4],
+    ac: &mut [Option<HuffmanTable>; 4],
 ) -> Result<(), String> {
     let mut i = 0;
     while i < p.len() {
@@ -1173,7 +1195,7 @@ fn parse_dht(
         }
         let t = HuffmanTable::new(counts, &p[i..i + total])?;
         i += total;
-        let slot = if info & 15 > 1 {
+        let slot = if info & 15 > 3 {
             return Err("unsupported Huffman table id".into());
         } else {
             usize::from(info & 15)
@@ -1271,6 +1293,143 @@ mod tests {
             SequentialFrame::decode(&restarted).unwrap().samples,
             plain.samples
         );
+    }
+
+    /// Rewrites every table 0 reference to table 3 in DQT/DHT/SOF/SOS while
+    /// leaving table 1 alone, so the entropy data stays valid. Only the table
+    /// identifiers differ from the original codestream.
+    fn renumber_table_zero_to_three(stream: &[u8]) -> Vec<u8> {
+        let mut out = stream.to_vec();
+        let mut at = 2; // after SOI
+        while at + 4 <= out.len() {
+            let marker = out[at + 1];
+            let length = usize::from(u16::from_be_bytes([out[at + 2], out[at + 3]]));
+            let payload = at + 4;
+            match marker {
+                0xdb => {
+                    let mut p = payload;
+                    while p < at + 2 + length {
+                        let precision = out[p] >> 4;
+                        if out[p] & 0x0f == 0 {
+                            out[p] = (out[p] & 0xf0) | 3;
+                        }
+                        p += 1 + 64 * if precision == 1 { 2 } else { 1 };
+                    }
+                }
+                0xc4 => {
+                    let mut p = payload;
+                    while p < at + 2 + length {
+                        let total: usize = out[p + 1..p + 17].iter().map(|&c| usize::from(c)).sum();
+                        if out[p] & 0x0f == 0 {
+                            out[p] = (out[p] & 0xf0) | 3;
+                        }
+                        p += 17 + total;
+                    }
+                }
+                0xc0 | 0xc1 => {
+                    let count = usize::from(out[payload + 5]);
+                    for component in 0..count {
+                        let qid = payload + 6 + 3 * component + 2;
+                        if out[qid] == 0 {
+                            out[qid] = 3;
+                        }
+                    }
+                }
+                0xda => {
+                    let count = usize::from(out[payload]);
+                    for component in 0..count {
+                        let selector = payload + 1 + 2 * component + 1;
+                        if out[selector] == 0 {
+                            out[selector] = 0x33;
+                        }
+                    }
+                    break; // entropy data follows; nothing else to renumber
+                }
+                0xd9 => break,
+                _ => {}
+            }
+            at += 2 + length;
+        }
+        out
+    }
+
+    #[test]
+    fn decodes_quantization_and_huffman_table_ids_three() {
+        let samples = (0..8 * 8).map(|v| ((v * 37) % 256) as u16).collect();
+        let frame = SequentialFrame::new(8, 8, 8, 1, samples).unwrap();
+        let encoded = frame
+            .encode_with_smoothing(90, false, false, 0, None)
+            .unwrap();
+        let reference = SequentialFrame::decode(&encoded).unwrap();
+        let renumbered = renumber_table_zero_to_three(&encoded);
+        assert_eq!(
+            SequentialFrame::decode(&renumbered).unwrap().samples,
+            reference.samples,
+            "table ids 0..=3 are legal (T.81 B.2.4.2/B.2.4.3)"
+        );
+    }
+
+    /// 16x8 single-component stream with a custom DC table (one code), an AC
+    /// table holding only EOB, and the given quantization value. Each of the
+    /// two blocks codes `category` followed by the largest positive amplitude.
+    fn crafted_dc_stream(sof: Marker, precision: u8, category: u8, quant: u16) -> Vec<u8> {
+        let mut out = MarkerWriter::default();
+        out.write_marker(Marker::Soi).unwrap();
+        let mut dqt = vec![0x10];
+        for _ in 0..64 {
+            dqt.extend(quant.to_be_bytes());
+        }
+        out.write_segment(Marker::Dqt, &dqt).unwrap();
+        let sof_payload = vec![precision, 0, 8, 0, 16, 1, 1, 0x11, 0];
+        out.write_segment(sof, &sof_payload).unwrap();
+        // DC table 0: one code of length 1 for `category`; AC table 0: EOB.
+        let mut dht = vec![0x00, 1];
+        dht.extend([0u8; 15]);
+        dht.push(category);
+        dht.push(0x10);
+        dht.push(1);
+        dht.extend([0u8; 15]);
+        dht.push(0);
+        out.write_segment(Marker::Dht, &dht).unwrap();
+        out.write_segment(Marker::Sos, &[1, 1, 0x00, 0, 63, 0])
+            .unwrap();
+        let mut bits = BitWriter::default();
+        for _ in 0..2 {
+            bits.write_bits(0, 1).unwrap(); // the single DC code
+            bits.write_bits((1u32 << category) - 1, category).unwrap();
+            bits.write_bits(0, 1).unwrap(); // EOB
+        }
+        out.write_raw(&bits.finish().unwrap());
+        out.write_marker(Marker::Eoi).unwrap();
+        out.into_bytes()
+    }
+
+    #[test]
+    fn rejects_dc_categories_above_the_process_limit() {
+        let error =
+            SequentialFrame::decode(&crafted_dc_stream(Marker::Sof0, 8, 12, 1)).unwrap_err();
+        assert!(error.contains("exceeds the 11 limit"), "{error}");
+    }
+
+    #[test]
+    fn dequantization_overflow_is_a_managed_error() {
+        // Category 15 reaches 32767; two blocks at q=65535 overflow i32.
+        let error =
+            SequentialFrame::decode(&crafted_dc_stream(Marker::Sof1, 12, 15, 65535)).unwrap_err();
+        assert!(error.contains("outside the i32 range"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_oversized_sof_before_allocating() {
+        let mut stream = MarkerWriter::default();
+        stream.write_marker(Marker::Soi).unwrap();
+        // 65535x65535 single component: 4.29e9 samples, above 1<<28.
+        stream
+            .write_segment(Marker::Sof1, &[8, 0xff, 0xff, 0xff, 0xff, 1, 1, 0x11, 0])
+            .unwrap();
+        stream.write_marker(Marker::Eoi).unwrap();
+        let error = SequentialFrame::decode(&stream.into_bytes()).unwrap_err();
+        assert!(error.contains("sample limit"), "{error}");
     }
 
     #[test]

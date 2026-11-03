@@ -137,6 +137,8 @@ fn progression_code(order: ProgressionOrder) -> u8 {
 }
 
 fn ht_params(irreversible: bool, progression_order: ProgressionOrder) -> CodecParams {
+    // The codec default enables MCT so RGB output matches fo-dicom/OpenJPH.
+    // `HtJ2kParams::default()` keeps it false; see docs/design/htj2k.md.
     CodecParams::HtJpeg2000(HtJ2kParams {
         irreversible,
         employ_color_transform: true,
@@ -304,19 +306,29 @@ fn operate(
             ))
         }
     };
-    if reversible && p.irreversible {
-        return Err(error(
-            codec,
-            "encode",
-            "lossless JPEG 2000 requires reversible coding",
-        ));
-    }
-    if p.encode_signed_as_unsigned {
-        return Err(error(
-            codec,
-            if decode { "decode" } else { "encode" },
-            "encode_signed_as_unsigned is not supported",
-        ));
+    if !decode {
+        if reversible && p.irreversible {
+            return Err(error(
+                codec,
+                "encode",
+                "lossless JPEG 2000 requires reversible coding",
+            ));
+        }
+        if p.encode_signed_as_unsigned {
+            return Err(error(
+                codec,
+                "encode",
+                "encode_signed_as_unsigned is not implemented",
+            ));
+        }
+        let will_be_lossy = !reversible && p.irreversible;
+        if will_be_lossy && (p.rate != 20 || !p.rate_levels.is_empty()) {
+            return Err(error(
+                codec,
+                "encode",
+                "rate and rate_levels are not implemented by the classic JPEG 2000 encoder",
+            ));
+        }
     }
     if decode {
         if src.transfer_syntax().uid() != syntax.uid() {
@@ -341,6 +353,7 @@ fn operate(
             .map_err(|m| error(codec, "decode", m))?
             .rgb_output()
             .map_err(|m| error(codec, "decode", m))?;
+        frame::update_decoded_color_metadata(dst, &layout);
         let mut frames = Vec::new();
         for i in 0..src.number_of_frames() {
             let b = src
@@ -358,7 +371,6 @@ fn operate(
             dst.add_frame(frame)
                 .map_err(|e| error(codec, "decode", e.to_string()))?;
         }
-        frame::update_decoded_color_metadata(dst, &layout);
         Ok(())
     } else {
         if dst.transfer_syntax().uid() != syntax.uid() {
@@ -394,6 +406,9 @@ fn operate(
                 "source and destination pixel layouts differ",
             ));
         }
+        let encode_reversible = if reversible { true } else { !p.irreversible };
+        let apply_mct =
+            p.allow_mct && p.update_photometric_interpretation && layout.components == 3;
         let mut frames = Vec::new();
         for i in 0..src.number_of_frames() {
             let b = src
@@ -403,7 +418,7 @@ fn operate(
                 .data()
                 .map_err(|e| error(codec, "encode", format!("frame {i}: {e}")))?;
             frames.push(
-                frame::encode(&layout, bytes.as_ref(), reversible)
+                frame::encode(&layout, bytes.as_ref(), encode_reversible, apply_mct)
                     .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?,
             );
         }
@@ -411,7 +426,17 @@ fn operate(
             dst.add_frame(frame)
                 .map_err(|e| error(codec, "encode", e.to_string()))?;
         }
-        frame::update_color_metadata(dst, &layout, None);
+        frame::use_ob_vr_for_16_bit(dst);
+        let mct_label = if apply_mct {
+            Some(if encode_reversible {
+                "YBR_RCT"
+            } else {
+                "YBR_ICT"
+            })
+        } else {
+            None
+        };
+        frame::update_color_metadata(dst, &layout, mct_label, p.update_photometric_interpretation);
         Ok(())
     }
 }
@@ -436,7 +461,7 @@ fn operate_ht(
             ))
         }
     };
-    if p.irreversible == reversible {
+    if !decode && p.irreversible == reversible {
         return Err(error(
             codec,
             if decode { "decode" } else { "encode" },
@@ -445,6 +470,18 @@ fn operate_ht(
             } else {
                 "lossy HTJ2K requires irreversible coding"
             },
+        ));
+    }
+    if !decode
+        && matches!(
+            p.progression_order,
+            ProgressionOrder::Pcrl | ProgressionOrder::Cprl
+        )
+    {
+        return Err(error(
+            codec,
+            "encode",
+            "PCRL and CPRL progression orders are not implemented by the HTJ2K codec",
         ));
     }
     let levels = i32::try_from(p.decompositions).map_err(|_| {
@@ -502,6 +539,7 @@ fn operate_ht(
             .map_err(|m| error(codec, "decode", m))?
             .rgb_output()
             .map_err(|m| error(codec, "decode", m))?;
+        frame::update_decoded_color_metadata(dst, &layout);
         let mut frames = Vec::new();
         for i in 0..src.number_of_frames() {
             let b = src
@@ -519,7 +557,6 @@ fn operate_ht(
             dst.add_frame(frame)
                 .map_err(|e| error(codec, "decode", e.to_string()))?;
         }
-        frame::update_decoded_color_metadata(dst, &layout);
         Ok(())
     } else {
         if dst.transfer_syntax().uid() != syntax.uid() {
@@ -572,6 +609,7 @@ fn operate_ht(
             dst.add_frame(frame)
                 .map_err(|e| error(codec, "encode", e.to_string()))?;
         }
+        frame::use_ob_vr_for_16_bit(dst);
         // A multiple component transform requires the matching label; fo-dicom's
         // JPEG 2000 codec writes YBR_RCT/YBR_ICT for the same reason.
         let mct_label = if options.mct && layout.components == 3 {
@@ -579,7 +617,7 @@ fn operate_ht(
         } else {
             None
         };
-        frame::update_color_metadata(dst, &layout, mct_label);
+        frame::update_color_metadata(dst, &layout, mct_label, true);
         Ok(())
     }
 }
@@ -891,5 +929,261 @@ mod facade_tests {
         assert!(Jpeg2000LosslessCodec
             .encode(&src, &mut dst, &CodecParams::None)
             .is_err());
+    }
+
+    fn encode_with(
+        codec: &dyn Codec,
+        source: &mut Dataset,
+        params: &CodecParams,
+    ) -> Result<Dataset, String> {
+        let mut encoded = source.clone();
+        encoded.set_transfer_syntax(std::sync::Arc::new(codec.transfer_syntax().clone()));
+        encoded.remove(Tag::PIXEL_DATA);
+        let src = PixelDataRef::from_dataset(source).unwrap();
+        let mut dst = PixelData::create_new(&mut encoded).unwrap();
+        codec
+            .encode(&src, &mut dst, params)
+            .map_err(|e| e.to_string())?;
+        Ok(encoded)
+    }
+
+    fn decode_with(
+        codec: &dyn Codec,
+        encoded: &Dataset,
+        params: &CodecParams,
+    ) -> Result<Dataset, String> {
+        let mut decoded = encoded.clone();
+        decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        decoded.remove(Tag::PIXEL_DATA);
+        let src = PixelDataRef::from_dataset(encoded).unwrap();
+        let mut dst = PixelData::create_new(&mut decoded).unwrap();
+        codec
+            .decode(&src, &mut dst, params)
+            .map_err(|e| e.to_string())?;
+        Ok(decoded)
+    }
+
+    #[test]
+    fn lossy_syntax_honours_irreversible_false() {
+        let raw: Vec<u8> = (0..16 * 16).map(|i| (i * 31 + 7) as u8).collect();
+        let mut source = ds(16, 16, 8, 1, 0, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let params = CodecParams::Jpeg2000(J2kParams {
+            irreversible: false,
+            ..Default::default()
+        });
+        let encoded = encode_with(&Jpeg2000LossyCodec, &mut source, &params).unwrap();
+        let decoded = decode_with(&Jpeg2000LossyCodec, &encoded, &params).unwrap();
+        assert_eq!(samples(&decoded), raw, "5/3 coding must be lossless");
+    }
+
+    #[test]
+    fn lossless_decode_ignores_the_irreversible_parameter() {
+        let raw: Vec<u8> = (0..16 * 16).map(|i| (i * 11 + 3) as u8).collect();
+        let mut source = ds(16, 16, 8, 1, 0, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let encoded = encode_with(
+            &Jpeg2000LosslessCodec,
+            &mut source,
+            &Jpeg2000LosslessCodec.default_params(),
+        )
+        .unwrap();
+        let params = CodecParams::Jpeg2000(J2kParams {
+            irreversible: true,
+            rate: 50,
+            rate_levels: vec![10],
+            allow_mct: true,
+            update_photometric_interpretation: true,
+            encode_signed_as_unsigned: true,
+        });
+        let decoded = decode_with(&Jpeg2000LosslessCodec, &encoded, &params).unwrap();
+        assert_eq!(samples(&decoded), raw);
+    }
+
+    #[test]
+    fn ht_lossless_decode_ignores_the_irreversible_parameter() {
+        let raw: Vec<u8> = (0..16 * 16).map(|i| (i * 7 + 5) as u8).collect();
+        let mut source = ds(16, 16, 8, 1, 0, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let codec = HtJpeg2000LosslessCodec;
+        let encoded = encode_with(&codec, &mut source, &codec.default_params()).unwrap();
+        let decoded =
+            decode_with(&codec, &encoded, &ht_params(true, ProgressionOrder::Lrcp)).unwrap();
+        assert_eq!(samples(&decoded), raw);
+    }
+
+    #[test]
+    fn ht_defaults_enable_the_color_transform() {
+        for params in [
+            HtJpeg2000LosslessCodec.default_params(),
+            HtJpeg2000LosslessRpclCodec.default_params(),
+            HtJpeg2000LossyCodec.default_params(),
+        ] {
+            match params {
+                CodecParams::HtJpeg2000(p) => assert!(p.employ_color_transform),
+                _ => panic!("wrong default parameter family"),
+            }
+        }
+    }
+
+    #[test]
+    fn unimplemented_encoder_parameters_are_reported() {
+        let raw: Vec<u8> = (0..16 * 16).map(|i| (i * 5) as u8).collect();
+        let mut source = ds(16, 16, 8, 1, 0, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        for params in [
+            J2kParams {
+                rate: 64,
+                ..Default::default()
+            },
+            J2kParams {
+                rate_levels: vec![32],
+                ..Default::default()
+            },
+            J2kParams {
+                encode_signed_as_unsigned: true,
+                ..Default::default()
+            },
+        ] {
+            let params = CodecParams::Jpeg2000(params);
+            let error = encode_with(&Jpeg2000LossyCodec, &mut source, &params).unwrap_err();
+            assert!(
+                error.contains("not implemented"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_parameters_do_not_apply_a_component_transform() {
+        let raw: Vec<u8> = (0..8 * 6 * 3).map(|i| (i * 19 + 3) as u8).collect();
+        let mut source = ds(8, 6, 8, 3, 0, "RGB");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let encoded = encode_with(
+            &Jpeg2000LosslessCodec,
+            &mut source,
+            &Jpeg2000LosslessCodec.default_params(),
+        )
+        .unwrap();
+        assert_eq!(
+            encoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "RGB"
+        );
+        let decoded = decode_with(
+            &Jpeg2000LosslessCodec,
+            &encoded,
+            &Jpeg2000LosslessCodec.default_params(),
+        )
+        .unwrap();
+        assert_eq!(samples(&decoded), raw);
+    }
+
+    #[test]
+    fn component_transform_is_labelled_and_lossless() {
+        let raw: Vec<u8> = (0..8 * 6 * 3).map(|i| (i * 23 + 5) as u8).collect();
+        let mut source = ds(8, 6, 8, 3, 0, "RGB");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let params = CodecParams::Jpeg2000(J2kParams {
+            irreversible: false,
+            allow_mct: true,
+            update_photometric_interpretation: true,
+            ..Default::default()
+        });
+        let encoded = encode_with(&Jpeg2000LosslessCodec, &mut source, &params).unwrap();
+        assert_eq!(
+            encoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "YBR_RCT"
+        );
+        let decoded = decode_with(&Jpeg2000LosslessCodec, &encoded, &params).unwrap();
+        assert_eq!(samples(&decoded), raw);
+        assert_eq!(
+            decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "RGB"
+        );
+
+        let lossy_params = CodecParams::Jpeg2000(J2kParams {
+            irreversible: true,
+            allow_mct: true,
+            update_photometric_interpretation: true,
+            ..Default::default()
+        });
+        let encoded = encode_with(&Jpeg2000LossyCodec, &mut source, &lossy_params).unwrap();
+        assert_eq!(
+            encoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "YBR_ICT"
+        );
+    }
+
+    #[test]
+    fn multiple_frames_receive_photometric_interpretation_before_frames() {
+        let first: Vec<u8> = (0..8 * 6 * 3).map(|i| (i * 17 + 1) as u8).collect();
+        let second: Vec<u8> = (0..8 * 6 * 3).map(|i| (i * 13 + 9) as u8).collect();
+        let mut source = ds(8, 6, 8, 3, 0, "RGB");
+        {
+            let mut pixel = PixelData::create_new(&mut source).unwrap();
+            pixel.add_frame(&first).unwrap();
+            pixel.add_frame(&second).unwrap();
+        }
+        let params = CodecParams::Jpeg2000(J2kParams {
+            irreversible: false,
+            allow_mct: true,
+            update_photometric_interpretation: true,
+            ..Default::default()
+        });
+        let encoded = encode_with(&Jpeg2000LosslessCodec, &mut source, &params).unwrap();
+        let decoded = decode_with(&Jpeg2000LosslessCodec, &encoded, &params).unwrap();
+        assert_eq!(
+            decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "RGB"
+        );
+        let pixel = PixelDataRef::from_dataset(&decoded).unwrap();
+        assert_eq!(pixel.number_of_frames(), 2);
+        for (index, expected) in [first, second].iter().enumerate() {
+            assert_eq!(
+                pixel.get_frame(index as u32).unwrap().data().unwrap(),
+                expected.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn encapsulated_16_bit_pixel_data_uses_ob() {
+        let raw: Vec<u8> = (0..8 * 6).flat_map(|v: u16| v.to_le_bytes()).collect();
+        let mut source = ds(8, 6, 16, 1, 0, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let encoded = encode_with(
+            &Jpeg2000LosslessCodec,
+            &mut source,
+            &Jpeg2000LosslessCodec.default_params(),
+        )
+        .unwrap();
+        let item = encoded.item(&Tag::PIXEL_DATA).unwrap();
+        match item {
+            radicom::model::item::DicomItem::Fragments(sequence) => {
+                assert_eq!(sequence.vr(), Vr::Ob)
+            }
+            other => panic!("expected a fragment sequence, got {other:?}"),
+        }
     }
 }

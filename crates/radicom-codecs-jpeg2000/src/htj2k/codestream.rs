@@ -6,8 +6,8 @@
 
 use crate::geometry::{CodeBlock, Component, PrecinctBand};
 use crate::marker::{
-    write_cap, write_eoc, write_soc, write_sod, write_tlm, Cod, CodingStyle, MainHeader, QStep,
-    Quantization, Siz, SizComp, Sot, EOC, SOD, SOT,
+    cap_ccap, write_cap, write_eoc, write_soc, write_sod, write_tlm, Cod, CodingStyle, MainHeader,
+    QStep, Quantization, Siz, SizComp, Sot, EOC, SOD, SOT,
 };
 use crate::quantization::{bit_plane_depth, reversible_steps, subband_index};
 use crate::wavelet;
@@ -41,6 +41,11 @@ impl EncodeOptions {
         if self.quality > 100 {
             return Err("HTJ2K quality must be between 1 and 100".into());
         }
+        if self.progression >= 3 {
+            return Err(
+                "PCRL and CPRL progression orders are not implemented by the HTJ2K codec".into(),
+            );
+        }
         Ok(())
     }
 }
@@ -58,6 +63,8 @@ pub(crate) fn encode(
     let reversible = options.reversible;
     let progression = options.progression;
     let precision = components[0].precision;
+    // T.800 Table A.15: MCT is a flag; the wavelet transform selects RCT (5/3)
+    // or ICT (9/7).
     let mct = u8::from(options.mct && components.len() >= 3);
     if reversible && mct != 0 {
         forward_rct(components);
@@ -226,11 +233,12 @@ pub(crate) fn encode(
         style: quant_style,
         steps,
     };
+    let cap = cap_ccap(precision, reversible);
 
     let mut output = Vec::new();
     write_soc(&mut output);
     siz.write(&mut output);
-    write_cap(&mut output);
+    write_cap(&mut output, cap);
     cod.write(&mut output);
     quant.write(&mut output);
     let tile_part_length = (14 + tile_data.len()) as u32;
@@ -348,6 +356,22 @@ pub(crate) fn decode(
     if header.cod.style.style & 0x40 == 0 {
         return Err("codestream is not HTJ2K (COD style 0x40 is missing)".into());
     }
+    if header.cod.style.style & 0xB7 != 0 {
+        return Err("unsupported HTJ2K code-block style bits".into());
+    }
+    if header.cod.scod & 1 != 0
+        || header
+            .cocs
+            .iter()
+            .any(|coc| !coc.style.precincts.is_empty())
+    {
+        return Err("HTJ2K codestreams with explicit precincts are not supported".into());
+    }
+    if header.cod.progression >= 3 {
+        return Err(
+            "PCRL and CPRL progression orders are not implemented by the HTJ2K codec".into(),
+        );
+    }
     if header.cod.layers != 1 {
         // Multi-layer HTJ2K needs SigProp/MagRef refinement passes, which
         // OpenJPH also rejects (`0x00030053`); no reference encoder emits them.
@@ -365,6 +389,12 @@ pub(crate) fn decode(
         }
     }
     let reversible = header.cod.style.transform == 1;
+    if header.cod.mct > 1 {
+        return Err("unsupported multiple component transform value".into());
+    }
+    if header.cod.mct != 0 && header.siz.comps.len() < 3 {
+        return Err("multiple component transform requires at least three components".into());
+    }
     if header
         .siz
         .comps
@@ -376,6 +406,12 @@ pub(crate) fn decode(
     if header.siz.xosiz != 0 || header.siz.yosiz != 0 {
         return Err("HTJ2K image offsets are not supported".into());
     }
+    let width = u64::from(header.siz.xsiz) - u64::from(header.siz.xosiz);
+    let height = u64::from(header.siz.ysiz) - u64::from(header.siz.yosiz);
+    if width > i32::MAX as u64 || height > i32::MAX as u64 {
+        return Err("HTJ2K image dimensions exceed the supported range".into());
+    }
+    crate::geometry::checked_total(width, height, header.siz.comps.len())?;
     let levels = i32::from(header.cod.style.decompositions);
     let (code_block_width, code_block_height) = header.cod.style.code_block_size()?;
     let mut components = Vec::with_capacity(header.siz.comps.len());
@@ -383,18 +419,16 @@ pub(crate) fn decode(
         if comp.xrsiz != 1 || comp.yrsiz != 1 {
             return Err("subsampled HTJ2K components are not supported".into());
         }
-        let width = header.siz.xsiz as i32 - header.siz.xosiz as i32;
-        let height = header.siz.ysiz as i32 - header.siz.yosiz as i32;
         let mut component = Component::new(
             index,
             0,
             0,
-            width,
-            height,
+            width as i32,
+            height as i32,
             levels,
             comp.precision(),
             comp.signed(),
-        );
+        )?;
         component.build_code_blocks(code_block_width as i32, code_block_height as i32, None)?;
         components.push(component);
     }
@@ -857,5 +891,98 @@ mod tests {
         let fine = error_for(95);
         assert!(coarse > fine, "coarse {coarse} fine {fine}");
         assert!(fine < 2.0, "fine quality error {fine}");
+    }
+
+    fn cod_position(stream: &[u8]) -> usize {
+        stream
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0x52])
+            .expect("COD marker")
+    }
+
+    fn cap_ccap_of(stream: &[u8]) -> u16 {
+        let cap = stream
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0x50])
+            .expect("CAP marker");
+        u16::from_be_bytes([stream[cap + 8], stream[cap + 9]])
+    }
+
+    #[test]
+    fn cap_ccap_follows_precision_and_transform() {
+        let mut eight = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let opts = options(&eight, true);
+        let encoded = encode(&mut eight, &opts).unwrap();
+        assert_eq!(cap_ccap_of(&encoded), 0x0002);
+
+        let sixteen_bit: Vec<i32> = (0..16).map(|i| i * 1000 - 8000).collect();
+        let mut sixteen =
+            build_components(std::slice::from_ref(&sixteen_bit), 4, 4, 16, false, 0).unwrap();
+        let opts = options(&sixteen, true);
+        let encoded = encode(&mut sixteen, &opts).unwrap();
+        assert_eq!(cap_ccap_of(&encoded), 0x000A);
+
+        let mut lossy = build_components(&[sixteen_bit], 4, 4, 16, false, 0).unwrap();
+        let opts = options(&lossy, false);
+        let encoded = encode(&mut lossy, &opts).unwrap();
+        assert_eq!(cap_ccap_of(&encoded), 0x002A);
+    }
+
+    #[test]
+    fn pcrl_and_cprl_are_rejected() {
+        let mut components = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
+        for progression in [3u8, 4] {
+            let opts = EncodeOptions {
+                progression,
+                ..options(&components, true)
+            };
+            let error = encode(&mut components, &opts).unwrap_err();
+            assert!(error.contains("PCRL"), "{error}");
+        }
+
+        let mut components = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let opts = options(&components, true);
+        let mut encoded = encode(&mut components, &opts).unwrap();
+        let cod = cod_position(&encoded);
+        encoded[cod + 5] = 3;
+        let error = decode(&encoded, None).unwrap_err();
+        assert!(error.contains("PCRL"), "{error}");
+    }
+
+    #[test]
+    fn multi_precinct_codestreams_are_rejected() {
+        let mut components = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let opts = options(&components, true);
+        let encoded = encode(&mut components, &opts).unwrap();
+        let (header, offset) = MainHeader::parse(&encoded).unwrap();
+        let mut cod = header.cod;
+        cod.scod |= 1;
+        cod.style.precincts = vec![(0, 0)];
+        let mut rebuilt = Vec::new();
+        write_soc(&mut rebuilt);
+        header.siz.write(&mut rebuilt);
+        cod.write(&mut rebuilt);
+        header.qcd.write(&mut rebuilt);
+        rebuilt.extend_from_slice(&encoded[offset..]);
+        let error = decode(&rebuilt, None).unwrap_err();
+        assert!(error.contains("precinct"), "{error}");
+    }
+
+    #[test]
+    fn unsupported_code_block_style_bits_are_rejected() {
+        let mut components = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let opts = options(&components, true);
+        let encoded = encode(&mut components, &opts).unwrap();
+        let (header, offset) = MainHeader::parse(&encoded).unwrap();
+        let mut cod = header.cod;
+        cod.style.style |= 0x80;
+        let mut rebuilt = Vec::new();
+        write_soc(&mut rebuilt);
+        header.siz.write(&mut rebuilt);
+        cod.write(&mut rebuilt);
+        header.qcd.write(&mut rebuilt);
+        rebuilt.extend_from_slice(&encoded[offset..]);
+        let error = decode(&rebuilt, None).unwrap_err();
+        assert!(error.contains("unsupported HTJ2K"), "{error}");
     }
 }

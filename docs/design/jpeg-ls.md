@@ -153,6 +153,10 @@ Plane interleaving (one scan per component) is produced only when `1` is
 requested explicitly; the decoder reads it either way, and the encoder never
 emits it by default.
 
+The `.interop/REPORT.md` decision to bump `radicom`/`radicom-codecs*` from
+0.1.0 to 0.2.0 for `restart_interval` is obsolete: the released `radicom`
+0.1.0 already carries the field, so no version bump is needed.
+
 ## 5. Supported DICOM pixel layouts
 
 The first release accepts the following source and destination layouts:
@@ -296,17 +300,26 @@ finish.
 
 The decoder requires SOI, one valid SOF55, at least one compatible SOS, a
 complete scan, and EOI. It validates segment lengths before slicing, rejects
-duplicate or inconsistent component definitions, checks `NEAR`, `ILV`, and point
-transform against the frame precision, and accepts APPn/COM only by safely
-skipping their bounded payload. SOF55 component descriptors must carry sampling
-factors in `1..=4` and a zero quantisation-table selector; unequal factors select
-the sub-sampled plane grid of §5 on decode, while the encoder always writes
-`0x11`. `ILV=2` additionally requires equal component dimensions (T.87 C.2.3). A
-marker-like byte inside scan data is legal only after bit stuffing or at a
-restart/scan/EOI boundary. Unknown markers, truncated segments, invalid restart
-transitions, and a missing EOI are errors. Bytes after EOI are ignored instead of
-rejected: fo-dicom sizes encapsulated fragments by `ArrayPool` bucket, so stale
-non-zero memory can follow a valid codestream, and a decoder stops at EOI.
+duplicate or inconsistent component definitions, checks `NEAR`, `ILV`, and the
+scan's `Al` point transform against the frame precision, and safely skips the
+bounded payloads of APPn/COM. Besides the header, marker segments may appear
+wherever T.81 B.2.4.1 allows tables and miscellaneous segments, including
+between scans: an `LSE` or `DRI` found there updates the parameters of the
+following scans (T.87 C.2.4.1/C.2.5), a repeated `LSE` replaces the previous
+specification, and SOF55 after the first scan remains a duplicate error. The SOS
+`Ah` field is ignored as T.87 C.2.3 requires. SOF55 component descriptors must
+carry sampling factors in `1..=4` and a zero quantisation-table selector;
+unequal factors select the sub-sampled plane grid of §5 on decode, while the
+encoder always writes `0x11`. `ILV=2` additionally requires equal component
+dimensions (T.87 C.2.3), compared on the actual plane grids so a 1-pixel
+dimension does not let different factors pass. A marker-like byte inside scan
+data is legal only after bit stuffing or at a restart/scan/EOI boundary. Unknown
+markers, truncated segments, invalid restart transitions, and a missing EOI are
+errors. Bytes after EOI are ignored instead of rejected: fo-dicom sizes
+encapsulated fragments by `ArrayPool` bucket, so stale non-zero memory can
+follow a valid codestream, and a decoder stops at EOI. Between the last entropy
+byte and EOI, a single `0x00` is padding rather than trailing entropy and is
+accepted (CharLS does the same); any other leftover byte is an error.
 
 T.87 B.2 and DICOM PS3.5 8.2.3 let the bit stream choose component, line or
 sample interleaving. With `ILV=0` every scan holds `Ns=1`, and the image is
@@ -350,7 +363,8 @@ interval were the first line of the scan, so the previous line and the left edge
 sample are zero. Reconstruction buffers keep their real samples; only prediction
 restarts. The encoder emits DRI and `RSTm` when
 `JpegLsParams::restart_interval` is non-zero.
-The decoder accepts legal LSE preset segments.
+The decoder accepts legal LSE preset segments before the first scan and between
+scans; the last specification before a scan decides that scan's parameters.
 Zero-valued LSE fields select defaults; thresholds must satisfy
 `NEAR+1 <= T1 <= T2 <= T3 <= MAXVAL`, and RESET must be in
 `3..=max(255, MAXVAL)`. Nonzero SOS mapping-table selectors are rejected
@@ -587,8 +601,9 @@ Each stage ends with its own focused tests and keeps earlier stages passing.
 - Lossless comparisons are byte/sample exact after DICOM native byte order and
   planar rules. Near-lossless comparisons report maximum absolute sample error,
   not only visual similarity.
-- The DICOM-level fo-dicom.Codecs 5.16.7 matrix (`node .interop/dicom-matrix.js`)
-  is sample-exact in both directions for `.80` at 8 and 12 bits and for `.81`.
+- The DICOM-level fo-dicom.Codecs 5.16.7 matrix (`.interop/dicomref` driven by
+  `.interop/run_matrix.sh`) is sample-exact in both directions for `.80` at 8 and
+  12 bits and for `.81`.
 - The acceptance matrix records external file fixtures separately from
   local unit and property checks; a successful Rust round trip alone is not
   claimed as cross-implementation proof.
@@ -598,8 +613,9 @@ Each stage ends with its own focused tests and keeps earlier stages passing.
 - No parser path may panic on untrusted codestream bytes.
 - Every marker length, bit count, unary run, dimension product, offset, and
   allocation uses checked arithmetic or a bounded cursor.
-- The decoder rejects dimensions or frame sizes that exceed the destination or
-  `usize` before allocation.
+- The decoder rejects dimensions or frame sizes that exceed the destination,
+  `usize`, or the `1 << 28`-sample-per-frame cap before allocation; the cap is
+  `MAX_FRAME_SAMPLES` in `lib.rs` and also guards each scan buffer.
 - Temporary buffers are dropped on all error paths; compressed output is copied
   to an owned frame before `add_frame`.
 - Error messages include codec name, operation, frame index when known, and the
@@ -647,8 +663,10 @@ successfully decodes Rust output in both directions for the supported layouts.
 - The facade integration test uses the real registry/Transcoder for both UIDs,
   two frames, a Basic Offset Table with multiple fragments per frame, signed
   8/12/16-bit samples and planar 8/16-bit RGB.
-- The ignored `.interop/matrix.py` and `.interop/matrix-rust/` harnesses run
-  300 bidirectional CharLS cases. They pass the original signed two's-complement
+- The ignored `.interop/run_conformance.sh` (T.87 conformance streams against
+  the ITU reference tools) and `.interop/run_extra.sh` (synthetic layouts:
+  16/12-bit, signed, planar, multi-frame, restart markers) harnesses run the
+  bidirectional CharLS cases. They pass the original signed two's-complement
   bytes directly to the native encoder; comparisons apply only DICOM planar
   ordering and sign extension, never a sample offset. Lossless samples are
   exact; each near-lossless error is <= the requested NEAR. Rust and native

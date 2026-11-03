@@ -11,7 +11,10 @@ mod scan;
 
 use frame::Layout;
 use radicom::error::{CodecError, Error};
+use radicom::model::item::{DicomFragmentSequence, DicomItem};
+use radicom::model::tag::Tag;
 use radicom::model::transfer_syntax::{syntaxes, TransferSyntax};
+use radicom::model::vr::Vr;
 use radicom::pixel::codec::{Codec, CodecParams, JpegLsParams};
 use radicom::pixel::photometric::PhotometricInterpretation;
 use radicom::pixel::{PixelData, PixelDataRef};
@@ -85,6 +88,50 @@ fn error(codec: &str, op: &str, msg: impl Into<String>) -> Error {
     }
     .into()
 }
+
+/// Hard cap on the samples of one decoded frame. 2^28 samples is 512 MiB of
+/// `u16`, far above any real DICOM image, and stops a tiny codestream that
+/// declares `65535 x 65535` from forcing a multi-gigabyte allocation
+/// (design §10: dimensions and frame sizes are rejected before allocation).
+pub(crate) const MAX_FRAME_SAMPLES: usize = 1 << 28;
+
+/// Validates `width * height * components` before a frame buffer is allocated.
+/// The dimensions come from untrusted metadata, so overflow and the sample cap
+/// are both checked.
+pub(crate) fn checked_sample_count(
+    width: usize,
+    height: usize,
+    components: usize,
+) -> Result<usize, String> {
+    let count = width
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(components))
+        .ok_or("image dimensions overflow")?;
+    if count > MAX_FRAME_SAMPLES {
+        return Err(format!(
+            "image dimensions exceed the {MAX_FRAME_SAMPLES} sample limit"
+        ));
+    }
+    Ok(count)
+}
+
+/// PS3.5 Table 7.1-1: encapsulated Pixel Data uses VR `OB` regardless of
+/// `BitsAllocated`. `PixelData::add_frame` creates an `OW` element for 16-bit
+/// samples, so rewrite the fragment sequence after the codec appended frames.
+fn ensure_encapsulated_pixel_data_is_ob(dst: &mut PixelData<'_>) {
+    let fragments = match dst.dataset().item(&Tag::PIXEL_DATA) {
+        Some(DicomItem::Fragments(fragments)) if fragments.vr() != Vr::Ob => fragments.clone(),
+        _ => return,
+    };
+    let mut rebuilt = DicomFragmentSequence::new(Tag::PIXEL_DATA, Vr::Ob);
+    for fragment in fragments.fragments() {
+        rebuilt.push_fragment_raw(fragment.clone());
+    }
+    rebuilt.set_offset_table(fragments.offset_table().to_vec());
+    dst.dataset_mut()
+        .insert_or_update(DicomItem::Fragments(rebuilt));
+}
+
 fn operate(
     codec: &str,
     syntax: &TransferSyntax,
@@ -219,6 +266,7 @@ fn operate(
                 .map_err(|e| error(codec, "encode", e.to_string()))?;
         }
         frame::update_color_metadata(dst, &layout);
+        ensure_encapsulated_pixel_data_is_ob(dst);
         Ok(())
     }
 }
@@ -362,6 +410,80 @@ mod facade_tests {
             raw.as_slice()
         );
     }
+    #[test]
+    fn encapsulated_16_bit_frames_are_written_with_ob_pixel_data() {
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            2,
+            2,
+            16,
+            1,
+            0,
+            "MONOCHROME2",
+        );
+        let raw = [0u8, 1, 0, 2, 0, 3, 0, 4];
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(raw)
+            .unwrap();
+        let enc = encode_stream(&source);
+        // `add_frame` creates OW for 16-bit samples; encapsulated Pixel Data
+        // must use OB (PS3.5 Table 7.1-1), so the codec rewrites the sequence.
+        match enc.item(&Tag::PIXEL_DATA) {
+            Some(DicomItem::Fragments(fragments)) => {
+                assert_eq!(fragments.vr(), Vr::Ob);
+                assert_eq!(fragments.fragments().len(), 1);
+            }
+            other => panic!("expected encapsulated fragments, got {other:?}"),
+        }
+        assert_eq!(frame_bytes(&decode_stream(&enc)), raw);
+    }
+
+    #[test]
+    fn rejects_a_declared_frame_above_the_sample_limit() {
+        // 65535 x 65535 x 3 samples would be 12.8 GiB, declared by a 40-byte
+        // codestream; the codec must fail before allocating anything.
+        let mut compressed = ds(
+            syntaxes::JPEG_LS_LOSSLESS.clone(),
+            65535,
+            65535,
+            8,
+            3,
+            0,
+            "RGB",
+        );
+        let mut codestream = Vec::new();
+        crate::marker::write_soi(&mut codestream);
+        crate::marker::write_sof55(
+            &mut codestream,
+            &crate::marker::FrameHeader {
+                precision: 8,
+                width: 65535,
+                height: 65535,
+                components: 3,
+            },
+        )
+        .unwrap();
+        crate::marker::write_sos(&mut codestream, 3, 0, 2).unwrap();
+        crate::marker::write_eoi(&mut codestream);
+        PixelData::create_new(&mut compressed)
+            .unwrap()
+            .add_frame(codestream)
+            .unwrap();
+        let mut decoded = compressed.clone();
+        decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        decoded.remove(Tag::PIXEL_DATA);
+        let error = JpegLsLosslessCodec
+            .decode(
+                &PixelDataRef::from_dataset(&compressed).unwrap(),
+                &mut PixelData::create_new(&mut decoded).unwrap(),
+                &JpegLsLosslessCodec.default_params(),
+            )
+            .unwrap_err();
+        assert!(format!("{error}").contains("sample limit"), "{error}");
+        assert!(!decoded.contains(&Tag::PIXEL_DATA));
+    }
+
     #[test]
     fn rgb_color_transform_roundtrip() {
         // The HP transforms are an encoding preference: the stream carries the

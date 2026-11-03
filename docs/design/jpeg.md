@@ -195,7 +195,9 @@ the lossless path accepts APP, COM, DQT, DHT, and DRI before or after SOF3 (SOF3
 is still required before the first SOS; a lossless DQT is legal and unused). A
 restart interval of `0` means “no restarts”. At each restart boundary the
 decoder requires the next `RST0`–`RST7` marker in sequence, resets the DC
-predictors or lossless predictor state, and aligns to the byte boundary; a
+predictors (for Process 14 the predictor state restarts, so the whole first row
+of the new interval uses the one-dimensional predictor of T.81 G.1.2, as in
+libjpeg-turbo's first-row undifferencer), and aligns to the byte boundary; a
 missing, unexpected, or mid-entropy restart marker is a managed error. Both
 sequential and lossless decoding accept any number of scans as long as every
 component is covered exactly once: an interleaved scan (Ns > 1) uses the frame
@@ -353,10 +355,11 @@ without updating this document first.
   fixed-point colour conversion, not from the filter. Before the filter the same
   comparison was `max=78`. The packed `YBR_FULL_422` decode path (no RGB
   conversion) is unchanged and byte-exact.
-- The DICOM-level fo-dicom.Codecs 5.16.7 matrix (`node .interop/dicom-matrix.js`)
-  agrees in both directions: `.57` (16-bit) and `.70` (12 bits stored in 16) are
-  sample-exact, and `.50` (8-bit) and `.51` (12 bits stored in 16) stay within
-  one sample of fo-dicom's own decode of the same codestream.
+- The DICOM-level fo-dicom.Codecs matrix (`.interop/run_matrix.sh` driving
+  `.interop/dicomref`) agrees in both directions: `.57` (16-bit) and `.70`
+  (12 bits stored in 16) are sample-exact, and `.50` (8-bit) and `.51`
+  (12 bits stored in 16) stay within one sample of fo-dicom's own decode of the
+  same codestream.
 - `smoothing_factor` parity with libjpeg is sample-exact: at `quality=100` a
   monochrome encode with `smoothing=50` decodes (DCMTK) within `max=1` of the
   unsmoothed stream — the same bound as `smoothing=0` — while the codestream
@@ -370,6 +373,10 @@ without updating this document first.
   libijg rejects intervals that are not an integer multiple of the MCU row) to
   the source samples with 0 differences, and a `.50` stream with an interval of 2
   to RGB within `max=4`, the same bound as the same stream without restarts.
+  The `.70`/SV1 path forces predictor 1, so this evidence does not cover the
+  `.57` predictors 2–7: that rule is pinned by the hand-computed predictor-4
+  fixture in the `lossless.rs` unit tests, which DCMTK also decodes to the same
+  samples.
   The lossless encoder enforces the same rule: a Process 14 interval that is not
   a multiple of the image width is refused with a codec error, and the
   integration test uses whole-MCU-row intervals only.

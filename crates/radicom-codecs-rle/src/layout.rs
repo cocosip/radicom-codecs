@@ -28,6 +28,7 @@ struct LayoutInput {
     samples: u16,
     planar: u16,
     photometric: Option<PhotometricInterpretation>,
+    pixel_representation: u16,
 }
 
 impl RleLayout {
@@ -41,6 +42,7 @@ impl RleLayout {
             samples: data.samples_per_pixel(),
             planar: data.planar_configuration(),
             photometric: data.photometric_interpretation(),
+            pixel_representation: data.pixel_representation(),
         })
     }
 
@@ -54,6 +56,7 @@ impl RleLayout {
             samples: data.samples_per_pixel(),
             planar: data.planar_configuration(),
             photometric: data.photometric_interpretation(),
+            pixel_representation: data.pixel_representation(),
         })
     }
 
@@ -78,6 +81,7 @@ impl RleLayout {
             } else {
                 PhotometricInterpretation::Rgb
             }),
+            pixel_representation: 0,
         })
     }
 
@@ -86,6 +90,12 @@ impl RleLayout {
             return Err(format!(
                 "image dimensions must be non-zero, got {}x{}",
                 input.columns, input.rows
+            ));
+        }
+        if input.pixel_representation > 1 {
+            return Err(format!(
+                "PixelRepresentation {} must be 0 or 1",
+                input.pixel_representation
             ));
         }
         let bit_packed = input.bits_allocated == 1;
@@ -236,6 +246,7 @@ mod tests {
             samples,
             planar: 0,
             photometric: Some(photometric),
+            pixel_representation: 0,
         }
     }
 
@@ -287,5 +298,24 @@ mod tests {
         assert!(RleLayout::new_for_test(1, 1, 12, 1, 0).is_err());
         assert!(RleLayout::new_for_test(1, 1, 16, 8, 0).is_err());
         assert!(RleLayout::new_for_test(1, 1, 8, 3, 2).is_err());
+    }
+
+    #[test]
+    fn rejects_pixel_representation_outside_zero_and_one() {
+        let mut input = LayoutInput {
+            rows: 1,
+            columns: 1,
+            bits_allocated: 8,
+            bits_stored: 8,
+            high_bit: 7,
+            samples: 1,
+            planar: 0,
+            photometric: Some(PhotometricInterpretation::Monochrome2),
+            pixel_representation: 2,
+        };
+        let error = RleLayout::from_values(input).unwrap_err();
+        assert!(error.contains("PixelRepresentation 2"), "{error}");
+        input.pixel_representation = 1;
+        assert!(RleLayout::from_values(input).is_ok());
     }
 }

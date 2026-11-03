@@ -1,4 +1,4 @@
-const HEADER_LENGTH: usize = 64;
+pub(crate) const HEADER_LENGTH: usize = 64;
 const MAX_SEGMENTS: usize = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,5 +104,24 @@ mod tests {
         invalid[..64].copy_from_slice(&RleHeader::write(&[64]).unwrap());
         invalid[0] = 0;
         assert!(RleHeader::parse(&invalid).is_err());
+    }
+
+    fn raw_header(frame_length: usize, count: u32, offsets: &[u32]) -> Vec<u8> {
+        let mut frame = vec![0u8; frame_length];
+        frame[..4].copy_from_slice(&count.to_le_bytes());
+        for (index, offset) in offsets.iter().enumerate() {
+            let start = 4 + index * 4;
+            frame[start..start + 4].copy_from_slice(&offset.to_le_bytes());
+        }
+        frame
+    }
+
+    #[test]
+    fn rejects_offset_boundaries_and_non_increasing_offsets() {
+        assert!(RleHeader::parse(&raw_header(70, 1, &[63])).is_err());
+        assert!(RleHeader::parse(&raw_header(70, 1, &[70])).is_err());
+        assert!(RleHeader::parse(&raw_header(80, 2, &[64, 64])).is_err());
+        assert!(RleHeader::parse(&raw_header(80, 2, &[70, 66])).is_err());
+        assert!(RleHeader::parse(&raw_header(64, 16, &[])).is_err());
     }
 }

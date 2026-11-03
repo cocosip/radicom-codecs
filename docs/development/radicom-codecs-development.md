@@ -126,8 +126,10 @@ the distinction between portable tests and native evidence are in
 - [x] Run the independent fo-dicom bidirectional acceptance matrix for `.90`
   and `.91`.
 
-Interop evidence: the OpenJPEG 2.5.4 matrix (`node .interop/matrix.js`) passes
-after two scaling corrections. The classic inverse applied `2/K` where the
+Interop evidence: the OpenJPEG 2.5.4 matrix
+(`pwsh .interop/run-j2k-interop.ps1`, which drives `j2k_tool` and
+`.interop/j2k-oracle`) passes after two scaling corrections. The classic inverse
+applied `2/K` where the
 analysis applies `K`, so `1/K` is the exact inverse; and the irreversible
 coefficient domain carries each subband's gain (`2^gain`, Equation E-4) in both
 the encoder's quantization step and the decoder's dequantization step, which is
@@ -138,14 +140,18 @@ max 1` of OpenJPEG's own output at 8 bits (`0.036 / 1` at 12 bits); and an
 OpenJPEG decode of a Rust `.91` stays within `mean 0.172 / max 2` of the Rust
 decode of the same codestream. An OpenJPEG-written irreversible codestream and
 its reference samples are embedded in a unit test so the convention cannot
-regress silently. A second, DICOM-level matrix (`node .interop/dicom-matrix.js`)
-drives the real `fo-dicom.Codecs` 5.16.7 transcoder over the same syntaxes and
-agrees: `.90` is exact in both directions at 8 and 12 bits, a fo-dicom `.91`
-decodes within `max 1`, and fo-dicom decodes a Rust `.91` within `max 2`.
+regress silently. A second, DICOM-level check drives the real
+`fo-dicom.Codecs` 5.16.7 transcoder (`.interop/dicomref`) over the same
+syntaxes and agrees: `.90` is exact in both directions at 8 and 12 bits, a
+fo-dicom `.91` decodes within `max 1`, and fo-dicom decodes a Rust `.91` within
+`max 2`.
 
-The classic encoder emits one quality layer and does not apply MCT; `rate`,
-`rate_levels`, and `allow_mct` are accepted but do not alter the codestream yet.
-YBR_FULL/YBR_FULL_422 input is normalized to RGB. See
+The classic encoder emits one quality layer; non-default `rate` or `rate_levels`
+values are rejected until multi-layer rate control exists. `allow_mct` selects
+RCT/ICT with the matching `YBR_RCT`/`YBR_ICT` label, and
+`update_photometric_interpretation` controls whether the emitted dataset's
+photometric interpretation is rewritten. YBR_FULL/YBR_FULL_422 input is
+normalized to RGB. See
 [the JPEG 2000 implementation contract](../design/jpeg2000.md).
 
 ### HTJ2K implementation status
@@ -163,9 +169,11 @@ YBR_FULL/YBR_FULL_422 input is normalized to RGB. See
 
 ### Codec interop matrix against fo-dicom.Codecs
 
-`node .interop/dicom-matrix.js` encodes a raw frame with one codec, decodes the
-codestream with both, and compares the two decodes; it then repeats the other
-direction. Lossless syntaxes must also reproduce the source exactly. Results
+The cross-codec interop matrix (`.interop/rustharness` + `.interop/dicomref`,
+run with `bash .interop/run_matrix.sh` and `bash .interop/run_extra.sh`)
+encodes a raw frame with one codec, decodes the codestream with both, and
+compares the two decodes; it then repeats the other direction. Lossless
+syntaxes must also reproduce the source exactly. Results
 (mono, 64×48, 8-bit unless noted):
 `.5` (8 and 16 bits), `.57` (16), `.70` (12 stored in 16), `.80` (8 and 12),
 `.81`, `.90` (8 and 12), `.201` (8 and 12), `.202`, and `.203` are sample-exact

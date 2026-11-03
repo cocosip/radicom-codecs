@@ -1,3 +1,5 @@
+use crate::MAX_DECODED_BYTES;
+
 pub(crate) fn encode_segment(source: &[u8]) -> Result<Vec<u8>, String> {
     let mut output = Vec::with_capacity(source.len().saturating_add(source.len().div_ceil(128)));
     let mut literals = Vec::with_capacity(132);
@@ -52,7 +54,31 @@ pub(crate) fn encode_segment(source: &[u8]) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+/// Rejects an output size that the segment input cannot justify, before the
+/// output buffer is allocated. See `frame::ensure_decodable_size` for the
+/// 128-bytes-per-input-byte argument.
+pub(crate) fn ensure_decoded_size_fits(
+    expected_length: usize,
+    encoded_length: usize,
+) -> Result<(), String> {
+    if expected_length > MAX_DECODED_BYTES {
+        return Err(format!(
+            "declared segment output {expected_length} exceeds the {MAX_DECODED_BYTES}-byte limit"
+        ));
+    }
+    let expansion_limit = encoded_length
+        .checked_mul(128)
+        .ok_or_else(|| "RLE segment size overflow".to_owned())?;
+    if expected_length > expansion_limit {
+        return Err(format!(
+            "declared segment output {expected_length} exceeds the {expansion_limit}-byte expansion bound for a {encoded_length}-byte segment"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn decode_segment(encoded: &[u8], expected_length: usize) -> Result<Vec<u8>, String> {
+    ensure_decoded_size_fits(expected_length, encoded.len())?;
     let mut output = Vec::with_capacity(expected_length);
     let mut input = 0usize;
     while input < encoded.len() {
@@ -169,5 +195,26 @@ mod tests {
         expected.extend(0..128);
         expected.extend_from_slice(&[254, 200, 1, 5, 6]);
         assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn encodes_a_two_byte_tail_run_as_a_literal() {
+        let encoded = encode_segment(&[1, 2, 3, 3]).unwrap();
+        assert_eq!(encoded, [3, 1, 2, 3, 3]);
+        assert_eq!(decode_segment(&encoded, 4).unwrap(), [1, 2, 3, 3]);
+        assert_eq!(encode_segment(&[7, 7]).unwrap(), [1, 7, 7]);
+        // fo-dicom's repeat-2 form of the same bytes must still decode.
+        assert_eq!(
+            decode_segment(&[1, 1, 2, 0xff, 3], 4).unwrap(),
+            [1, 2, 3, 3]
+        );
+    }
+
+    #[test]
+    fn rejects_an_output_size_beyond_the_segment_input() {
+        let error = decode_segment(&[0x00, 0x2a], 1_000_000).unwrap_err();
+        assert!(error.contains("expansion"), "{error}");
+        let error = ensure_decoded_size_fits((1 << 30) + 1, 2).unwrap_err();
+        assert!(error.contains("limit"), "{error}");
     }
 }

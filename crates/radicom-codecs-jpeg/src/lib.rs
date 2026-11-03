@@ -16,6 +16,12 @@ mod lossless;
 mod marker;
 mod sequential;
 
+/// Upper bound on the samples a single SOF may declare, shared with the other
+/// pure-Rust codecs (`docs/design/radicom-codecs-design.md`). The decoders
+/// check it before allocating so a crafted 65535x65535 header is a managed
+/// error instead of an allocation failure.
+pub(crate) const MAX_DECODED_SAMPLES: u64 = 1 << 28;
+
 macro_rules! sequential_jpeg_codec {
     ($type:ident, $name:literal, $syntax:ident, $baseline:expr) => {
         #[derive(Debug, Default, Clone, Copy)]

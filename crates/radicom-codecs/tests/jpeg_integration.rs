@@ -13,6 +13,7 @@ fn install() -> std::sync::MutexGuard<'static, ()> {
 }
 use radicom::pixel::{
     codec::{CodecParams, JpegParams},
+    transcoder::Transcoder,
     PixelData, PixelDataRef,
 };
 
@@ -228,4 +229,115 @@ fn jpeg_baseline_restart_intervals_do_not_change_reconstruction() {
     // therefore the reconstructed samples, must be identical.
     assert_eq!(decoded[0], decoded[1]);
     assert_eq!(decoded[0], decoded[2]);
+}
+
+/// Two-frame 8-bit RGB source; the second frame is a different gradient.
+fn two_frame_source(rows: u16, cols: u16) -> Dataset {
+    let mut dataset = source(rows, cols, 8, 8, 3);
+    let frame: Vec<u8> = (0..usize::from(rows) * usize::from(cols) * 3)
+        .map(|i| ((i / 7) % 256) as u8)
+        .collect();
+    PixelData::from_dataset(&mut dataset)
+        .unwrap()
+        .add_frame(&frame)
+        .unwrap();
+    dataset
+}
+
+#[test]
+fn jpeg_422_conversion_keeps_every_frame_aligned() {
+    let _guard = install();
+    let (rows, cols) = (8u16, 16u16);
+    let source = two_frame_source(rows, cols);
+    // A 4:2:2 encode labels the compressed dataset YBR_FULL_422, so the decode
+    // destination is 2 B/px while conversion writes 3 B/px.
+    let params = JpegParams {
+        sample_factor: radicom::pixel::codec::SampleFactor::Half,
+        ..Default::default()
+    };
+    let compressed = source
+        .clone_with_syntax(
+            syntaxes::JPEG_PROCESS_1.clone(),
+            Some(CodecParams::Jpeg(params)),
+        )
+        .unwrap();
+    assert_eq!(
+        compressed.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+        "YBR_FULL_422"
+    );
+    let decoded = Transcoder::new(
+        compressed.transfer_syntax(),
+        syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+        Some(CodecParams::Jpeg(JpegParams {
+            convert_colorspace_to_rgb: true,
+            ..Default::default()
+        })),
+        None,
+    )
+    .transcode_dataset(&compressed)
+    .unwrap();
+    assert_eq!(
+        decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+        "RGB"
+    );
+    let frames = PixelDataRef::from_dataset(&decoded).unwrap();
+    let first = frames.get_frame(0).unwrap().data().unwrap().to_vec();
+    let second = frames.get_frame(1).unwrap().data().unwrap().to_vec();
+    assert_eq!(first.len(), usize::from(rows) * usize::from(cols) * 3);
+    assert_eq!(second.len(), first.len());
+    assert_ne!(first, second, "frames must not alias after conversion");
+
+    // Frame 1 decoded on its own is the reference for its content.
+    let mut single = compressed.clone();
+    single.remove(Tag::PIXEL_DATA);
+    single.remove(Tag::NUMBER_OF_FRAMES);
+    let codestream = PixelDataRef::from_dataset(&compressed)
+        .unwrap()
+        .get_frame(1)
+        .unwrap()
+        .data()
+        .unwrap()
+        .to_vec();
+    PixelData::create_new(&mut single)
+        .unwrap()
+        .add_frame(codestream)
+        .unwrap();
+    let alone = Transcoder::new(
+        single.transfer_syntax(),
+        syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+        Some(CodecParams::Jpeg(JpegParams {
+            convert_colorspace_to_rgb: true,
+            ..Default::default()
+        })),
+        None,
+    )
+    .transcode_dataset(&single)
+    .unwrap();
+    assert_eq!(frame_bytes(&alone), second);
+}
+
+fn pixel_data_vr(dataset: &Dataset) -> Vr {
+    match dataset.item(&Tag::PIXEL_DATA) {
+        Some(radicom::model::item::DicomItem::Fragments(fragments)) => fragments.vr(),
+        other => panic!("expected encapsulated pixel data, got {other:?}"),
+    }
+}
+
+#[test]
+fn encapsulated_pixel_data_uses_ob_for_wide_samples() {
+    let _guard = install();
+    for (allocated, stored, syntax) in [
+        (16u16, 16u16, syntaxes::JPEG_LOSSLESS_PROCESS_14.clone()),
+        (16, 12, syntaxes::JPEG_PROCESS_2_4.clone()),
+        (8, 8, syntaxes::JPEG_PROCESS_1.clone()),
+    ] {
+        let compressed = source(8, 8, allocated, stored, 1)
+            .clone_with_syntax(syntax, None)
+            .unwrap();
+        assert_eq!(
+            pixel_data_vr(&compressed),
+            Vr::Ob,
+            "encapsulated BA={allocated} BS={stored} must use OB"
+        );
+    }
 }

@@ -1,6 +1,7 @@
-use super::header::RleHeader;
+use super::header::{RleHeader, HEADER_LENGTH};
 use super::layout::RleLayout;
 use super::segment::{decode_segment, encode_segment};
+use crate::MAX_DECODED_BYTES;
 
 pub(crate) fn encode_frame(layout: &RleLayout, raw: &[u8]) -> Result<Vec<u8>, String> {
     if raw.len() < layout.frame_length {
@@ -44,6 +45,7 @@ pub(crate) fn decode_frame(layout: &RleLayout, rle: &[u8]) -> Result<Vec<u8>, St
             layout.segment_count
         ));
     }
+    ensure_decodable_size(layout, rle.len())?;
     let mut raw = vec![0u8; layout.frame_length];
     for (segment_index, &start) in header.offsets().iter().enumerate() {
         let end = header
@@ -80,6 +82,30 @@ pub(crate) fn decode_frame(layout: &RleLayout, rle: &[u8]) -> Result<Vec<u8>, St
         }
     }
     Ok(raw)
+}
+
+/// Rejects a declared decoded size that the compressed frame cannot justify,
+/// before any allocation. A PackBits input byte contributes at most 128 output
+/// bytes (one literal control plus up to 128 payload bytes, or two repeat bytes
+/// for 128 output), so the bound is conservative for every legal segment.
+fn ensure_decodable_size(layout: &RleLayout, rle_len: usize) -> Result<(), String> {
+    if layout.frame_length > MAX_DECODED_BYTES || layout.pixel_count > MAX_DECODED_BYTES {
+        return Err(format!(
+            "declared decoded size (frame {} bytes, segment {} bytes) exceeds the {MAX_DECODED_BYTES}-byte limit",
+            layout.frame_length, layout.pixel_count
+        ));
+    }
+    let payload = rle_len.saturating_sub(HEADER_LENGTH);
+    let expansion_limit = payload
+        .checked_mul(128)
+        .ok_or_else(|| "RLE frame size overflow".to_owned())?;
+    if layout.frame_length > expansion_limit || layout.pixel_count > expansion_limit {
+        return Err(format!(
+            "declared decoded size (frame {} bytes, segment {} bytes) exceeds the {expansion_limit}-byte expansion bound for a {payload}-byte frame",
+            layout.frame_length, layout.pixel_count
+        ));
+    }
+    Ok(())
 }
 
 /// Expands the native LSB-first bit-packed frame to one byte per pixel.
@@ -173,5 +199,42 @@ mod tests {
         frame.extend_from_slice(&encode_segment(&[0, 1, 2]).unwrap());
         let error = decode_frame(&layout, &frame).unwrap_err();
         assert!(error.contains("is not 0 or 1"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_frame_beyond_the_packbits_expansion_bound() {
+        let layout = RleLayout::new_for_test(1000, 1000, 8, 1, 0).unwrap();
+        let mut frame = RleHeader::write(&[64]).unwrap().to_vec();
+        frame.extend_from_slice(&[0x00, 0x2a]);
+        let error = decode_frame(&layout, &frame).unwrap_err();
+        assert!(error.contains("expansion"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_frame_beyond_the_absolute_output_limit() {
+        let layout = RleLayout::new_for_test(40_000, 40_000, 8, 1, 0).unwrap();
+        let error = ensure_decodable_size(&layout, 130).unwrap_err();
+        assert!(error.contains("limit"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_segment_count_mismatch() {
+        let layout = RleLayout::new_for_test(1, 1, 8, 1, 0).unwrap();
+        let mut frame = RleHeader::write(&[64, 66]).unwrap().to_vec();
+        frame.extend_from_slice(&[0x00, 0x2a, 0x00]);
+        let error = decode_frame(&layout, &frame).unwrap_err();
+        assert!(
+            error.contains("segment count 2 does not match expected 1"),
+            "{error}"
+        );
+
+        let layout = RleLayout::new_for_test(2, 1, 16, 1, 0).unwrap();
+        let mut frame = RleHeader::write(&[64]).unwrap().to_vec();
+        frame.extend_from_slice(&[0x00, 1, 0x00, 2]);
+        let error = decode_frame(&layout, &frame).unwrap_err();
+        assert!(
+            error.contains("segment count 1 does not match expected 2"),
+            "{error}"
+        );
     }
 }

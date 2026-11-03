@@ -28,21 +28,26 @@ pub(crate) fn build_components(
     if width <= 0 || height <= 0 {
         return Err("image dimensions must be positive".into());
     }
+    let area = crate::geometry::checked_total(width as u64, height as u64, samples.len())? as usize;
     let mut components = Vec::with_capacity(samples.len());
     for (index, plane) in samples.iter().enumerate() {
-        if plane.len() != (width as usize) * (height as usize) {
+        if plane.len() != area {
             return Err("component sample count does not match the image size".into());
         }
-        let mut component = Component::new(index, 0, 0, width, height, levels, precision, signed);
+        let mut component = Component::new(index, 0, 0, width, height, levels, precision, signed)?;
         component.coefficients = plane.clone();
         components.push(component);
     }
     Ok(components)
 }
 
-/// Encodes a complete codestream for one tile.
-pub(crate) fn encode(components: &mut [Component], reversible: bool) -> Result<Vec<u8>, String> {
-    encode_with_precincts(components, reversible, None)
+/// Encodes one tile with an optional multiple component transform.
+pub(crate) fn encode_with_mct(
+    components: &mut [Component],
+    reversible: bool,
+    mct: bool,
+) -> Result<Vec<u8>, String> {
+    encode_with_precincts(components, reversible, None, mct)
 }
 
 /// Encodes one tile, optionally with explicit precinct exponents per resolution.
@@ -50,6 +55,7 @@ pub(crate) fn encode_with_precincts(
     components: &mut [Component],
     reversible: bool,
     precincts: Option<&[(u8, u8)]>,
+    mct: bool,
 ) -> Result<Vec<u8>, String> {
     if components.is_empty() {
         return Err("no components to encode".into());
@@ -59,7 +65,26 @@ pub(crate) fn encode_with_precincts(
         return Err("invalid decomposition level count".into());
     }
     let precision = components[0].precision;
-    for component in components.iter_mut() {
+    let mct = mct && components.len() >= 3;
+    if mct && reversible {
+        forward_rct(components);
+    }
+    let mut ict_planes: Option<Vec<Vec<f64>>> = None;
+    if mct && !reversible {
+        let mut planes: Vec<Vec<f64>> = components
+            .iter()
+            .map(|component| {
+                component
+                    .coefficients
+                    .iter()
+                    .map(|&v| f64::from(v))
+                    .collect()
+            })
+            .collect();
+        forward_ict_planes(&mut planes);
+        ict_planes = Some(planes);
+    }
+    for (index, component) in components.iter_mut().enumerate() {
         if component.levels != levels {
             return Err("components disagree on the decomposition level count".into());
         }
@@ -74,11 +99,14 @@ pub(crate) fn encode_with_precincts(
                 0,
             )?;
         } else {
-            let mut plane: Vec<f64> = component
-                .coefficients
-                .iter()
-                .map(|&v| f64::from(v))
-                .collect();
+            let mut plane: Vec<f64> = match &ict_planes {
+                Some(planes) => planes[index].clone(),
+                None => component
+                    .coefficients
+                    .iter()
+                    .map(|&v| f64::from(v))
+                    .collect(),
+            };
             wavelet::forward_97(
                 &mut plane,
                 component.width as usize,
@@ -230,7 +258,7 @@ pub(crate) fn encode_with_precincts(
         scod: if precincts.is_some() { 1 } else { 0 },
         progression: 0,
         layers: 1,
-        mct: 0,
+        mct: u8::from(mct),
         style: CodingStyle {
             decompositions: levels as u8,
             code_block_width: 4,
@@ -260,7 +288,7 @@ pub(crate) fn encode_with_precincts(
 
 /// Decodes a complete codestream into components with integer samples.
 pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
-    let (header, mut offset) = MainHeader::parse(data)?;
+    let (mut header, mut offset) = MainHeader::parse(data)?;
     if header.siz.xrsiz() != 1 || header.siz.yrsiz() != 1 {
         return Err("subsampled JPEG 2000 components are not supported".into());
     }
@@ -270,6 +298,24 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
     if header.siz.xtsiz < header.siz.xsiz || header.siz.ytsiz < header.siz.ysiz {
         return Err("multi-tile JPEG 2000 codestreams are not supported".into());
     }
+    if header.cap || header.siz.rsiz & 0x4000 != 0 || header.cod.style.style & 0x40 != 0 {
+        return Err("HTJ2K codestream is not supported by the classic JPEG 2000 codec".into());
+    }
+    if (0..header.siz.comps.len()).any(|index| header.coding_style(index).style & 0x40 != 0) {
+        return Err("HTJ2K codestream is not supported by the classic JPEG 2000 codec".into());
+    }
+    let width = u64::from(header.siz.xsiz) - u64::from(header.siz.xosiz);
+    let height = u64::from(header.siz.ysiz) - u64::from(header.siz.yosiz);
+    if width > i32::MAX as u64 || height > i32::MAX as u64 {
+        return Err("image dimensions exceed the supported range".into());
+    }
+    crate::geometry::checked_total(width, height, header.siz.comps.len())?;
+    if header.cod.mct > 1 {
+        return Err("unsupported multiple component transform value".into());
+    }
+    if header.cod.mct != 0 && header.siz.comps.len() < 3 {
+        return Err("multiple component transform requires at least three components".into());
+    }
     let levels = i32::from(header.cod.style.decompositions);
     let (code_block_width, code_block_height) = header.cod.style.code_block_size()?;
     let mut components = Vec::with_capacity(header.siz.comps.len());
@@ -277,18 +323,16 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
         if comp.xrsiz != 1 || comp.yrsiz != 1 {
             return Err("subsampled JPEG 2000 components are not supported".into());
         }
-        let width = header.siz.xsiz as i32 - header.siz.xosiz as i32;
-        let height = header.siz.ysiz as i32 - header.siz.yosiz as i32;
         let mut component = Component::new(
             index,
             0,
             0,
-            width,
-            height,
+            width as i32,
+            height as i32,
             levels,
             comp.precision(),
             comp.signed(),
-        );
+        )?;
         let style = header.coding_style(index);
         let precincts = if style.precincts.is_empty() {
             None
@@ -304,12 +348,15 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
     }
 
     let mut tile_data = Vec::new();
+    let mut tile_parts = 0usize;
+    let eoc_offset;
     loop {
         if offset + 2 > data.len() {
             return Err("truncated codestream before SOT".into());
         }
         let marker = u16::from_be_bytes([data[offset], data[offset + 1]]);
         if marker == EOC {
+            eoc_offset = offset;
             break;
         }
         if marker != SOT {
@@ -323,27 +370,66 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
         if sot.tile != 0 {
             return Err("only tile 0 is supported".into());
         }
+        if sot.length != 0 && sot.length < 14 {
+            return Err("tile-part length is shorter than its SOT and SOD segments".into());
+        }
         offset += 12;
-        if offset + 2 > data.len() {
-            return Err("truncated tile-part before SOD".into());
+        loop {
+            while offset + 1 < data.len() && data[offset] == 0xFF && data[offset + 1] == 0xFF {
+                offset += 1;
+            }
+            if offset + 2 > data.len() {
+                return Err("truncated tile-part before SOD".into());
+            }
+            if data[offset] != 0xFF {
+                return Err("expected marker in tile-part header".into());
+            }
+            let marker = u16::from_be_bytes([data[offset], data[offset + 1]]);
+            if marker == SOD {
+                offset += 2;
+                break;
+            }
+            if offset + 4 > data.len() {
+                return Err("truncated tile-part header segment".into());
+            }
+            let length = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+            if length < 2 || offset + 2 + length > data.len() {
+                return Err("invalid tile-part header segment length".into());
+            }
+            header.apply_tile_part_header(marker, &data[offset + 4..offset + 2 + length])?;
+            offset += 2 + length;
         }
-        let sod = u16::from_be_bytes([data[offset], data[offset + 1]]);
-        if sod != SOD {
-            return Err("missing SOD marker".into());
+        if (0..header.siz.comps.len()).any(|index| header.coding_style(index).style & 0x40 != 0) {
+            return Err("HTJ2K codestream is not supported by the classic JPEG 2000 codec".into());
         }
-        offset += 2;
         let end = if sot.length != 0 {
             sot_start
                 .checked_add(sot.length as usize)
                 .ok_or_else(|| "tile-part length overflow".to_string())?
         } else {
-            find_next_tile_marker(data, offset)?
+            // Psot=0 means "the tile-part runs to EOC", so it can only be the
+            // last tile-part of the codestream.
+            let position = find_next_tile_marker(data, offset)?;
+            if u16::from_be_bytes([data[position], data[position + 1]]) != EOC {
+                return Err("a zero-length tile-part must be the last one".into());
+            }
+            position
         };
         if end > data.len() || end < offset {
             return Err("tile-part extends past the codestream".into());
         }
+        tile_parts += 1;
         tile_data.extend_from_slice(&data[offset..end]);
         offset = end;
+    }
+    if eoc_offset + 2 < data.len() {
+        let trailing = &data[eoc_offset + 2..];
+        if trailing.len() > 1 || trailing.iter().any(|&byte| byte != 0) {
+            return Err("trailing bytes after the EOC marker".into());
+        }
+    }
+    if tile_parts == 0 {
+        return Err("codestream has no tile-part".into());
     }
 
     let styles: Vec<u8> = (0..components.len())
@@ -455,6 +541,41 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
     Ok(components)
 }
 
+fn forward_rct(components: &mut [Component]) {
+    let count = components
+        .iter()
+        .take(3)
+        .map(|component| component.coefficients.len())
+        .min()
+        .unwrap_or(0);
+    for index in 0..count {
+        let r = components[0].coefficients[index];
+        let g = components[1].coefficients[index];
+        let b = components[2].coefficients[index];
+        components[0].coefficients[index] = (r + 2 * g + b) >> 2;
+        components[1].coefficients[index] = b - g;
+        components[2].coefficients[index] = r - g;
+    }
+}
+
+fn forward_ict_planes(planes: &mut [Vec<f64>]) {
+    if planes.len() < 3 {
+        return;
+    }
+    let (red, rest) = planes.split_at_mut(1);
+    let (green, blue) = rest.split_at_mut(1);
+    for ((r, g), b) in red[0]
+        .iter_mut()
+        .zip(green[0].iter_mut())
+        .zip(blue[0].iter_mut())
+    {
+        let y = 0.299 * *r + 0.587 * *g + 0.114 * *b;
+        *g = (0.5 / (1.0 - 0.114)) * (*b - y);
+        *b = (0.5 / (1.0 - 0.299)) * (*r - y);
+        *r = y;
+    }
+}
+
 fn inverse_rct(components: &mut [Component]) {
     let count = components
         .iter()
@@ -541,6 +662,7 @@ impl Siz {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::marker::{write_cap, COD, SIZ};
 
     fn pattern(width: usize, height: usize, seed: i32) -> Vec<i32> {
         (0..width * height)
@@ -555,7 +677,7 @@ mod tests {
         let samples = vec![pattern(width, height, 11)];
         let mut components =
             build_components(&samples, width as i32, height as i32, 8, false, 5).unwrap();
-        let codestream = encode(&mut components, true).unwrap();
+        let codestream = encode_with_mct(&mut components, true, false).unwrap();
         let decoded = decode(&codestream).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].samples, samples[0]);
@@ -569,7 +691,8 @@ mod tests {
         let precincts = vec![(2u8, 2u8); 6];
         let mut components =
             build_components(&samples, width as i32, height as i32, 8, false, 5).unwrap();
-        let codestream = encode_with_precincts(&mut components, true, Some(&precincts)).unwrap();
+        let codestream =
+            encode_with_precincts(&mut components, true, Some(&precincts), false).unwrap();
         let decoded = decode(&codestream).unwrap();
         assert_eq!(decoded[0].samples, samples[0]);
         let (header, _) = MainHeader::parse(&codestream).unwrap();
@@ -658,7 +781,7 @@ mod tests {
         let samples = vec![pattern];
         let mut components =
             build_components(&samples, width as i32, height as i32, 8, false, 2).unwrap();
-        let codestream = encode(&mut components, false).unwrap();
+        let codestream = encode_with_mct(&mut components, false, false).unwrap();
         let decoded = decode(&codestream).unwrap();
         let max = samples[0]
             .iter()
@@ -677,7 +800,7 @@ mod tests {
             let samples = vec![pattern(width, height, 3)];
             let mut components =
                 build_components(&samples, width as i32, height as i32, 8, false, levels).unwrap();
-            let codestream = encode(&mut components, false).unwrap();
+            let codestream = encode_with_mct(&mut components, false, false).unwrap();
             let decoded = decode(&codestream).unwrap();
             let mut total = 0i64;
             let mut max = 0i64;
@@ -690,5 +813,296 @@ mod tests {
             println!("levels={levels} mean={mean} max={max}");
             assert!(mean < 4.0, "levels={levels} mean absolute error {mean}");
         }
+    }
+
+    fn main_segment(stream: &[u8], marker: u16) -> Option<(usize, usize)> {
+        let mut offset = 2;
+        while offset + 4 <= stream.len() {
+            let current = u16::from_be_bytes([stream[offset], stream[offset + 1]]);
+            let length = u16::from_be_bytes([stream[offset + 2], stream[offset + 3]]) as usize;
+            if current == marker {
+                return Some((offset + 4, offset + 2 + length));
+            }
+            if current == SOT || current == EOC {
+                break;
+            }
+            offset += 2 + length;
+        }
+        None
+    }
+
+    fn three_component_stream(reversible: bool, mct: bool) -> Vec<u8> {
+        let width = 48usize;
+        let height = 40usize;
+        let samples: Vec<Vec<i32>> = (0..3)
+            .map(|component| {
+                (0..width * height)
+                    .map(|i| ((i * 13 + component * 29) % 200) as i32 - 100)
+                    .collect()
+            })
+            .collect();
+        let mut components =
+            build_components(&samples, width as i32, height as i32, 8, false, 5).unwrap();
+        encode_with_mct(&mut components, reversible, mct).unwrap()
+    }
+
+    #[test]
+    fn reversible_multiple_component_transform_round_trips_exactly() {
+        let width = 48usize;
+        let height = 40usize;
+        let samples: Vec<Vec<i32>> = (0..3)
+            .map(|component| {
+                (0..width * height)
+                    .map(|i| ((i * 13 + component * 29) % 200) as i32 - 100)
+                    .collect()
+            })
+            .collect();
+        let mut components =
+            build_components(&samples, width as i32, height as i32, 8, false, 5).unwrap();
+        let codestream = encode_with_mct(&mut components, true, true).unwrap();
+        let (header, _) = MainHeader::parse(&codestream).unwrap();
+        assert_eq!(header.cod.mct, 1);
+        let decoded = decode(&codestream).unwrap();
+        for (expected, actual) in samples.iter().zip(&decoded) {
+            assert_eq!(&actual.samples, expected);
+        }
+    }
+
+    #[test]
+    fn irreversible_multiple_component_transform_decodes_within_tolerance() {
+        let width = 48usize;
+        let height = 40usize;
+        let samples: Vec<Vec<i32>> = (0..3)
+            .map(|component| {
+                (0..width * height)
+                    .map(|i| ((i * 7 + component * 41) % 220) as i32 - 110)
+                    .collect()
+            })
+            .collect();
+        let mut components =
+            build_components(&samples, width as i32, height as i32, 8, false, 3).unwrap();
+        let codestream = encode_with_mct(&mut components, false, true).unwrap();
+        let (header, _) = MainHeader::parse(&codestream).unwrap();
+        assert_eq!(header.cod.mct, 1);
+        assert_eq!(header.cod.style.transform, 0);
+        let decoded = decode(&codestream).unwrap();
+        for (expected, actual) in samples.iter().zip(&decoded) {
+            let max = expected
+                .iter()
+                .zip(&actual.samples)
+                .map(|(a, b)| (a - b).abs())
+                .max()
+                .unwrap();
+            assert!(max <= 8, "ICT reconstruction error {max}");
+        }
+    }
+
+    #[test]
+    fn multiple_component_transform_requires_three_components() {
+        let stream = three_component_stream(true, false);
+        let (cod_payload, _) = main_segment(&stream, COD).unwrap();
+        let mut patched = stream.clone();
+        patched[cod_payload + 4] = 1; // mct = 1 with csiz = 3
+        assert_eq!(decode(&patched).unwrap().len(), 3);
+        let mut mono = {
+            let width = 16usize;
+            let samples = vec![pattern(width, 16, 1)];
+            let mut components = build_components(&samples, width as i32, 16, 8, false, 2).unwrap();
+            encode_with_mct(&mut components, true, false).unwrap()
+        };
+        let (mono_cod, _) = main_segment(&mono, COD).unwrap();
+        mono[mono_cod + 4] = 1;
+        let error = decode(&mono).unwrap_err();
+        assert!(error.contains("three components"), "{error}");
+    }
+
+    #[test]
+    fn oversized_siz_is_rejected_before_any_allocation() {
+        let mut stream = three_component_stream(true, false);
+        let (siz_payload, _) = main_segment(&stream, SIZ).unwrap();
+        stream[siz_payload + 2..siz_payload + 6].copy_from_slice(&65535u32.to_be_bytes());
+        stream[siz_payload + 6..siz_payload + 10].copy_from_slice(&65535u32.to_be_bytes());
+        stream[siz_payload + 18..siz_payload + 22].copy_from_slice(&65535u32.to_be_bytes());
+        stream[siz_payload + 22..siz_payload + 26].copy_from_slice(&65535u32.to_be_bytes());
+        let error = decode(&stream).unwrap_err();
+        assert!(error.contains("sample count"), "{error}");
+    }
+
+    #[test]
+    fn a_tile_larger_than_the_image_is_a_valid_single_tile() {
+        let stream = three_component_stream(true, false);
+        let (siz_payload, _) = main_segment(&stream, SIZ).unwrap();
+        let mut larger = stream.clone();
+        larger[siz_payload + 18..siz_payload + 22].copy_from_slice(&65535u32.to_be_bytes());
+        larger[siz_payload + 22..siz_payload + 26].copy_from_slice(&65535u32.to_be_bytes());
+        assert_eq!(decode(&larger).unwrap().len(), 3);
+
+        let mut smaller = stream.clone();
+        smaller[siz_payload + 18..siz_payload + 22].copy_from_slice(&32u32.to_be_bytes());
+        let error = decode(&smaller).unwrap_err();
+        assert!(error.contains("multi-tile"), "{error}");
+    }
+
+    #[test]
+    fn the_classic_codec_rejects_htj2k_codestreams() {
+        let stream = three_component_stream(true, false);
+        let (siz_payload, siz_end) = main_segment(&stream, SIZ).unwrap();
+        let (cod_payload, _) = main_segment(&stream, COD).unwrap();
+
+        let mut capped = stream.clone();
+        let mut cap = Vec::new();
+        write_cap(&mut cap, 2);
+        capped.splice(siz_end..siz_end, cap);
+        let error = decode(&capped).unwrap_err();
+        assert!(error.contains("HTJ2K"), "{error}");
+
+        let mut rsiz = stream.clone();
+        rsiz[siz_payload..siz_payload + 2].copy_from_slice(&0x4000u16.to_be_bytes());
+        let error = decode(&rsiz).unwrap_err();
+        assert!(error.contains("HTJ2K"), "{error}");
+
+        let mut style = stream.clone();
+        style[cod_payload + 8] |= 0x40;
+        let error = decode(&style).unwrap_err();
+        assert!(error.contains("HTJ2K"), "{error}");
+    }
+
+    #[test]
+    fn trailing_non_padding_bytes_after_eoc_are_rejected() {
+        let mut stream = three_component_stream(true, false);
+        assert_eq!(&stream[stream.len() - 2..], &EOC.to_be_bytes());
+        stream.push(0x00);
+        assert!(decode(&stream).is_ok(), "a single padding byte is allowed");
+        stream.push(0x7F);
+        let error = decode(&stream).unwrap_err();
+        assert!(error.contains("trailing"), "{error}");
+    }
+
+    #[test]
+    fn zero_length_tile_parts_are_valid_only_for_the_last_part() {
+        let stream = three_component_stream(true, false);
+        let sot = {
+            let mut offset = 2;
+            loop {
+                let marker = u16::from_be_bytes([stream[offset], stream[offset + 1]]);
+                if marker == SOT {
+                    break offset;
+                }
+                let length = u16::from_be_bytes([stream[offset + 2], stream[offset + 3]]) as usize;
+                offset += 2 + length;
+            }
+        };
+        let mut patched = stream.clone();
+        patched[sot + 6..sot + 10].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(decode(&patched).unwrap().len(), 3);
+
+        let mut short = stream.clone();
+        short[sot + 6..sot + 10].copy_from_slice(&10u32.to_be_bytes());
+        let error = decode(&short).unwrap_err();
+        assert!(error.contains("shorter"), "{error}");
+
+        let mut long = stream.clone();
+        long[sot + 6..sot + 10].copy_from_slice(&(stream.len() as u32).to_be_bytes());
+        let error = decode(&long).unwrap_err();
+        assert!(error.contains("past the codestream"), "{error}");
+    }
+
+    #[test]
+    fn trailing_tile_data_is_rejected() {
+        let stream = three_component_stream(true, false);
+        let sot = {
+            let mut offset = 2;
+            loop {
+                let marker = u16::from_be_bytes([stream[offset], stream[offset + 1]]);
+                if marker == SOT {
+                    break offset;
+                }
+                let length = u16::from_be_bytes([stream[offset + 2], stream[offset + 3]]) as usize;
+                offset += 2 + length;
+            }
+        };
+        let mut patched = stream;
+        let psot = u32::from_be_bytes([
+            patched[sot + 6],
+            patched[sot + 7],
+            patched[sot + 8],
+            patched[sot + 9],
+        ]);
+        patched[sot + 6..sot + 10].copy_from_slice(&(psot + 1).to_be_bytes());
+        patched.insert(patched.len() - 2, 0xAA);
+        let error = decode(&patched).unwrap_err();
+        assert!(error.contains("trailing bytes"), "{error}");
+    }
+
+    #[test]
+    fn tile_part_coc_and_qcc_are_applied() {
+        let samples = vec![pattern(24, 20, 3)];
+        let mut components = build_components(&samples, 24, 20, 8, false, 2).unwrap();
+        let stream = encode_with_mct(&mut components, true, false).unwrap();
+        let marker = |code| {
+            stream
+                .windows(2)
+                .position(|pair| pair == [0xFF, code])
+                .unwrap_or_else(|| panic!("marker 0x{code:02X}"))
+        };
+        let (cod, qcd, sot, sod) = (marker(0x52), marker(0x5C), marker(0x90), marker(0x93));
+        let cod_length = u16::from_be_bytes([stream[cod + 2], stream[cod + 3]]) as usize;
+        let qcd_length = u16::from_be_bytes([stream[qcd + 2], stream[qcd + 3]]) as usize;
+        let mut coc = vec![0u8, stream[cod + 4]];
+        coc.extend_from_slice(&stream[cod + 9..cod + 2 + cod_length]);
+        let mut qcc = vec![0u8];
+        qcc.extend_from_slice(&stream[qcd + 4..qcd + 2 + qcd_length]);
+        let mut insertion = vec![0xFF, 0x53];
+        insertion.extend_from_slice(&(coc.len() as u16 + 2).to_be_bytes());
+        insertion.extend_from_slice(&coc);
+        insertion.extend_from_slice(&[0xFF, 0x5D]);
+        insertion.extend_from_slice(&(qcc.len() as u16 + 2).to_be_bytes());
+        insertion.extend_from_slice(&qcc);
+
+        let mut patched = stream[..sod].to_vec();
+        patched.extend_from_slice(&insertion);
+        patched.extend_from_slice(&stream[sod..]);
+        let psot = u32::from_be_bytes([
+            patched[sot + 6],
+            patched[sot + 7],
+            patched[sot + 8],
+            patched[sot + 9],
+        ]);
+        patched[sot + 6..sot + 10].copy_from_slice(&(psot + insertion.len() as u32).to_be_bytes());
+
+        let decoded = decode(&patched).unwrap();
+        assert_eq!(decoded[0].samples, samples[0]);
+    }
+
+    #[test]
+    fn every_truncation_of_a_valid_codestream_is_rejected() {
+        let stream = three_component_stream(true, false);
+        for length in [0, 1, 2, 3, stream.len() - 1] {
+            assert!(decode(&stream[..length]).is_err(), "length {length}");
+        }
+    }
+
+    #[test]
+    fn scalar_derived_quantization_decodes_end_to_end() {
+        let samples = vec![pattern(16, 16, 5)];
+        let mut components = build_components(&samples, 16, 16, 8, false, 0).unwrap();
+        let stream = encode_with_mct(&mut components, true, false).unwrap();
+        let (header, _) = MainHeader::parse(&stream).unwrap();
+        let marker = stream
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0x5C])
+            .expect("QCD marker");
+        let length = u16::from_be_bytes([stream[marker + 2], stream[marker + 3]]) as usize;
+        let end = marker + 2 + length;
+        let style1 = Quantization {
+            guard_bits: header.qcd.guard_bits,
+            style: 1,
+            steps: vec![header.qcd.steps[0]],
+        };
+        let mut patched = stream[..marker].to_vec();
+        style1.write(&mut patched);
+        patched.extend_from_slice(&stream[end..]);
+        let decoded = decode(&patched).unwrap();
+        assert_eq!(decoded[0].samples, samples[0]);
     }
 }

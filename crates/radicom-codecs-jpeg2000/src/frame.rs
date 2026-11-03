@@ -354,7 +354,12 @@ fn rgb_to_ybr(r: i32, g: i32, b: i32, bits: u8) -> (i32, i32, i32) {
     )
 }
 
-pub(crate) fn encode(layout: &Layout, raw: &[u8], reversible: bool) -> Result<Vec<u8>, String> {
+pub(crate) fn encode(
+    layout: &Layout,
+    raw: &[u8],
+    reversible: bool,
+    mct: bool,
+) -> Result<Vec<u8>, String> {
     if matches!(
         layout.pi,
         PhotometricInterpretation::YbrRct | PhotometricInterpretation::YbrIct
@@ -370,7 +375,7 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], reversible: bool) -> Result<Ve
         layout.signed,
         codestream::DEFAULT_LEVELS,
     )?;
-    codestream::encode(&mut components, reversible)
+    codestream::encode_with_mct(&mut components, reversible, mct)
 }
 
 pub(crate) fn encode_ht(
@@ -398,23 +403,47 @@ pub(crate) fn encode_ht(
 
 /// Re-centres samples when a codestream carries a wider precision than the
 /// destination's `BitsStored`. fo-dicom's OpenJPH encoder writes `BitsAllocated`
-/// into SIZ, so a 12-bit dataset arrives in a 16-bit codestream. Values that do
-/// not fit the stored precision are refused instead of clamped.
+/// into SIZ, so a 12-bit dataset arrives in a 16-bit codestream. Lossless
+/// codestreams refuse values that do not fit the stored precision; lossy
+/// reconstruction overshoot is clamped instead, because ringing is expected.
 fn align_precision(components: &mut [Component], layout: &Layout) -> Result<(), String> {
     let precision = components[0].precision;
     if precision == layout.bits_stored {
         return Ok(());
     }
-    if layout.signed {
-        return Err("codestream layout does not match destination".into());
-    }
-    let shift =
-        (1i32 << (i32::from(precision) - 1)) - (1i32 << (i32::from(layout.bits_stored) - 1));
+    let lossy = components
+        .iter()
+        .any(|component| component.float_samples.is_some());
     let limit = 1i32 << (i32::from(layout.bits_stored) - 1);
+    let clamp = |value: i32| value.clamp(-limit, limit - 1);
+    if layout.signed {
+        // Signed codestream samples are not level shifted, so a wider
+        // codestream precision is only a container width: no re-centring is
+        // needed, just a range check.
+        for component in components.iter_mut() {
+            for sample in &mut component.samples {
+                if *sample < -limit || *sample >= limit {
+                    if lossy {
+                        *sample = clamp(*sample);
+                    } else {
+                        return Err(
+                            "codestream samples do not fit the destination Bits Stored".into()
+                        );
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+    let shift = (1i32 << (i32::from(precision) - 1)) - limit;
     for component in components.iter_mut() {
         for sample in &mut component.samples {
             let value = *sample + shift;
             if value < -limit || value >= limit {
+                if lossy {
+                    *sample = clamp(value);
+                    continue;
+                }
                 return Err("codestream samples do not fit the destination Bits Stored".into());
             }
             *sample = value;
@@ -472,21 +501,53 @@ pub(crate) fn decode(layout: &Layout, data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Sets the encoded dataset's colour metadata. `mct_label` is the photometric
 /// interpretation an applied multiple component transform requires
-/// (`YBR_RCT`/`YBR_ICT`); without one the codec writes RGB.
+/// (`YBR_RCT`/`YBR_ICT`); without one the codec writes RGB when the caller
+/// asked for it or when the source was converted from YBR to RGB.
 pub(crate) fn update_color_metadata(
     dst: &mut PixelData<'_>,
     layout: &Layout,
     mct_label: Option<&str>,
+    update_photometric: bool,
 ) {
-    if layout.components == 3 {
-        dst.dataset_mut().insert_str(
-            Tag::PHOTOMETRIC_INTERPRETATION,
-            Vr::Cs,
-            mct_label.unwrap_or("RGB"),
-        );
-        dst.dataset_mut()
-            .insert_value(Tag::PLANAR_CONFIGURATION, 0u16);
+    if layout.components != 3 {
+        return;
     }
+    let converted_from_ybr = matches!(
+        layout.pi,
+        PhotometricInterpretation::YbrFull | PhotometricInterpretation::YbrFull422
+    );
+    if let Some(label) = mct_label {
+        dst.dataset_mut()
+            .insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, label);
+    } else if update_photometric || converted_from_ybr {
+        dst.dataset_mut()
+            .insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "RGB");
+    }
+    dst.dataset_mut()
+        .insert_value(Tag::PLANAR_CONFIGURATION, 0u16);
+}
+
+/// Encapsulated 16-bit Pixel Data must carry OB, not OW. The dataset stores
+/// encapsulated pixel data as a fragment sequence, so the sequence is rebuilt
+/// with the same fragments and the other VR.
+pub(crate) fn use_ob_vr_for_16_bit(dst: &mut PixelData<'_>) {
+    use radicom::model::item::DicomItem;
+
+    if !matches!(dst.bits_allocated(), Ok(16)) {
+        return;
+    }
+    let fragments = match dst.dataset().item(&Tag::PIXEL_DATA) {
+        Some(DicomItem::Fragments(sequence)) if sequence.vr() == Vr::Ow => {
+            sequence.fragments().to_vec()
+        }
+        _ => return,
+    };
+    let mut replacement = radicom::model::item::DicomFragmentSequence::new(Tag::PIXEL_DATA, Vr::Ob);
+    for fragment in fragments {
+        replacement.push_fragment(fragment);
+    }
+    dst.dataset_mut()
+        .insert_or_update(DicomItem::Fragments(replacement));
 }
 
 pub(crate) fn update_decoded_color_metadata(dst: &mut PixelData<'_>, layout: &Layout) {
@@ -551,7 +612,7 @@ mod tests {
         let centered: Vec<i32> = values.iter().map(|value| value - 32768).collect();
         let mut components =
             crate::codestream::build_components(&[centered], width, height, 16, false, 2).unwrap();
-        crate::codestream::encode(&mut components, true).unwrap()
+        crate::codestream::encode_with_mct(&mut components, true, false).unwrap()
     }
 
     fn narrow_layout() -> Layout {
@@ -587,5 +648,66 @@ mod tests {
         let values: Vec<i32> = (0..(32 * 8)).map(|i| 4095 + (i % 900)).collect();
         let error = decode(&narrow_layout(), &full_width_codestream(&values)).unwrap_err();
         assert!(error.contains("do not fit"), "{error}");
+    }
+
+    #[test]
+    fn signed_full_width_codestream_decodes_into_a_narrower_destination() {
+        let values: Vec<i32> = (0..(32 * 8)).map(|i| (i * 53) % 4096 - 2048).collect();
+        let mut components =
+            crate::codestream::build_components(std::slice::from_ref(&values), 32, 8, 16, true, 2)
+                .unwrap();
+        let stream = crate::codestream::encode_with_mct(&mut components, true, false).unwrap();
+        let layout = Layout {
+            signed: true,
+            ..narrow_layout()
+        };
+        let bytes = decode(&layout, &stream).unwrap();
+        for (index, value) in values.iter().enumerate() {
+            let stored = i16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
+            assert_eq!(i32::from(stored), *value, "sample {index}");
+        }
+    }
+
+    #[test]
+    fn signed_ht_full_width_codestream_decodes_into_a_narrower_destination() {
+        let values: Vec<i32> = (0..(32 * 8)).map(|i| (i * 53) % 4096 - 2048).collect();
+        let mut components =
+            crate::codestream::build_components(std::slice::from_ref(&values), 32, 8, 16, true, 2)
+                .unwrap();
+        let options = ht_codestream::EncodeOptions {
+            progression: 0,
+            reversible: true,
+            levels: 2,
+            mct: false,
+            quality: 0,
+            insert_tlm: false,
+        };
+        let stream = ht_codestream::encode(&mut components, &options).unwrap();
+        let layout = Layout {
+            signed: true,
+            ..narrow_layout()
+        };
+        let bytes = decode_ht(&layout, &stream, None).unwrap();
+        for (index, value) in values.iter().enumerate() {
+            let stored = i16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
+            assert_eq!(i32::from(stored), *value, "sample {index}");
+        }
+    }
+
+    #[test]
+    fn lossy_overshoot_is_clamped_but_lossless_refuses_it() {
+        let mut components = vec![Component::new(0, 0, 0, 2, 1, 0, 16, false).unwrap()];
+        components[0].samples = vec![40000, -40000];
+        components[0].float_samples = Some(vec![0.0; 2]);
+        let mut layout = narrow_layout();
+        layout.width = 2;
+        layout.height = 1;
+        layout.frame_len = 4;
+        align_precision(&mut components, &layout).unwrap();
+        assert_eq!(components[0].samples, vec![2047, -2048]);
+
+        components[0].float_samples = None;
+        components[0].samples = vec![40000, -40000];
+        assert!(align_precision(&mut components, &layout).is_err());
     }
 }

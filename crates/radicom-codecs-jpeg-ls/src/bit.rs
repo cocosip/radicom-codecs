@@ -103,8 +103,13 @@ impl<'a> BitReader<'a> {
                 return Err("non-zero JPEG-LS padding bits".into());
             }
         }
-        if self.pos != self.data.len() {
-            return Err("trailing JPEG-LS entropy data".into());
+        if self.pos < self.data.len() {
+            // Writers may pad an entropy segment with zero bytes before the
+            // next marker (fo-dicom pads a fragment to an even length) and
+            // CharLS accepts a trailing 0x00 as well.
+            if self.data[self.pos..].iter().any(|byte| *byte != 0) {
+                return Err("trailing JPEG-LS entropy data".into());
+            }
         }
         Ok(())
     }
