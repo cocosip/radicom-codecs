@@ -742,7 +742,11 @@ fn decode_component_line(
     while x < width {
         let ra = if x == 0 { previous[0] } else { current[x - 1] };
         let rb = previous[x];
-        let rc = if x == 0 { previous_left } else { previous[x - 1] };
+        let rc = if x == 0 {
+            previous_left
+        } else {
+            previous[x - 1]
+        };
         let rd = if x + 1 == width { rb } else { previous[x + 1] };
         let qs = context_id(ra, rb, rc, rd, &c.preset, c.near as i32);
         if qs == 0 {
@@ -791,17 +795,8 @@ fn decode_component_line(
             }
         } else {
             let idx = qs.unsigned_abs() as usize;
-            current[x] = decode_regular(
-                reader,
-                &mut contexts[idx],
-                qs,
-                ra,
-                rb,
-                rc,
-                c,
-                limit,
-                qbpp,
-            )?;
+            current[x] =
+                decode_regular(reader, &mut contexts[idx], qs, ra, rb, rc, c, limit, qbpp)?;
             x += 1;
         }
     }
@@ -901,8 +896,7 @@ pub(crate) fn decode_line_scan_planes(
                     }
                 }
                 previous_left[index] = previous[offset];
-                previous[offset..offset + width]
-                    .copy_from_slice(&current[offset..offset + width]);
+                previous[offset..offset + width].copy_from_slice(&current[offset..offset + width]);
             }
         }
     }
@@ -910,11 +904,7 @@ pub(crate) fn decode_line_scan_planes(
     Ok(planes)
 }
 
-fn decode_line_scan(
-    c: ScanConfig,
-    scan: &[u8],
-    restart_interval: u32,
-) -> Result<Vec<u16>, String> {
+fn decode_line_scan(c: ScanConfig, scan: &[u8], restart_interval: u32) -> Result<Vec<u16>, String> {
     let geometry: Vec<(usize, usize, usize)> =
         (0..c.components).map(|_| (c.width, c.height, 1)).collect();
     let planes = decode_line_scan_planes(c, &geometry, scan, restart_interval)?;

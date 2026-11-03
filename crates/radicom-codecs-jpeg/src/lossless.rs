@@ -138,9 +138,7 @@ impl LosslessFrame {
                     ));
                 }
                 if seen[slot] {
-                    return Err(format!(
-                        "JPEG lossless scan repeats component {component}"
-                    ));
+                    return Err(format!("JPEG lossless scan repeats component {component}"));
                 }
                 seen[slot] = true;
             }
@@ -150,8 +148,9 @@ impl LosslessFrame {
             for pixel in 0..self.width * self.height {
                 let x = pixel % self.width;
                 let y = pixel / self.width;
-                let restart_pixel = restart_interval
-                    .is_some_and(|interval| pixel != 0 && pixel.is_multiple_of(usize::from(interval)));
+                let restart_pixel = restart_interval.is_some_and(|interval| {
+                    pixel != 0 && pixel.is_multiple_of(usize::from(interval))
+                });
                 if restart_pixel {
                     entropy.flush_to_byte();
                     output_bytes(&mut output, entropy.take_bytes());
@@ -224,8 +223,7 @@ impl LosslessFrame {
                             || precision != expected.precision
                             || components != expected.components
                         {
-                            return Err("codestream layout does not match destination"
-                                .to_owned());
+                            return Err("codestream layout does not match destination".to_owned());
                         }
                     }
                     let expected = width
@@ -244,8 +242,7 @@ impl LosslessFrame {
                 Marker::Dri => restart_interval = parse_restart_interval(&payload)?,
                 Marker::App(_) | Marker::Com => {}
                 Marker::Sos => {
-                    let Some((width, height, precision, components, component_ids)) = header
-                    else {
+                    let Some((width, height, precision, components, component_ids)) = header else {
                         return Err("missing JPEG SOF3".to_owned());
                     };
                     let scan = parse_sos(&payload, precision, components, &component_ids)?;
@@ -331,8 +328,8 @@ fn decode_scan(
     for mcu in 0..mcus {
         let x = mcu % width;
         let y = mcu / width;
-        let restart =
-            restart_interval.is_some_and(|interval| mcu != 0 && mcu.is_multiple_of(usize::from(interval)));
+        let restart = restart_interval
+            .is_some_and(|interval| mcu != 0 && mcu.is_multiple_of(usize::from(interval)));
         if restart {
             bits.align_to_byte();
             let marker = bits.take_marker()?.ok_or_else(|| {
@@ -442,7 +439,8 @@ fn dht_payload() -> Vec<u8> {
 
 fn sos_payload(scan: &[u8], predictor: u8, point_transform: u8) -> Result<Vec<u8>, String> {
     validate_predictor(predictor)?;
-    let count = u8::try_from(scan.len()).map_err(|_| "JPEG scan has too many components".to_owned())?;
+    let count =
+        u8::try_from(scan.len()).map_err(|_| "JPEG scan has too many components".to_owned())?;
     let mut payload = Vec::with_capacity(2 + scan.len() * 2 + 3);
     payload.push(count);
     for &component in scan {
@@ -543,12 +541,7 @@ fn parse_sos(
         let index = component_ids[..usize::from(components)]
             .iter()
             .position(|&id| id == pair[0])
-            .ok_or_else(|| {
-                format!(
-                    "JPEG lossless SOS references unknown component {}",
-                    pair[0]
-                )
-            })?;
+            .ok_or_else(|| format!("JPEG lossless SOS references unknown component {}", pair[0]))?;
         if scan_components
             .iter()
             .any(|&(component, _): &(u8, u8)| usize::from(component) == index)
@@ -829,9 +822,7 @@ mod tests {
         repeated[sos[1] + 5] = 1;
         let error = decode_any(&repeated).unwrap_err();
         assert!(error.contains("more than one scan"), "{error}");
-        let missing = frame
-            .encode_scans(1, 0, None, &[vec![0], vec![1]])
-            .unwrap();
+        let missing = frame.encode_scans(1, 0, None, &[vec![0], vec![1]]).unwrap();
         let error = decode_any(&missing).unwrap_err();
         assert!(error.contains("every component"), "{error}");
     }

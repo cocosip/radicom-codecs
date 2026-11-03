@@ -315,7 +315,9 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
         }
     }
     let maximum = ((1u32 << frame.precision) - 1) as u16;
-    let preset = preset.map(|value| value.resolve(maximum, near)).transpose()?;
+    let preset = preset
+        .map(|value| value.resolve(maximum, near))
+        .transpose()?;
     Ok(ParsedHeader {
         frame,
         sampling,
@@ -607,9 +609,11 @@ mod tests {
         assert_eq!(uniform.sampling, vec![(1, 1); 3]);
 
         // T.81 B.2.2: factors are in 1..=4 and the table selector must be zero.
-        assert!(parse_header(&header_with_sampling(&[(0, 1), (1, 1), (1, 1)], 1))
-            .unwrap_err()
-            .contains("unsupported SOF55 sampling factors"));
+        assert!(
+            parse_header(&header_with_sampling(&[(0, 1), (1, 1), (1, 1)], 1))
+                .unwrap_err()
+                .contains("unsupported SOF55 sampling factors")
+        );
         assert!(parse_header(&header_with_sampling(&[(5, 1), (1, 1), (1, 1)], 1)).is_err());
         assert!(parse_header(&header_with_sampling(&[(1, 1), (1, 1), (1, 1)], 1)).is_ok());
     }
@@ -617,9 +621,11 @@ mod tests {
     #[test]
     fn rejects_sample_interleaving_of_unequal_components() {
         // T.87 C.2.3: sample interleaving needs identical columns and lines.
-        assert!(parse_header(&header_with_sampling(&[(2, 4), (2, 1), (1, 2)], 2))
-            .unwrap_err()
-            .contains("sample interleaving requires equal component dimensions"));
+        assert!(
+            parse_header(&header_with_sampling(&[(2, 4), (2, 1), (1, 2)], 2))
+                .unwrap_err()
+                .contains("sample interleaving requires equal component dimensions")
+        );
         // Line interleaving carries sub-sampled components, so it stays legal.
         assert!(parse_header(&header_with_sampling(&[(2, 4), (2, 1), (1, 2)], 1)).is_ok());
     }

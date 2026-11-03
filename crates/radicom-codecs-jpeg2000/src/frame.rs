@@ -408,7 +408,8 @@ fn align_precision(components: &mut [Component], layout: &Layout) -> Result<(), 
     if layout.signed {
         return Err("codestream layout does not match destination".into());
     }
-    let shift = (1i32 << (i32::from(precision) - 1)) - (1i32 << (i32::from(layout.bits_stored) - 1));
+    let shift =
+        (1i32 << (i32::from(precision) - 1)) - (1i32 << (i32::from(layout.bits_stored) - 1));
     let limit = 1i32 << (i32::from(layout.bits_stored) - 1);
     for component in components.iter_mut() {
         for sample in &mut component.samples {
@@ -548,15 +549,8 @@ mod tests {
         let width = 32;
         let height = 8;
         let centered: Vec<i32> = values.iter().map(|value| value - 32768).collect();
-        let mut components = crate::codestream::build_components(
-            &[centered],
-            width,
-            height,
-            16,
-            false,
-            2,
-        )
-        .unwrap();
+        let mut components =
+            crate::codestream::build_components(&[centered], width, height, 16, false, 2).unwrap();
         crate::codestream::encode(&mut components, true).unwrap()
     }
 
@@ -595,5 +589,3 @@ mod tests {
         assert!(error.contains("do not fit"), "{error}");
     }
 }
-
-

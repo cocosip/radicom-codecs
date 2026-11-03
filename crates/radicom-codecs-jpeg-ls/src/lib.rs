@@ -394,7 +394,10 @@ mod facade_tests {
                 let mut d = PixelData::create_new(&mut enc).unwrap();
                 c.encode(&s, &mut d, &params).unwrap();
             }
-            let codestream = PixelDataRef::from_dataset(&enc).unwrap().get_frame(0).unwrap();
+            let codestream = PixelDataRef::from_dataset(&enc)
+                .unwrap()
+                .get_frame(0)
+                .unwrap();
             let bytes = codestream.data().unwrap();
             assert_eq!(
                 bytes

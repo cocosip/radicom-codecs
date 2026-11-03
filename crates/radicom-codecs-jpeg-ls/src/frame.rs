@@ -212,8 +212,8 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
         return Err("PALETTE COLOR requires lossless JPEG-LS (NEAR=0)".into());
     }
     let ilv = resolve_interleave(layout, p.interleave_mode)?;
-    let color_transformation = u8::try_from(p.color_transformation)
-        .map_err(|_| "unknown JPEG-LS color transformation")?;
+    let color_transformation =
+        u8::try_from(p.color_transformation).map_err(|_| "unknown JPEG-LS color transformation")?;
     if color_transformation > 3 {
         return Err("unknown JPEG-LS color transformation".into());
     }
@@ -338,7 +338,10 @@ struct PlaneGeometry {
     vertical: usize,
 }
 
-fn plane_geometry(frame: &FrameHeader, sampling: &[(u8, u8)]) -> Result<Vec<PlaneGeometry>, String> {
+fn plane_geometry(
+    frame: &FrameHeader,
+    sampling: &[(u8, u8)],
+) -> Result<Vec<PlaneGeometry>, String> {
     if sampling.len() != frame.components as usize {
         return Err("SOF55 sampling factors do not match the component count".into());
     }
@@ -370,11 +373,7 @@ fn assemble_planes(
     if components != geometry.len() || components != layout.components as usize {
         return Err("decoded planes do not match the layout".into());
     }
-    let horizontal_max = geometry
-        .iter()
-        .map(|g| g.horizontal)
-        .max()
-        .unwrap_or(1);
+    let horizontal_max = geometry.iter().map(|g| g.horizontal).max().unwrap_or(1);
     let vertical_max = geometry.iter().map(|g| g.vertical).max().unwrap_or(1);
     let mut samples = vec![0u16; layout.width * layout.height * components];
     for (index, plane) in planes.iter().enumerate() {
@@ -483,11 +482,8 @@ fn decode_planes(
                 ilv: 0,
                 preset,
             };
-            planes[entry.component] = decode_scan(
-                cfg,
-                &data[entry.start..entry.end],
-                h.restart_interval,
-            )?;
+            planes[entry.component] =
+                decode_scan(cfg, &data[entry.start..entry.end], h.restart_interval)?;
         }
         planes
     } else if first.scan.ilv == 1 && layout.components > 1 {
@@ -506,7 +502,12 @@ fn decode_planes(
             .iter()
             .map(|plane| (plane.columns, plane.lines, plane.vertical))
             .collect();
-        decode_line_scan_planes(cfg, &planes, &data[entry.start..entry.end], h.restart_interval)?
+        decode_line_scan_planes(
+            cfg,
+            &planes,
+            &data[entry.start..entry.end],
+            h.restart_interval,
+        )?
     } else {
         let cfg = ScanConfig {
             width: layout.width,
@@ -775,9 +776,14 @@ mod tests {
         let layout = mono8();
         let original = encode(&layout, &[7], &JpegLsParams::default()).unwrap();
         for end in 0..original.len() {
-            assert!(
-                decode(&layout, &original[..end], &JpegLsParams::default(), None, false).is_err()
-            );
+            assert!(decode(
+                &layout,
+                &original[..end],
+                &JpegLsParams::default(),
+                None,
+                false
+            )
+            .is_err());
         }
         for index in 0..original.len() {
             for value in 0..=255 {
@@ -807,9 +813,11 @@ mod tests {
             raw
         );
         let truncated = &encoded[..encoded.len() - 2];
-        assert!(decode(&layout, truncated, &JpegLsParams::default(), Some(0), false)
-            .unwrap_err()
-            .contains("missing EOI"));
+        assert!(
+            decode(&layout, truncated, &JpegLsParams::default(), Some(0), false)
+                .unwrap_err()
+                .contains("missing EOI")
+        );
     }
 
     #[test]
@@ -1115,7 +1123,10 @@ mod tests {
             read_pgm(&dir.join("TEST8GR4.PGM")),
             read_pgm(&dir.join("TEST8BS2.PGM")),
         ) else {
-            eprintln!("skipping: sub-sampled fixtures are not present in {}", dir.display());
+            eprintln!(
+                "skipping: sub-sampled fixtures are not present in {}",
+                dir.display()
+            );
             return;
         };
         let layout = subsampled_layout();
@@ -1161,7 +1172,10 @@ mod tests {
             read_pgm(&dir.join("TEST8GR4.PGM")),
             read_pgm(&dir.join("TEST8BS2.PGM")),
         ) else {
-            eprintln!("skipping: sub-sampled fixtures are not present in {}", dir.display());
+            eprintln!(
+                "skipping: sub-sampled fixtures are not present in {}",
+                dir.display()
+            );
             return;
         };
         let layout = subsampled_layout();
@@ -1184,7 +1198,10 @@ mod tests {
         // 256 line count of the unsampled layout.
         let dir = std::path::Path::new("../../.interop/tmp-t87/img");
         let Ok(jls) = std::fs::read(dir.join("T8SSE0.JLS")) else {
-            eprintln!("skipping: sub-sampled fixtures are not present in {}", dir.display());
+            eprintln!(
+                "skipping: sub-sampled fixtures are not present in {}",
+                dir.display()
+            );
             return;
         };
         let layout = subsampled_layout();
@@ -1198,9 +1215,22 @@ mod tests {
             codestream.extend(&jls[sos..]);
             codestream
         };
-        assert!(decode(&layout, &with_dri(64), &JpegLsParams::default(), Some(0), false).is_ok());
-        let error = decode(&layout, &with_dri(63), &JpegLsParams::default(), Some(0), false)
-            .unwrap_err();
+        assert!(decode(
+            &layout,
+            &with_dri(64),
+            &JpegLsParams::default(),
+            Some(0),
+            false
+        )
+        .is_ok());
+        let error = decode(
+            &layout,
+            &with_dri(63),
+            &JpegLsParams::default(),
+            Some(0),
+            false,
+        )
+        .unwrap_err();
         assert!(error.contains("restart marker count"), "{error}");
     }
 
@@ -1247,7 +1277,8 @@ mod tests {
                         transform as u8
                     );
                     assert_eq!(
-                        decode(&layout, &encoded, &JpegLsParams::default(), Some(0), false).unwrap(),
+                        decode(&layout, &encoded, &JpegLsParams::default(), Some(0), false)
+                            .unwrap(),
                         raw,
                         "HP{transform} {bits_stored}bit ilv{interleave_mode}"
                     );
@@ -1292,7 +1323,17 @@ mod tests {
             // SOI, then APP8 "mrfx" with the transform id, then SOF55.
             assert_eq!(
                 &encoded[2..11],
-                &[0xff, 0xe8, 0x00, 0x07, b'm', b'r', b'f', b'x', transform as u8]
+                &[
+                    0xff,
+                    0xe8,
+                    0x00,
+                    0x07,
+                    b'm',
+                    b'r',
+                    b'f',
+                    b'x',
+                    transform as u8
+                ]
             );
             assert_eq!(&encoded[11..13], &[0xff, 0xf7]);
         }
@@ -1357,14 +1398,18 @@ mod tests {
     #[test]
     fn rejects_unknown_and_misplaced_color_transformations() {
         let layout = rgb_layout(2, 2, 8, 8);
-        let raw = layout.write(&(0..12).map(|i| (i * 7) as u16).collect::<Vec<_>>()).unwrap();
+        let raw = layout
+            .write(&(0..12).map(|i| (i * 7) as u16).collect::<Vec<_>>())
+            .unwrap();
         let plain = encode(&layout, &raw, &JpegLsParams::default()).unwrap();
         let mut bad = plain[..2].to_vec();
         bad.extend([0xff, 0xe8, 0x00, 0x07, b'm', b'r', b'f', b'x', 4]);
         bad.extend(&plain[2..]);
-        assert!(decode(&layout, &bad, &JpegLsParams::default(), Some(0), false)
-            .unwrap_err()
-            .contains("unknown JPEG-LS color transformation"));
+        assert!(
+            decode(&layout, &bad, &JpegLsParams::default(), Some(0), false)
+                .unwrap_err()
+                .contains("unknown JPEG-LS color transformation")
+        );
 
         // A transform needs three components on both paths.
         assert!(encode(
@@ -1435,7 +1480,9 @@ mod tests {
         // interleaved stream with a transform has no implementation that
         // inverts it; the encoder refuses to write one.
         let layout = rgb_layout(6, 4, 8, 8);
-        let raw = layout.write(&vec![7u16; layout.width * layout.height * 3]).unwrap();
+        let raw = layout
+            .write(&vec![7u16; layout.width * layout.height * 3])
+            .unwrap();
         for (interleave_mode, transformation) in [(1u32, 1u32), (1, 2), (1, 3)] {
             let params = JpegLsParams {
                 color_transformation: transformation,

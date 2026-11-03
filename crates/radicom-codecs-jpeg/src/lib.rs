@@ -130,7 +130,13 @@ impl Codec for JpegLossless14Codec {
             self.name(),
             "decode",
         )?;
-        frame::decode_lossless(src, dst, params, lossless::Selection::Process14, self.name())
+        frame::decode_lossless(
+            src,
+            dst,
+            params,
+            lossless::Selection::Process14,
+            self.name(),
+        )
     }
 }
 
@@ -930,9 +936,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            compressed
-                .get_str(Tag::PHOTOMETRIC_INTERPRETATION)
-                .unwrap(),
+            compressed.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
             "YBR_FULL_422"
         );
         let compressed_view = PixelDataRef::from_dataset(&compressed).unwrap();
@@ -986,9 +990,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            converted
-                .get_str(Tag::PHOTOMETRIC_INTERPRETATION)
-                .unwrap(),
+            converted.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
             "RGB"
         );
         let actual = PixelDataRef::from_dataset(&converted)
@@ -1036,7 +1038,14 @@ mod tests {
                 .unwrap()
                 .add_frame(&index)
                 .unwrap();
-            let mut compressed = dataset(syntaxes::JPEG_LOSSLESS_PROCESS_14.clone(), 4, 5, bits, 1, None);
+            let mut compressed = dataset(
+                syntaxes::JPEG_LOSSLESS_PROCESS_14.clone(),
+                4,
+                5,
+                bits,
+                1,
+                None,
+            );
             compressed.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "PALETTE COLOR");
             JpegLossless14Codec
                 .encode(

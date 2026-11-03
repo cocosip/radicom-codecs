@@ -11,7 +11,9 @@ use radicom::pixel::{
 static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn install() -> std::sync::MutexGuard<'static, ()> {
-    let guard = REGISTRY_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let guard = REGISTRY_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let _ = radicom_codecs::install();
     guard
 }
@@ -176,7 +178,11 @@ fn registry_transcodes_jpeg_ls_with_restart_intervals() {
         source.insert_str(
             Tag::PHOTOMETRIC_INTERPRETATION,
             Vr::Cs,
-            if components == 1 { "MONOCHROME2" } else { "RGB" },
+            if components == 1 {
+                "MONOCHROME2"
+            } else {
+                "RGB"
+            },
         );
         let frame: Vec<u8> = (0..50 * 12 * usize::from(components))
             .map(|i| ((i * 37 + i / 5) & 0xff) as u8)
@@ -241,7 +247,11 @@ fn registry_transcodes_jpeg_ls_with_restart_intervals() {
                 // ILV=2 counts one MCU per line of the interleaved set; ILV=0/1
                 // count one MCU per line of each component, so the plane and line
                 // interleaved streams carry one restart sequence per scan (3x).
-                let scans = if components == 3 && interleave != 3 { 3 } else { 1 };
+                let scans = if components == 3 && interleave != 3 {
+                    3
+                } else {
+                    1
+                };
                 assert_eq!(
                     rst,
                     expected * scans,

@@ -87,11 +87,7 @@ impl Tables {
         } else {
             HuffmanTable::new(&COUNTS_AC_CHROMA, &VALUES_AC_CHROMA)?
         };
-        let max_qval = if extended {
-            MAX_QUANTIZATION
-        } else {
-            255
-        };
+        let max_qval = if extended { MAX_QUANTIZATION } else { 255 };
         Ok(Self {
             dc: [dc_luma, dc_chroma],
             ac: [ac_luma, ac_chroma],
@@ -1379,11 +1375,7 @@ mod tests {
         }
         let mut stream = encoded[..start].to_vec();
         stream.extend_from_slice(&[0xff, 0xdb]);
-        stream.extend_from_slice(
-            &u16::try_from(wide.len() + 2)
-                .unwrap()
-                .to_be_bytes(),
-        );
+        stream.extend_from_slice(&u16::try_from(wide.len() + 2).unwrap().to_be_bytes());
         stream.extend_from_slice(&wide);
         stream.extend_from_slice(&encoded[start + total..]);
         assert_eq!(

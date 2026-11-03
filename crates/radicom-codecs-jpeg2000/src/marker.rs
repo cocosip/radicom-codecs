@@ -573,10 +573,7 @@ impl MainHeader {
                     let mut cc = Cursor::new(payload);
                     let component = component_index(&mut cc, components)?;
                     let offset = cc.position();
-                    qccs.push((
-                        component,
-                        Quantization::parse(&payload[offset..])?,
-                    ));
+                    qccs.push((component, Quantization::parse(&payload[offset..])?));
                 }
                 TLM => {
                     let payload = c.segment()?;
@@ -943,15 +940,9 @@ mod tests {
                     .collect()
             })
             .collect();
-        let mut components = crate::codestream::build_components(
-            &samples,
-            width as i32,
-            height as i32,
-            8,
-            false,
-            2,
-        )
-        .unwrap();
+        let mut components =
+            crate::codestream::build_components(&samples, width as i32, height as i32, 8, false, 2)
+                .unwrap();
         crate::codestream::encode(&mut components, true).unwrap()
     }
 

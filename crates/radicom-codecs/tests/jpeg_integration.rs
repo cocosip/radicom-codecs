@@ -5,7 +5,9 @@ use radicom::model::{dataset::Dataset, tag::Tag, transfer_syntax::syntaxes, vr::
 static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn install() -> std::sync::MutexGuard<'static, ()> {
-    let guard = REGISTRY_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let guard = REGISTRY_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let _ = radicom_codecs::install();
     guard
 }
@@ -33,13 +35,20 @@ fn source(rows: u16, cols: u16, allocated: u16, stored: u16, components: u16) ->
     dataset.insert_str(
         Tag::PHOTOMETRIC_INTERPRETATION,
         Vr::Cs,
-        if components == 1 { "MONOCHROME2" } else { "RGB" },
+        if components == 1 {
+            "MONOCHROME2"
+        } else {
+            "RGB"
+        },
     );
     let mask = (1u32 << stored) - 1;
     let bytes_per = usize::from(allocated / 8);
     let samples = usize::from(rows) * usize::from(cols) * usize::from(components);
     let frame: Vec<u8> = (0..samples)
-        .flat_map(|i| (((i as u32).wrapping_mul(2654435761) & mask) as u16).to_le_bytes()[..bytes_per].to_vec())
+        .flat_map(|i| {
+            (((i as u32).wrapping_mul(2654435761) & mask) as u16).to_le_bytes()[..bytes_per]
+                .to_vec()
+        })
         .collect();
     {
         let mut pixels = PixelData::create_new(&mut dataset).unwrap();
@@ -198,11 +207,16 @@ fn jpeg_baseline_restart_intervals_do_not_change_reconstruction() {
             )
             .unwrap();
         let stream = frame_bytes(&compressed);
-        assert_eq!(count_marker(&stream, 0xDD), usize::from(restart != 0).min(1));
+        assert_eq!(
+            count_marker(&stream, 0xDD),
+            usize::from(restart != 0).min(1)
+        );
         if restart != 0 {
             // Baseline 4:4:4: one MCU is one 8x8 block of all components.
             let mcus = u32::from(24u16.div_ceil(8)) * u32::from(40u16.div_ceil(8));
-            let rst = (0..8).map(|i| count_marker(&stream, 0xD0 + i)).sum::<usize>();
+            let rst = (0..8)
+                .map(|i| count_marker(&stream, 0xD0 + i))
+                .sum::<usize>();
             assert_eq!(rst, mcus.div_ceil(u32::from(restart)) as usize - 1);
         }
         let restored = compressed

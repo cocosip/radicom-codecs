@@ -71,11 +71,7 @@ impl Layout {
         }
         let bits_allocated = match bits_allocated {
             8 | 16 => usize::from(bits_allocated / 8),
-            other => {
-                return Err(format!(
-                    "JPEG BitsAllocated {other} is unsupported"
-                ))
-            }
+            other => return Err(format!("JPEG BitsAllocated {other} is unsupported")),
         };
         let bits_stored =
             u8::try_from(bits_stored).map_err(|_| "JPEG BitsStored does not fit u8".to_owned())?;
@@ -93,9 +89,7 @@ impl Layout {
         let components = u8::try_from(components)
             .map_err(|_| "JPEG SamplesPerPixel does not fit u8".to_owned())?;
         if !(1..=3).contains(&components) {
-            return Err(format!(
-                "JPEG SamplesPerPixel {components} is unsupported"
-            ));
+            return Err(format!("JPEG SamplesPerPixel {components} is unsupported"));
         }
         if components > 1 && planar > 1 {
             return Err(format!("JPEG PlanarConfiguration {planar} must be 0 or 1"));
@@ -439,9 +433,7 @@ pub(crate) fn decode_sequential(
             .map_err(|e| operation_error(codec, &format!("frame {i}: {e}")))?;
         let frame = SequentialFrame::decode_expected(bytes.as_ref(), Some(&expected))
             .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?;
-        if (baseline && frame.precision != 8)
-            || (!baseline && !matches!(frame.precision, 8 | 12))
-        {
+        if (baseline && frame.precision != 8) || (!baseline && !matches!(frame.precision, 8 | 12)) {
             return Err(operation_error(
                 codec,
                 &format!("frame {i}: codestream layout does not match destination"),
@@ -453,8 +445,7 @@ pub(crate) fn decode_sequential(
     let convert = params.convert_colorspace_to_rgb
         && matches!(
             photometric,
-            Some(PhotometricInterpretation::YbrFull)
-                | Some(PhotometricInterpretation::YbrFull422)
+            Some(PhotometricInterpretation::YbrFull) | Some(PhotometricInterpretation::YbrFull422)
         )
         && frames.first().is_some_and(|frame| frame.components == 3);
     if convert && dst.pixel_representation() != 0 {
@@ -463,7 +454,8 @@ pub(crate) fn decode_sequential(
             "color conversion is unsupported for signed samples",
         ));
     }
-    let mut layout = Layout::from_destination(dst, false).map_err(|m| operation_error(codec, &m))?;
+    let mut layout =
+        Layout::from_destination(dst, false).map_err(|m| operation_error(codec, &m))?;
     if convert && layout.photometric == PhotometricInterpretation::YbrFull422 {
         // A 4:2:2 destination packs 2 bytes per pixel, but conversion produces
         // three interleaved samples per pixel labelled RGB.
@@ -538,7 +530,8 @@ pub(crate) fn encode_lossless(
             "lossless encode does not perform color conversion",
         ));
     }
-    let layout = Layout::from_source(src, true).map_err(|message| operation_error(codec, &message))?;
+    let layout =
+        Layout::from_source(src, true).map_err(|message| operation_error(codec, &message))?;
     let point_transform = u8::try_from(params.point_transform)
         .map_err(|_| operation_error(codec, "point transform must fit in u8"))?;
     if point_transform >= layout.bits_stored {
@@ -569,10 +562,10 @@ pub(crate) fn encode_lossless(
         encoded_frames.push(
             frame
                 .encode(
-                predictor,
-                point_transform,
-                (params.restart_interval != 0).then_some(params.restart_interval),
-            )
+                    predictor,
+                    point_transform,
+                    (params.restart_interval != 0).then_some(params.restart_interval),
+                )
                 .map_err(|message| {
                     operation_error(codec, &format!("frame {frame_index}: {message}"))
                 })?,

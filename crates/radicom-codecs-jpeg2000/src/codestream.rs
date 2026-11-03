@@ -578,10 +578,7 @@ mod tests {
     }
 
     fn hex_bytes(text: &str) -> Vec<u8> {
-        let digits: Vec<u8> = text
-            .bytes()
-            .filter(|b| b.is_ascii_hexdigit())
-            .collect();
+        let digits: Vec<u8> = text.bytes().filter(|b| b.is_ascii_hexdigit()).collect();
         digits
             .chunks(2)
             .map(|pair| {
@@ -636,7 +633,10 @@ mod tests {
             let difference = (samples[index] + shift - i32::from(reference)).abs();
             worst = worst.max(difference);
         }
-        assert!(worst <= 1, "decoded samples differ from OpenJPEG by {worst}");
+        assert!(
+            worst <= 1,
+            "decoded samples differ from OpenJPEG by {worst}"
+        );
     }
 
     #[test]
@@ -647,7 +647,13 @@ mod tests {
         let width = 48usize;
         let height = 40usize;
         let pattern: Vec<i32> = (0..width * height)
-            .map(|i| if (i + i / width).is_multiple_of(2) { 127 } else { -128 })
+            .map(|i| {
+                if (i + i / width).is_multiple_of(2) {
+                    127
+                } else {
+                    -128
+                }
+            })
             .collect();
         let samples = vec![pattern];
         let mut components =
