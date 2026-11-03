@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+readme = "README.md"
 repository.workspace = true
 
 [[bin]]
@@ -13,4 +14,4 @@ path = "src/main.rs"
 
 [dependencies]
 radicom.workspace = true
-radicom-codecs = { path = "../radicom-codecs", version = "0.2.0" }
+radicom-codecs.workspace = true
