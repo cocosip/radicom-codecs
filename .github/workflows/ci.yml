@@ -1,0 +1,104 @@
+name: CI
+
+# master / main: build + test only. Publishing happens exclusively from tags,
+# in release.yml.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+      - name: Test (default features)
+        run: cargo test --workspace
+
+      - name: Test (all features)
+        run: cargo test --workspace --all-features
+
+      - name: Docs
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  msrv:
+    name: msrv (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.89.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --workspace --all-features
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Validates publishable metadata (license file, dependency versions,
+      # included files) without a crates.io token. `--list` is used because
+      # `cargo package` cannot resolve our own unpublished path deps.
+      - name: Check publishable metadata
+        run: |
+          for pkg in radicom-codecs-rle radicom-codecs-jpeg radicom-codecs-jpeg-ls radicom-codecs-jpeg2000 radicom-codecs radicom-codecs-tool; do
+            echo "::group::$pkg"
+            cargo package -p "$pkg" --list
+            echo "::endgroup::"
+          done
+
+      # Every published crate must ship the README that crates.io renders.
+      - name: Every crate ships its README
+        run: |
+          for pkg in radicom-codecs-rle radicom-codecs-jpeg radicom-codecs-jpeg-ls radicom-codecs-jpeg2000 radicom-codecs radicom-codecs-tool; do
+            files=$(cargo package -p "$pkg" --list | tr -d '\r')
+            if ! printf '%s\n' "$files" | grep -qx "README.md"; then
+              echo "::error::$pkg does not package README.md"
+              exit 1
+            fi
+            echo "$pkg ships README.md"
+          done
