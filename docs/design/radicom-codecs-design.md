@@ -8,9 +8,10 @@ library owns the codec contract, parameter types, registry, pixel-data facade,
 and transcoder. This project implements that contract and registers the concrete
 codecs, mirroring the relationship between `FO-DICOM.Core` and `fo-dicom.Codecs`.
 
-The implementation is developed with local Cargo path dependencies. A consumer
-will first use a local `radicom` checkout and a local `radicom-codecs` checkout;
-publishing both crates is a later release step.
+The implementation depends on the published `radicom` crate from crates.io. The
+workspace is released as the `radicom-codecs` family; its version and the internal
+path-dependency pins are centralized at the workspace root, and publishing is
+tag-driven.
 
 ## 2. Reference boundary
 
@@ -41,13 +42,15 @@ supported profiles, algorithm stages, DICOM metadata rules, and rejection rules.
 
 ## 3. Dependency on the radicom codec interface
 
-The implementation depends on the `radicom` crate through a local path during
-development:
+The implementation depends on the published `radicom` crate from crates.io:
 
 ```toml
 [dependencies]
-radicom = { path = "../radicom/crates/radicom" }
+radicom = "0.1.0"
 ```
+
+It must not use a local path dependency, so CI and consumers build exactly the
+released package.
 
 The implementation must use these existing types from `radicom::pixel::codec`:
 

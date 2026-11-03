@@ -12,12 +12,14 @@ the four classic JPEG transfer syntaxes, both JPEG-LS transfer syntaxes, both
 classic JPEG 2000 transfer syntaxes, and the three HTJ2K transfer syntaxes are
 integrated through the existing `radicom` codec trait and registry.
 
-The `radicom` dependency is a local path dependency. CI is intentionally deferred
-until `radicom` has been published and the project can consume the released package.
+The `radicom` dependency is the released crate from crates.io. CI builds and
+validates `master`/`main`, and the tag-driven release workflow publishes the
+workspace to crates.io.
 
 ## Files and responsibilities
 
-- `Cargo.toml`: workspace members, shared package metadata, and local `radicom` path dependency.
+- `Cargo.toml`: workspace members, the single workspace version, shared package metadata,
+  internal path-dependency pins, and the published `radicom` dependency.
 - `crates/radicom-codecs`: public facade, registry implementation, explicit codec registration,
   and re-exports of family codec types.
 - `crates/radicom-codecs-rle`: RLE Lossless implementation and registration.
@@ -39,8 +41,8 @@ until `radicom` has been published and the project can consume the released pack
 
 - [x] Add the root Cargo workspace.
 - [x] Add the four family crates and the facade crate as workspace members.
-- [x] Use a local path dependency on the sibling radicom workspace.
-- [x] Do not add GitHub Actions or other CI configuration.
+- [x] Consume `radicom` from crates.io; no local path dependency.
+- [x] Add CI for `master`/`main` and a tag-driven release workflow.
 
 ### Task 2: Implement family registration types
 

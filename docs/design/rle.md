@@ -254,7 +254,7 @@ crates/radicom-codecs-rle/src/
 
 Only `RleLosslessCodec` is public initially. `layout`, `header`, `segment`, and
 `frame` types are `pub(crate)` or private. The family crate has no dependencies
-beyond the local `radicom` crate for this stage.
+beyond the `radicom` crate for this stage.
 
 Recommended internal contracts:
 
