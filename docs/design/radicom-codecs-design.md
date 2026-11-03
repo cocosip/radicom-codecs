@@ -6,7 +6,7 @@
 codecs that are intentionally absent from the `radicom` core library. The core
 library owns the codec contract, parameter types, registry, pixel-data facade,
 and transcoder. This project implements that contract and registers the concrete
-codecs, mirroring the relationship between `FO-DICOM.Core` and `fo-dicom.Codecs`.
+codecs, mirroring the relationship between `fo-dicom` and `fo-dicom.Codecs`.
 
 The implementation depends on the published `radicom` crate from crates.io. The
 workspace is released as the `radicom-codecs` family; its version and the internal
