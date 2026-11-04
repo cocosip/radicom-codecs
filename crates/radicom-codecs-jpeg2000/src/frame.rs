@@ -359,6 +359,7 @@ pub(crate) fn encode(
     raw: &[u8],
     reversible: bool,
     mct: bool,
+    quant_shift: u8,
 ) -> Result<Vec<u8>, String> {
     if matches!(
         layout.pi,
@@ -375,7 +376,7 @@ pub(crate) fn encode(
         layout.signed,
         codestream::DEFAULT_LEVELS,
     )?;
-    codestream::encode_with_mct(&mut components, reversible, mct)
+    codestream::encode_with_mct_scaled(&mut components, reversible, mct, quant_shift)
 }
 
 pub(crate) fn encode_ht(

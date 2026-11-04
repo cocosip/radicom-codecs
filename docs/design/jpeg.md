@@ -256,6 +256,14 @@ operations exactly. Restart intervals reset the predictor state at MCU
 boundaries. No DCT, quantization, smoothing, or chroma subsampling is permitted
 on this path.
 
+The encoder sizes its DC table from the image itself: it walks the prediction
+differences first, builds the optimal canonical table with the T.81 K.2 merge
+algorithm (the same procedure libjpeg runs under `optimize_coding = TRUE`), and
+writes that table in DHT before the scan. The fixed Annex K table costs about 50%
+more on real images, which is why the encoder always optimizes; the decoder is
+unchanged because it already accepts any DHT. Sequential DCT still writes the
+Annex K default tables.
+
 ## 7. Error and resource rules
 
 All malformed input, unsupported parameters, precision mismatches, overflow,

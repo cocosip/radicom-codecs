@@ -5,8 +5,11 @@ use super::huffman::HuffmanTable;
 use super::marker::{check_trailing, Marker, MarkerReader, MarkerWriter};
 use super::sequential::FrameExpectation;
 
-const HUFFMAN_COUNTS: [u8; 16] = [0, 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-const HUFFMAN_VALUES: [u8; 17] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+/// One item of the scan walk: a coded difference or a restart boundary.
+enum ScanEvent {
+    Difference(i32),
+    Restart(u8),
+}
 
 /// Scan policy imposed by the transfer syntax that owns the codestream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,16 +118,8 @@ impl LosslessFrame {
         }
         let effective_precision = self.precision - point_transform;
         let initial = 1i32 << (effective_precision - 1);
-        let huffman = HuffmanTable::new(&HUFFMAN_COUNTS, &HUFFMAN_VALUES)?;
 
-        let mut output = MarkerWriter::default();
-        output.write_marker(Marker::Soi)?;
-        output.write_segment(Marker::Sof3, &sof_payload(self)?)?;
-        output.write_segment(Marker::Dht, &dht_payload())?;
-        if let Some(interval) = restart_interval {
-            output.write_segment(Marker::Dri, &interval.to_be_bytes())?;
-        }
-        let mut reconstructed = allocate_samples(self.samples.len())?;
+        // Validate every scan before the frequency pass reads samples through it.
         let mut seen = [false; 3];
         for scan in scans {
             if scan.is_empty() {
@@ -142,57 +137,130 @@ impl LosslessFrame {
                 }
                 seen[slot] = true;
             }
+        }
+
+        // libjpeg (`optimize_coding = TRUE`) sizes the DC table from the actual
+        // differences before coding them. The fixed T.81 default table costs
+        // about 50% more, so this encoder now follows libjpeg instead.
+        let mut frequencies = [0u32; 256];
+        let mut reconstructed = allocate_samples(self.samples.len())?;
+        for scan in scans {
+            self.walk_scan(
+                scan,
+                &mut reconstructed,
+                predictor,
+                point_transform,
+                restart_interval,
+                effective_precision,
+                initial,
+                |event| {
+                    if let ScanEvent::Difference(difference) = event {
+                        frequencies[usize::from(category(difference))] += 1;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        let (huffman_counts, huffman_values) = HuffmanTable::optimal(&frequencies);
+        let huffman = HuffmanTable::new(&huffman_counts, &huffman_values)?;
+
+        let mut output = MarkerWriter::default();
+        output.write_marker(Marker::Soi)?;
+        output.write_segment(Marker::Sof3, &sof_payload(self)?)?;
+        output.write_segment(Marker::Dht, &dht_payload(&huffman_counts, &huffman_values))?;
+        if let Some(interval) = restart_interval {
+            output.write_segment(Marker::Dri, &interval.to_be_bytes())?;
+        }
+        reconstructed.fill(0);
+        for scan in scans {
             output.write_segment(Marker::Sos, &sos_payload(scan, predictor, point_transform)?)?;
             let mut entropy = BitWriter::default();
-            let mut restart_index = 0u8;
-            // T.81 G.1.2: the first row of a scan or restart interval uses the
-            // one-dimensional predictor (libjpeg's first-row undifferencer), so
-            // every interval needs its own first row, not just the first sample.
-            let mut interval_start_row = 0usize;
-            for pixel in 0..self.width * self.height {
-                let x = pixel % self.width;
-                let y = pixel / self.width;
-                let restart_pixel = restart_interval.is_some_and(|interval| {
-                    pixel != 0 && pixel.is_multiple_of(usize::from(interval))
-                });
-                if restart_pixel {
-                    entropy.flush_to_byte();
-                    output_bytes(&mut output, entropy.take_bytes());
-                    output.write_marker(Marker::Restart(restart_index))?;
-                    restart_index = (restart_index + 1) & 7;
-                    interval_start_row = y;
-                }
-                for &component in scan {
-                    let index = pixel * usize::from(self.components) + usize::from(component);
-                    let shifted = i32::from(self.samples[index] >> point_transform);
-                    let prediction = predict(
-                        &reconstructed,
-                        index,
-                        x,
-                        y,
-                        self.width,
-                        self.components,
-                        usize::from(component),
-                        predictor,
-                        initial,
-                        y == interval_start_row,
-                    );
-                    let difference = encode_difference(shifted - prediction, effective_precision);
-                    let category = category(difference);
-                    huffman.encode(category, &mut entropy)?;
-                    if category != 0 && category != 16 {
-                        let amplitude = encode_amplitude(difference, category);
-                        entropy.write_bits(amplitude, category)?;
+            self.walk_scan(
+                scan,
+                &mut reconstructed,
+                predictor,
+                point_transform,
+                restart_interval,
+                effective_precision,
+                initial,
+                |event| match event {
+                    ScanEvent::Difference(difference) => {
+                        let category = category(difference);
+                        huffman.encode(category, &mut entropy)?;
+                        if category != 0 && category != 16 {
+                            let amplitude = encode_amplitude(difference, category);
+                            entropy.write_bits(amplitude, category)?;
+                        }
+                        Ok(())
                     }
-                    reconstructed[index] = u16::try_from(shifted)
-                        .map_err(|_| "JPEG reconstructed sample is outside u16".to_owned())?;
-                }
-            }
+                    ScanEvent::Restart(index) => {
+                        entropy.flush_to_byte();
+                        output_bytes(&mut output, entropy.take_bytes());
+                        output.write_marker(Marker::Restart(index))
+                    }
+                },
+            )?;
             entropy.flush_to_byte();
             output_bytes(&mut output, entropy.take_bytes());
         }
         output.write_marker(Marker::Eoi)?;
         Ok(output.into_bytes())
+    }
+
+    /// Walks one scan in coding order, reporting each coded difference and each
+    /// restart boundary. Both the frequency pass and the entropy pass use this
+    /// walk, so the table can never disagree with the symbols actually coded.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_scan(
+        &self,
+        scan: &[u8],
+        reconstructed: &mut [u16],
+        predictor: u8,
+        point_transform: u8,
+        restart_interval: Option<u16>,
+        effective_precision: u8,
+        initial: i32,
+        mut visit: impl FnMut(ScanEvent) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut restart_index = 0u8;
+        // T.81 G.1.2: the first row of a scan or restart interval uses the
+        // one-dimensional predictor (libjpeg's first-row undifferencer), so
+        // every interval needs its own first row, not just the first sample.
+        let mut interval_start_row = 0usize;
+        for pixel in 0..self.width * self.height {
+            let x = pixel % self.width;
+            let y = pixel / self.width;
+            let restart_pixel = restart_interval
+                .is_some_and(|interval| pixel != 0 && pixel.is_multiple_of(usize::from(interval)));
+            if restart_pixel {
+                visit(ScanEvent::Restart(restart_index))?;
+                restart_index = (restart_index + 1) & 7;
+                interval_start_row = y;
+            }
+            for &component in scan {
+                let index = pixel * usize::from(self.components) + usize::from(component);
+                let shifted = i32::from(self.samples[index] >> point_transform);
+                let prediction = predict(
+                    reconstructed,
+                    index,
+                    x,
+                    y,
+                    self.width,
+                    self.components,
+                    usize::from(component),
+                    predictor,
+                    initial,
+                    y == interval_start_row,
+                );
+                visit(ScanEvent::Difference(encode_difference(
+                    shifted - prediction,
+                    effective_precision,
+                )))?;
+                reconstructed[index] = u16::try_from(shifted)
+                    .map_err(|_| "JPEG reconstructed sample is outside u16".to_owned())?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn decode(
@@ -450,11 +518,11 @@ fn sof_payload(frame: &LosslessFrame) -> Result<Vec<u8>, String> {
     Ok(payload)
 }
 
-fn dht_payload() -> Vec<u8> {
-    let mut payload = Vec::with_capacity(1 + 16 + HUFFMAN_VALUES.len());
+fn dht_payload(counts: &[u8], values: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + counts.len() + values.len());
     payload.push(0);
-    payload.extend(HUFFMAN_COUNTS);
-    payload.extend(HUFFMAN_VALUES);
+    payload.extend(counts);
+    payload.extend(values);
     payload
 }
 
@@ -780,19 +848,22 @@ mod tests {
     /// MCU row). Samples are 10 20 / 30 40, initial predictor `1<<7` = 128.
     /// Row 0 is the first row of the scan: x0 codes 10-128 = -118, x1 codes
     /// 20-10 = 10. RST0. Row 1 is the first row of the next interval: x0 codes
-    /// 30-128 = -98 and x1 codes 40-30 = 10. DCMTK 3.7.1 decodes these bytes to
-    /// exactly those four samples.
+    /// 30-128 = -98 and x1 codes 40-30 = 10.
+    ///
+    /// Those differences use categories 7, 4, 7 and 4, so the per-image table
+    /// assigns category 4 the 1-bit code `0` and category 7 the 2-bit code
+    /// `10`; the entropy bytes follow from that by hand (`10` + `0001001` + `0`
+    /// + `1010`, then `10` + `0011101` + `0` + `1010`, each padded with ones).
     ///
     /// The point of the fixture is that the second row does *not* use the 2-D
     /// predictor (which would code x1 as 40-(30+20-10)=0): a decoder that only
     /// restarts the predictor for the first pixel diverges here.
     const P4_DRI2_FIXTURE: &[u8] = &[
         0xff, 0xd8, 0xff, 0xc3, 0x00, 0x0b, 0x08, 0x00, 0x02, 0x00, 0x02, 0x01, 0x01, 0x11, 0x00,
-        0xff, 0xc4, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0xff, 0xdd, 0x00, 0x04, 0x00, 0x02, 0xff,
-        0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x04, 0x00, 0x00, 0x38, 0x92, 0x57, 0xff, 0xd0, 0x39,
-        0xd2, 0x57, 0xff, 0xd9,
+        0xff, 0xc4, 0x00, 0x15, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x07, 0xff, 0xdd, 0x00, 0x04, 0x00, 0x02, 0xff,
+        0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x04, 0x00, 0x00, 0x84, 0xab, 0xff, 0xd0, 0x8e, 0xab,
+        0xff, 0xd9,
     ];
 
     #[test]
@@ -845,6 +916,14 @@ mod tests {
             .unwrap();
         let sos_length = usize::from(u16::from_be_bytes([encoded[sos + 2], encoded[sos + 3]]));
         let entropy = &encoded[sos + 2 + sos_length..encoded.len() - 2];
+        // The encoder derives a per-image table, so reuse that exact table and
+        // only change its selector id in each added DHT segment.
+        let dht = encoded
+            .windows(2)
+            .position(|window| window == [0xff, 0xc4])
+            .unwrap();
+        let dht_length = usize::from(u16::from_be_bytes([encoded[dht + 2], encoded[dht + 3]]));
+        let dht_payload = &encoded[dht + 4..dht + 2 + dht_length];
         for table in 0..=3u8 {
             let mut stream = MarkerWriter::default();
             stream.write_marker(Marker::Soi).unwrap();
@@ -852,7 +931,7 @@ mod tests {
                 .write_segment(Marker::Sof3, &sof_payload(&frame).unwrap())
                 .unwrap();
             for id in 0..=3u8 {
-                let mut payload = dht_payload();
+                let mut payload = dht_payload.to_vec();
                 payload[0] = id;
                 stream.write_segment(Marker::Dht, &payload).unwrap();
             }

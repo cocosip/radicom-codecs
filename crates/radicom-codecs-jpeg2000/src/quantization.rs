@@ -45,9 +45,12 @@ pub(crate) fn subband_count(levels: u8) -> usize {
     }
 }
 
-/// Default irreversible step sizes: one per subband, `1 / norm`.
-pub(crate) fn irreversible_steps(levels: u8) -> Vec<f64> {
+/// Default irreversible step sizes: one per subband, `1 / norm`, multiplied by
+/// `2^shift`. `shift == 0` is the near-lossless default; larger shifts trade
+/// bit-planes for size, which is how the classic encoder implements `rate`.
+pub(crate) fn irreversible_steps(levels: u8, shift: u8) -> Vec<f64> {
     let count = subband_count(levels);
+    let scale = 2f64.powi(i32::from(shift));
     let mut steps = Vec::with_capacity(count);
     for index in 0..count {
         let resolution = if index == 0 {
@@ -62,7 +65,7 @@ pub(crate) fn irreversible_steps(levels: u8) -> Vec<f64> {
         };
         let level = i32::from(levels) - resolution;
         let norm = dwt_norm_97(level, orientation);
-        steps.push(if norm <= 0.0 { 1.0 } else { 1.0 / norm });
+        steps.push(if norm <= 0.0 { scale } else { scale / norm });
     }
     steps
 }

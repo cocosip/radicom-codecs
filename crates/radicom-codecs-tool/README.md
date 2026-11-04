@@ -124,10 +124,14 @@ For input file `study1.dcm`, output names include:
   decoded once per target format; a source already in the target format is
   saved as-is instead of being decoded and re-encoded, so lossy input is never
   compressed twice.
-- Each target uses the codec's default parameters, except JPEG 2000 Lossy
-  (`.91`), which uses `irreversible = true` and `rate = 16` like the reference
-  tool. The classic JPEG 2000 encoder currently emits one quality layer and
-  ignores `rate`.
+- Each target uses the codec's default parameters. JPEG 2000 Lossy (`.91`) is
+  therefore irreversibly coded at `rate = 20`: the encoder widens its
+  quantization steps until the frame payload reaches roughly a 20:1 ratio. Each
+  step drops whole bit-planes, so the achieved ratio overshoots the target
+  slightly. `rate = 0` means "keep every bit-plane".
+- The JPEG lossless targets (`.57`/`.70`) derive a per-image Huffman table from
+  the actual prediction differences, matching libjpeg with
+  `optimize_coding = TRUE` instead of the larger Annex K default table.
 - There is no up-front "unsupported" classification. A format that cannot
   encode the input's shape fails with the codec's own error and the remaining
   formats still run.

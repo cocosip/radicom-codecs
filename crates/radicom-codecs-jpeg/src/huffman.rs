@@ -56,6 +56,109 @@ impl HuffmanTable {
         Ok(Self { codes })
     }
 
+    /// Builds the per-image optimal DC table from symbol frequencies, the way
+    /// libjpeg's `jpeg_gen_optimal_table` does (T.81 Annex K.2): merge the two
+    /// least frequent trees repeatedly, count the resulting code lengths, then
+    /// fold lengths above 16 bits back into the shorter lengths.
+    pub(crate) fn optimal(frequencies: &[u32; 256]) -> (Vec<u8>, Vec<u8>) {
+        // libjpeg reserves symbol 256 as an always-present pseudo-symbol so the
+        // real symbols never receive the all-ones code, and it chains codes with
+        // `others`; both are local to the construction.
+        let mut freq = [0u64; 257];
+        for (symbol, &count) in frequencies.iter().enumerate() {
+            freq[symbol] = u64::from(count);
+        }
+        freq[256] = 1;
+        let mut codesize = [0u32; 257];
+        let mut others = [-1i32; 257];
+
+        loop {
+            let mut c1: isize = -1;
+            let mut smallest = u64::MAX;
+            for (symbol, &count) in freq.iter().enumerate() {
+                if count != 0 && count <= smallest {
+                    smallest = count;
+                    c1 = symbol as isize;
+                }
+            }
+            let mut c2: isize = -1;
+            smallest = u64::MAX;
+            for (symbol, &count) in freq.iter().enumerate() {
+                if count != 0 && count <= smallest && symbol as isize != c1 {
+                    smallest = count;
+                    c2 = symbol as isize;
+                }
+            }
+            // One tree left: every frequency has been merged.
+            if c2 < 0 {
+                break;
+            }
+            let c1_index = c1 as usize;
+            let c2_index = c2 as usize;
+            freq[c1_index] += freq[c2_index];
+            freq[c2_index] = 0;
+
+            let mut node = c1_index;
+            codesize[node] += 1;
+            while others[node] >= 0 {
+                node = others[node] as usize;
+                codesize[node] += 1;
+            }
+            others[node] = c2 as i32;
+
+            let mut node = c2_index;
+            codesize[node] += 1;
+            while others[node] >= 0 {
+                node = others[node] as usize;
+                codesize[node] += 1;
+            }
+        }
+
+        // `bits[length]` counts symbols of that length; index 0 is unused. The
+        // array covers every reachable depth so pathological frequency sets
+        // cannot index past the folding range.
+        let mut bits = [0u32; 257];
+        for &length in &codesize {
+            if length != 0 {
+                bits[length as usize] += 1;
+            }
+        }
+
+        // T.81 limits codes to 16 bits: pair up the longest codes, move one to
+        // the next shorter length and turn the shorter prefix into two codes one
+        // bit longer.
+        for length in (17..=256).rev() {
+            while bits[length] > 0 {
+                let mut shorter = length - 2;
+                while bits[shorter] == 0 {
+                    shorter -= 1;
+                }
+                bits[length] -= 2;
+                bits[length - 1] += 1;
+                bits[shorter + 1] += 2;
+                bits[shorter] -= 1;
+            }
+        }
+
+        // Drop the pseudo-symbol from the longest remaining length.
+        let mut longest = 16;
+        while bits[longest] == 0 {
+            longest -= 1;
+        }
+        bits[longest] -= 1;
+
+        let counts: Vec<u8> = bits[1..=16].iter().map(|&count| count as u8).collect();
+        let mut values = Vec::new();
+        for length in 1..=256 {
+            for (symbol, &size) in codesize.iter().enumerate().take(256) {
+                if size == length {
+                    values.push(symbol as u8);
+                }
+            }
+        }
+        (counts, values)
+    }
+
     pub(crate) fn encode(&self, symbol: u8, writer: &mut BitWriter) -> Result<(), String> {
         let code = self
             .codes
@@ -84,6 +187,49 @@ impl HuffmanTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optimal_table_follows_the_symbol_frequencies() {
+        let mut frequencies = [0u32; 256];
+        frequencies[0] = 1000;
+        frequencies[1] = 10;
+        frequencies[2] = 1;
+        let (counts, values) = HuffmanTable::optimal(&frequencies);
+        // The dominant symbol takes the single 1-bit code; the other two split
+        // the 2-bit codes, and the pseudo-symbol is dropped from the longest.
+        assert_eq!(counts[0], 1);
+        assert_eq!(values, vec![0, 1, 2]);
+        let table = HuffmanTable::new(&counts, &values).unwrap();
+        let mut writer = BitWriter::default();
+        for symbol in values {
+            table.encode(symbol, &mut writer).unwrap();
+        }
+        let encoded = writer.finish().unwrap();
+        let mut reader = BitReader::new(&encoded);
+        assert_eq!(reader.read_bits(1).unwrap(), 0);
+        assert_eq!(table.decode(&mut reader).unwrap(), 1);
+        assert_eq!(table.decode(&mut reader).unwrap(), 2);
+    }
+
+    #[test]
+    fn optimal_table_caps_code_lengths_at_sixteen_bits() {
+        // Exponential frequencies force a depth far beyond the 16-bit limit, so
+        // the T.81 length-folding path has to run.
+        let mut frequencies = [0u32; 256];
+        for (symbol, slot) in frequencies.iter_mut().enumerate().take(40) {
+            *slot = 1 << symbol.min(31);
+        }
+        let (counts, values) = HuffmanTable::optimal(&frequencies);
+        assert!(counts.len() == 16);
+        assert_eq!(
+            counts
+                .iter()
+                .map(|&count| usize::from(count))
+                .sum::<usize>(),
+            values.len()
+        );
+        HuffmanTable::new(&counts, &values).expect("a valid canonical table");
+    }
 
     #[test]
     fn builds_canonical_codes_and_round_trips_symbols() {

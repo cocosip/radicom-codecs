@@ -113,9 +113,16 @@ fn transcodes_lossy_within_tolerance() {
     let compressed = source
         .clone_with_syntax(
             syntaxes::JPEG_2000_LOSSY.clone(),
-            Some(CodecParams::Jpeg2000(J2kParams::default())),
+            // `rate = 0` keeps every bit-plane, so this only exercises the 9/7
+            // reconstruction accuracy; the default `rate` trades it for size.
+            Some(CodecParams::Jpeg2000(J2kParams {
+                irreversible: true,
+                rate: 0,
+                ..Default::default()
+            })),
         )
         .unwrap();
+    let near_lossless_len = frame_bytes(&compressed, 0).len();
     let decoded = compressed
         .clone_with_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(), None)
         .unwrap();
@@ -126,6 +133,16 @@ fn transcodes_lossy_within_tolerance() {
     }
     let mean = total as f64 / raw.len() as f64;
     assert!(mean < 2.0, "mean absolute error {mean}");
+
+    // The default policy (`rate = 20`) must produce a genuinely smaller payload.
+    let default_lossy = source
+        .clone_with_syntax(syntaxes::JPEG_2000_LOSSY.clone(), None)
+        .unwrap();
+    let default_lossy_len = frame_bytes(&default_lossy, 0).len();
+    assert!(
+        default_lossy_len * 2 < near_lossless_len,
+        "rate 20 payload {default_lossy_len} vs near-lossless {near_lossless_len}"
+    );
 }
 
 #[test]

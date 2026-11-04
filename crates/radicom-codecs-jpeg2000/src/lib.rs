@@ -322,11 +322,11 @@ fn operate(
             ));
         }
         let will_be_lossy = !reversible && p.irreversible;
-        if will_be_lossy && (p.rate != 20 || !p.rate_levels.is_empty()) {
+        if will_be_lossy && !p.rate_levels.is_empty() {
             return Err(error(
                 codec,
                 "encode",
-                "rate and rate_levels are not implemented by the classic JPEG 2000 encoder",
+                "rate_levels (multiple quality layers) are not implemented by the classic JPEG 2000 encoder",
             ));
         }
     }
@@ -417,10 +417,45 @@ fn operate(
             let bytes = b
                 .data()
                 .map_err(|e| error(codec, "encode", format!("frame {i}: {e}")))?;
-            frames.push(
-                frame::encode(&layout, bytes.as_ref(), encode_reversible, apply_mct)
-                    .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?,
-            );
+            // `rate` is the target compression ratio for the irreversible path.
+            // The encoder reaches it by widening the quantization step, which
+            // drops bit-planes; the codestream stays a single standard layer.
+            let target = if encode_reversible || p.rate == 0 {
+                None
+            } else {
+                Some((bytes.as_ref().len() as u64 / u64::from(p.rate)).max(1))
+            };
+            let mut quant_shift = 0u8;
+            let mut encoded = frame::encode(
+                &layout,
+                bytes.as_ref(),
+                encode_reversible,
+                apply_mct,
+                quant_shift,
+            )
+            .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?;
+            if let Some(target) = target {
+                // Each extra step halves the retained bit-planes, so estimate
+                // the jump from the observed overshoot and correct at most
+                // twice more: quantization is not exactly logarithmic.
+                for _ in 0..3 {
+                    if encoded.len() as u64 <= target || quant_shift >= 24 {
+                        break;
+                    }
+                    let overshoot = (encoded.len() as f64 / target as f64).max(1.0);
+                    let jump = overshoot.log2().ceil().clamp(1.0, 8.0) as u8;
+                    quant_shift = (quant_shift + jump).min(24);
+                    encoded = frame::encode(
+                        &layout,
+                        bytes.as_ref(),
+                        encode_reversible,
+                        apply_mct,
+                        quant_shift,
+                    )
+                    .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?;
+                }
+            }
+            frames.push(encoded);
         }
         for frame in frames {
             dst.add_frame(frame)
@@ -882,7 +917,19 @@ mod facade_tests {
     fn lossy_round_trips_within_a_small_tolerance() {
         let values: Vec<u8> = (0..16 * 16).map(|i| (i * 7 + i / 16) as u8).collect();
         let mut source = ds(16, 16, 8, 1, 0, "MONOCHROME2");
-        let decoded = round_trip(&Jpeg2000LossyCodec, &mut source, &values);
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&values)
+            .unwrap();
+        // `rate = 0` keeps every irreversible bit-plane, so the 9/7 path is
+        // near-lossless; a non-zero `rate` deliberately trades accuracy for size.
+        let params = CodecParams::Jpeg2000(J2kParams {
+            irreversible: true,
+            rate: 0,
+            ..Default::default()
+        });
+        let encoded = encode_with(&Jpeg2000LossyCodec, &mut source, &params).unwrap();
+        let decoded = decode_with(&Jpeg2000LossyCodec, &encoded, &params).unwrap();
         let actual = samples(&decoded);
         let mut total = 0i64;
         for (a, b) in values.iter().zip(&actual) {
@@ -1092,10 +1139,6 @@ mod facade_tests {
             .unwrap();
         for params in [
             J2kParams {
-                rate: 64,
-                ..Default::default()
-            },
-            J2kParams {
                 rate_levels: vec![32],
                 ..Default::default()
             },
@@ -1111,6 +1154,38 @@ mod facade_tests {
                 "unexpected error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn a_higher_lossy_rate_writes_a_smaller_codestream() {
+        fn codestream_len(source: &mut Dataset, rate: u32) -> usize {
+            let params = CodecParams::Jpeg2000(J2kParams {
+                irreversible: true,
+                rate,
+                ..Default::default()
+            });
+            let encoded = encode_with(&Jpeg2000LossyCodec, source, &params).unwrap();
+            let frame = PixelDataRef::from_dataset(&encoded)
+                .unwrap()
+                .get_frame(0)
+                .unwrap();
+            frame.data().unwrap().len()
+        }
+
+        let raw: Vec<u8> = (0..64 * 64)
+            .map(|i| ((i * 7 + (i / 64) * 5) % 256) as u8)
+            .collect();
+        let mut source = ds(64, 64, 8, 1, 0, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let near_lossless = codestream_len(&mut source, 0);
+        let lossy = codestream_len(&mut source, 20);
+        assert!(
+            lossy * 2 < near_lossless,
+            "rate 20 must shrink the codestream: {lossy} vs {near_lossless}"
+        );
     }
 
     #[test]
