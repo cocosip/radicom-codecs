@@ -116,8 +116,10 @@ impl HuffmanTable {
 
         // `bits[length]` counts symbols of that length; index 0 is unused. The
         // array covers every reachable depth so pathological frequency sets
-        // cannot index past the folding range.
-        let mut bits = [0u32; 257];
+        // cannot index past the folding range. Signed counts mirror libjpeg's
+        // `int bits[]`: pairing an odd count can leave a negative entry at a
+        // length that is being abandoned.
+        let mut bits = [0i32; 257];
         for &length in &codesize {
             if length != 0 {
                 bits[length as usize] += 1;
@@ -130,7 +132,7 @@ impl HuffmanTable {
         for length in (17..=256).rev() {
             while bits[length] > 0 {
                 let mut shorter = length - 2;
-                while bits[shorter] == 0 {
+                while bits[shorter] <= 0 {
                     shorter -= 1;
                 }
                 bits[length] -= 2;
@@ -140,14 +142,24 @@ impl HuffmanTable {
             }
         }
 
-        // Drop the pseudo-symbol from the longest remaining length.
+        // Drop the pseudo-symbol from the longest remaining length. A table that
+        // never saw a real symbol (an unused component slot) still needs a
+        // structurally valid one-bit code, which is also what libjpeg emits.
         let mut longest = 16;
-        while bits[longest] == 0 {
+        while longest > 0 && bits[longest] <= 0 {
             longest -= 1;
+        }
+        if longest == 0 {
+            let mut counts = vec![0u8; 16];
+            counts[0] = 1;
+            return (counts, vec![0]);
         }
         bits[longest] -= 1;
 
-        let counts: Vec<u8> = bits[1..=16].iter().map(|&count| count as u8).collect();
+        let counts: Vec<u8> = bits[1..=16]
+            .iter()
+            .map(|&count| count.clamp(0, 255) as u8)
+            .collect();
         let mut values = Vec::new();
         for length in 1..=256 {
             for (symbol, &size) in codesize.iter().enumerate().take(256) {
@@ -187,6 +199,17 @@ impl HuffmanTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optimal_table_is_still_valid_for_an_unused_table() {
+        // A component that no block referenced (or a flat image with no AC
+        // symbols) leaves every count at zero; libjpeg emits a one-bit code.
+        let (counts, values) = HuffmanTable::optimal(&[0u32; 256]);
+        assert_eq!(counts.len(), 16);
+        assert_eq!(counts[0], 1);
+        assert_eq!(values, vec![0]);
+        HuffmanTable::new(&counts, &values).unwrap();
+    }
 
     #[test]
     fn optimal_table_follows_the_symbol_frequencies() {

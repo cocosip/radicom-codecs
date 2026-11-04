@@ -1017,6 +1017,65 @@ mod tests {
     }
 
     #[test]
+    fn sequential_jpeg_codes_signed_rgb_bit_patterns() {
+        use radicom::model::tag::Tag;
+        use radicom::model::vr::Vr;
+        let raw: Vec<u8> = (0..8 * 6 * 3).map(|i| (i * 53 + 71) as u8).collect();
+        let mut source = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            8,
+            6,
+            8,
+            3,
+            None,
+        );
+        source.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "RGB");
+        source.insert_value(Tag::PIXEL_REPRESENTATION, 1u16);
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let mut compressed = source.clone();
+        compressed.set_transfer_syntax(syntaxes::JPEG_PROCESS_1.clone());
+        compressed.remove(Tag::PIXEL_DATA);
+        let params = CodecParams::Jpeg(JpegParams::default());
+        JpegProcess1Codec
+            .encode(
+                &PixelDataRef::from_dataset(&source).unwrap(),
+                &mut PixelData::create_new(&mut compressed).unwrap(),
+                &params,
+            )
+            .unwrap();
+        assert_eq!(
+            compressed.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "YBR_FULL"
+        );
+        // The signed destination keeps its Pixel Representation and receives the
+        // decoded bit patterns back.
+        let mut decoded = source.clone();
+        decoded.remove(Tag::PIXEL_DATA);
+        let decode_params = CodecParams::Jpeg(JpegParams {
+            convert_colorspace_to_rgb: false,
+            ..JpegParams::default()
+        });
+        JpegProcess1Codec
+            .decode(
+                &PixelDataRef::from_dataset(&compressed).unwrap(),
+                &mut PixelData::create_new(&mut decoded).unwrap(),
+                &decode_params,
+            )
+            .unwrap();
+        let frame: Vec<u8> = PixelDataRef::from_dataset(&decoded)
+            .unwrap()
+            .get_frame(0)
+            .unwrap()
+            .data()
+            .unwrap()
+            .to_vec();
+        assert_eq!(frame.len(), raw.len());
+    }
+
+    #[test]
     fn lossless_preserves_palette_color_without_conversion() {
         use radicom::model::tag::Tag;
         use radicom::model::vr::Vr;
@@ -1092,15 +1151,25 @@ mod tests {
                 "bits={bits}"
             );
 
-            let mut lossy = dataset(syntaxes::JPEG_PROCESS_1.clone(), 4, 5, 8, 1, None);
+            // Sequential JPEG codes the LUT index plane as a one-component image
+            // and leaves PALETTE COLOR in place, like the native reference codec.
+            // It stays limited to 8-bit samples.
+            let mut lossy = dataset(syntaxes::JPEG_PROCESS_1.clone(), 4, 5, bits, 1, None);
             lossy.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "PALETTE COLOR");
-            assert!(JpegProcess1Codec
-                .encode(
-                    &PixelDataRef::from_dataset(&source).unwrap(),
-                    &mut PixelData::create_new(&mut lossy).unwrap(),
-                    &CodecParams::Jpeg(JpegParams::default()),
-                )
-                .is_err());
+            let encoded = JpegProcess1Codec.encode(
+                &PixelDataRef::from_dataset(&source).unwrap(),
+                &mut PixelData::create_new(&mut lossy).unwrap(),
+                &CodecParams::Jpeg(JpegParams::default()),
+            );
+            if bits == 8 {
+                encoded.unwrap();
+                assert_eq!(
+                    lossy.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+                    "PALETTE COLOR"
+                );
+            } else {
+                assert!(encoded.is_err());
+            }
         }
     }
 }

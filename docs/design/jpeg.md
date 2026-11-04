@@ -111,12 +111,14 @@ contract does not define a signed YCbCr/RGB conversion.
 
 ## 4. Photometric interpretation and color policy
 
-The encoder accepts `MONOCHROME1`, `MONOCHROME2`, `RGB`, `YBR_FULL`, and
-`YBR_FULL_422` for the supported process and sampling. The lossless transfer
-syntaxes (`1.2.840.10008.1.2.4.57` and `.70`) additionally accept `PALETTE
-COLOR` with one component, as PS3.5 Table 8.2.1-2 permits; the lossy syntaxes
-reject it, matching Table 8.2.1-1. `YBR_ICT`, `YBR_RCT`, CMYK, and YCCK are
-rejected for classic JPEG.
+The encoder accepts `MONOCHROME1`, `MONOCHROME2`, `RGB`, `YBR_FULL`,
+`YBR_FULL_422`, and one-component `PALETTE COLOR` for every supported process.
+A palette image is coded as a plain one-component plane: the LUT index samples
+are neither converted nor rescaled, and the Photometric Interpretation is left
+untouched. Signed samples are coded as their two's-complement bit patterns, which
+is what libjpeg sees; the level shift cancels on decode, so signed input
+round-trips through the same path as unsigned input. `YBR_ICT`, `YBR_RCT`, CMYK,
+and YCCK are rejected for classic JPEG.
 
 For lossy RGB encoding, the implementation converts RGB to full-range YCbCr.
 `sample_factor = Full` emits `YBR_FULL`; `sample_factor = Half` emits
@@ -235,14 +237,16 @@ cross that threshold only at quality ≤ 23, so a 12-bit encode at the default
 quality keeps the byte-identical `Pq = 0` form. The decoder accepts `Pq = 0` and
 `Pq = 1`, so 12-bit fo-dicom streams carrying 16-bit tables decode.
 
-The first release uses baseline Huffman coding and emits one sequential scan per
-frame. It does not emit progressive or arithmetic-coded scans, and it does not
-accept them: PS3.5 A.4 specifies DICOM JPEG transfer syntaxes for Process 1
-(`.50`), Process 2/4 (`.51`), and Process 14 (`.57`/`.70`); progressive and
-hierarchical JPEG are not part of that family. The decoder accepts sequential
-streams with any number of interleaved or non-interleaved scans and baseline
-streams that carry restart intervals from other encoders, so acceptance stays
-explicit and testable.
+The sequential path emits one scan per frame and does not emit progressive or
+arithmetic-coded scans, and it does not accept them: PS3.5 A.4 specifies DICOM
+JPEG transfer syntaxes for Process 1 (`.50`), Process 2/4 (`.51`), and Process 14
+(`.57`/`.70`); progressive and hierarchical JPEG are not part of that family. The
+encoder walks the scan twice: the first pass collects DC/AC symbol frequencies,
+`HuffmanTable::optimal` builds the four tables (T.81 Annex K.2), and the second
+pass codes with them, which is libjpeg's `optimize_coding = TRUE` behavior. The
+decoder accepts sequential streams with any number of interleaved or
+non-interleaved scans and baseline streams that carry restart intervals from
+other encoders, so acceptance stays explicit and testable.
 
 ### Process 14 and SV1
 
@@ -337,9 +341,13 @@ without updating this document first.
   round-trips, including signed samples where the DICOM layout permits them.
 - Interleaved and planar RGB normalization, multi-frame ordering, odd-length
   DICOM padding, and metadata consistency.
-- `PALETTE COLOR` round-trips at 8 and 16 bits through Process 14 and SV1, is
-  rejected by the lossy syntaxes, and a `YBR_FULL_422` destination with
+- `PALETTE COLOR` round-trips at 8 and 16 bits through Process 14 and SV1, and
+  the sequential syntaxes code the 8-bit index plane with the Photometric
+  Interpretation preserved. A `YBR_FULL_422` destination with
   `convert_colorspace_to_rgb` yields an RGB frame of three bytes per pixel.
+- Signed 8-bit RGB codes and decodes without sign-extension surprises: the
+  decoded byte patterns equal the encoded ones, and `PixelRepresentation`
+  survives.
 
 ### Interoperability checks
 
@@ -353,7 +361,8 @@ without updating this document first.
   samples as the reference decoder; the residual differences are `±1` IDCT
   rounding on 48 of 3,072 samples, not restart-state errors.
 - `PALETTE COLOR` round-trips byte-exactly through `.57`, `.70`, and `.80` in
-  both directions, and the lossy syntaxes reject it.
+  both directions, and the sequential syntaxes code the index plane with the
+  Photometric Interpretation preserved.
 - Lossless comparisons are byte/sample exact after the DICOM byte-order and
   planar rules are applied. Lossy comparisons use fixed fixtures and a stated
   tolerance; visual similarity alone is not an acceptance criterion. For
@@ -411,14 +420,13 @@ without updating this document first.
 ## 10. Non-goals and upgrade points
 
 The first release does not promise progressive JPEG, arithmetic coding,
-hierarchical JPEG, CMYK/YCCK, palette color in the lossy syntaxes (only the
-lossless paths accept it), or arbitrary component counts. These are separate
+hierarchical JPEG, CMYK/YCCK, or arbitrary component counts. These are separate
 compatibility projects because they alter marker validation, color semantics, or
-the DICOM photometric contract. Within DICOM three of them are not merely
+the DICOM photometric contract. Within DICOM two of them are not merely
 deferred but excluded by the standard: PS3.5 A.4 defines JPEG transfer syntaxes
 for Process 1, Process 2/4 and Process 14 only (progressive and hierarchical JPEG
 are not among them), and Table 8.2.1-1 admits only `YBR_FULL_422` or `RGB` for
-three-sample lossy JPEG and no `PALETTE COLOR` for the lossy syntaxes. Multi-scan
+three-sample lossy JPEG. Multi-scan
 sequential JPEG, by contrast, is inside the standard (`A.4` only requires the
 JPEG interchange format) and is implemented, and the decoder also accepts the
 non-DICOM 4:2:0/4:1:1 sampling layouts described in §4. Encoding remains limited

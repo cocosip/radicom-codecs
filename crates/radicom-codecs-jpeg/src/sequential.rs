@@ -9,42 +9,6 @@ use super::dct::{forward, inverse, scaled_table, CHROMA_Q, LUMA_Q, MAX_QUANTIZAT
 use super::huffman::HuffmanTable;
 use super::marker::{check_trailing, Marker, MarkerReader, MarkerWriter};
 
-const COUNTS_DC_LUMA: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
-const VALUES_DC_LUMA: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-const COUNTS_DC_CHROMA: [u8; 16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
-const VALUES_DC_CHROMA: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-const COUNTS_DC_EXTENDED: [u8; 16] = [0, 0, 0, 15, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-const VALUES_DC_EXTENDED: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-const COUNTS_AC_LUMA: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d];
-const VALUES_AC_LUMA: [u8; 162] = [
-    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
-    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0,
-    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
-    0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
-    0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
-    0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
-    0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
-    0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5,
-    0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
-    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
-    0xf9, 0xfa,
-];
-const COUNTS_AC_CHROMA: [u8; 16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77];
-const COUNTS_AC_EXTENDED: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 255, 1, 0, 0, 0, 0, 0, 0, 0];
-const VALUES_AC_CHROMA: [u8; 162] = [
-    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
-    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0,
-    0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26,
-    0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
-    0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
-    0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
-    0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5,
-    0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3,
-    0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda,
-    0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
-    0xf9, 0xfa,
-];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SequentialFrame {
     pub(crate) width: usize,
@@ -58,47 +22,74 @@ pub(crate) struct SequentialFrame {
     pub(crate) sampling: [(u8, u8); 3],
 }
 
+struct Spec {
+    counts: Vec<u8>,
+    values: Vec<u8>,
+    table: HuffmanTable,
+}
+
+impl Spec {
+    fn new(counts: Vec<u8>, values: Vec<u8>) -> Result<Self, String> {
+        let table = HuffmanTable::new(&counts, &values)?;
+        Ok(Self {
+            counts,
+            values,
+            table,
+        })
+    }
+
+    /// Per-image table from the scan statistics, as libjpeg's
+    /// `optimize_coding` does (T.81 Annex K.2).
+    fn optimal(frequencies: &[u32; 256]) -> Result<Self, String> {
+        let (counts, values) = HuffmanTable::optimal(frequencies);
+        Self::new(counts, values)
+    }
+}
+
 struct Tables {
-    dc: [HuffmanTable; 2],
-    ac: [HuffmanTable; 2],
+    dc: [Spec; 2],
+    ac: [Spec; 2],
     q: [[u16; 64]; 2],
 }
 
 impl Tables {
-    fn new(quality: u32, extended: bool) -> Result<Self, String> {
-        let dc_luma = if extended {
-            HuffmanTable::new(&COUNTS_DC_EXTENDED, &VALUES_DC_EXTENDED)?
-        } else {
-            HuffmanTable::new(&COUNTS_DC_LUMA, &VALUES_DC_LUMA)?
-        };
-        let dc_chroma = if extended {
-            HuffmanTable::new(&COUNTS_DC_EXTENDED, &VALUES_DC_EXTENDED)?
-        } else {
-            HuffmanTable::new(&COUNTS_DC_CHROMA, &VALUES_DC_CHROMA)?
-        };
-        let extended_values: Vec<u8> = (0..=u8::MAX).collect();
-        let ac_luma = if extended {
-            HuffmanTable::new(&COUNTS_AC_EXTENDED, &extended_values)?
-        } else {
-            HuffmanTable::new(&COUNTS_AC_LUMA, &VALUES_AC_LUMA)?
-        };
-        let ac_chroma = if extended {
-            HuffmanTable::new(&COUNTS_AC_EXTENDED, &extended_values)?
-        } else {
-            HuffmanTable::new(&COUNTS_AC_CHROMA, &VALUES_AC_CHROMA)?
-        };
-        let max_qval = if extended { MAX_QUANTIZATION } else { 255 };
+    fn new(
+        q: [[u16; 64]; 2],
+        dc_frequencies: &[[u32; 256]; 2],
+        ac_frequencies: &[[u32; 256]; 2],
+    ) -> Result<Self, String> {
         Ok(Self {
-            dc: [dc_luma, dc_chroma],
-            ac: [ac_luma, ac_chroma],
-            // The extended processes mirror libjpeg's force_baseline = FALSE
-            // (what fo-dicom's IJG path uses), so entries may exceed 255.
-            q: [
-                scaled_table(&LUMA_Q, quality, max_qval),
-                scaled_table(&CHROMA_Q, quality, max_qval),
+            dc: [
+                Spec::optimal(&dc_frequencies[0])?,
+                Spec::optimal(&dc_frequencies[1])?,
             ],
+            ac: [
+                Spec::optimal(&ac_frequencies[0])?,
+                Spec::optimal(&ac_frequencies[1])?,
+            ],
+            q,
         })
     }
+}
+
+fn quant_tables(quality: u32, extended: bool) -> [[u16; 64]; 2] {
+    let max_qval = if extended { MAX_QUANTIZATION } else { 255 };
+    // The extended processes mirror libjpeg's force_baseline = FALSE (what
+    // fo-dicom's IJG path uses), so entries may exceed 255.
+    [
+        scaled_table(&LUMA_Q, quality, max_qval),
+        scaled_table(&CHROMA_Q, quality, max_qval),
+    ]
+}
+
+/// One step of the block walk shared by the statistics and the entropy passes.
+enum ScanStep<'a> {
+    Block {
+        slot: usize,
+        diff: i32,
+        block: &'a [i32; 64],
+    },
+    Restart(u8),
 }
 
 /// How one component of a scan is pooled into block samples: the source step in
@@ -232,18 +223,6 @@ impl SequentialFrame {
             }
         }
         let restart_interval = restart_interval.filter(|&interval| interval != 0);
-        let tables = Tables::new(quality.max(1), extended)?;
-        let mut out = MarkerWriter::default();
-        out.write_marker(Marker::Soi)?;
-        out.write_segment(Marker::Dqt, &dqt_payload(&tables.q)?)?;
-        out.write_segment(
-            if extended { Marker::Sof1 } else { Marker::Sof0 },
-            &sof_payload(self, sampling),
-        )?;
-        out.write_segment(Marker::Dht, &dht_payload(extended))?;
-        if let Some(interval) = restart_interval {
-            out.write_segment(Marker::Dri, &interval.to_be_bytes())?;
-        }
         let mut seen = [false; 3];
         for scan in scans {
             if scan.is_empty() {
@@ -261,6 +240,35 @@ impl SequentialFrame {
                 }
                 seen[slot] = true;
             }
+        }
+        let q = quant_tables(quality.max(1), extended);
+        let mut dc_frequencies = [[0u32; 256]; 2];
+        let mut ac_frequencies = [[0u32; 256]; 2];
+        for scan in scans {
+            self.walk_scan(&q, sampling, smoothing, scan, restart_interval, |step| {
+                if let ScanStep::Block { slot, diff, block } = step {
+                    dc_frequencies[slot][usize::from(category(diff))] += 1;
+                    for_each_ac(block, |symbol, _, _| {
+                        ac_frequencies[slot][usize::from(symbol)] += 1;
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            })?;
+        }
+        let tables = Tables::new(q, &dc_frequencies, &ac_frequencies)?;
+        let mut out = MarkerWriter::default();
+        out.write_marker(Marker::Soi)?;
+        out.write_segment(Marker::Dqt, &dqt_payload(&tables.q)?)?;
+        out.write_segment(
+            if extended { Marker::Sof1 } else { Marker::Sof0 },
+            &sof_payload(self, sampling),
+        )?;
+        out.write_segment(Marker::Dht, &dht_payload(&tables))?;
+        if let Some(interval) = restart_interval {
+            out.write_segment(Marker::Dri, &interval.to_be_bytes())?;
+        }
+        for scan in scans {
             out.write_segment(Marker::Sos, &sos_payload(scan))?;
             self.write_scan(
                 &mut out,
@@ -275,14 +283,17 @@ impl SequentialFrame {
         Ok(out.into_bytes())
     }
 
-    fn write_scan(
+    /// Walks one scan's blocks in coding order, yielding the quantized block and
+    /// its DC difference. The statistics pass and the entropy pass both use it,
+    /// so they always agree on the symbol sequence.
+    fn walk_scan(
         &self,
-        out: &mut MarkerWriter,
-        tables: &Tables,
+        q: &[[u16; 64]; 2],
         sampling: &[(u8, u8); 3],
         smoothing: u32,
         components: &[u8],
         restart_interval: Option<u16>,
+        mut visit: impl FnMut(ScanStep<'_>) -> Result<(), String>,
     ) -> Result<(), String> {
         let interleaved = components.len() > 1;
         let (hmax, vmax) = max_sampling(sampling, self.components);
@@ -293,7 +304,6 @@ impl SequentialFrame {
             interleaved,
             sampling[usize::from(components[0])],
         );
-        let mut bits = BitWriter::default();
         let mut previous_dc = [0i32; 3];
         let mut mcu = 0usize;
         let mut restart_index = 0u8;
@@ -301,9 +311,7 @@ impl SequentialFrame {
             for mx in 0..mcu_w {
                 if let Some(interval) = restart_interval {
                     if mcu != 0 && mcu.is_multiple_of(usize::from(interval)) {
-                        bits.flush_to_byte();
-                        out.write_raw(&bits.take_bytes());
-                        out.write_marker(Marker::Restart(restart_index))?;
+                        visit(ScanStep::Restart(restart_index))?;
                         restart_index = (restart_index + 1) & 7;
                         previous_dc = [0i32; 3];
                     }
@@ -331,7 +339,7 @@ impl SequentialFrame {
                             let mut block = [0i32; 64];
                             self.load_block(pooling, block_x, block_y, &mut block);
                             let coeff = forward(&block);
-                            let table = &tables.q[c.min(1)];
+                            let table = &q[c.min(1)];
                             let mut quant = [0i32; 64];
                             for i in 0..64 {
                                 quant[i] =
@@ -340,31 +348,53 @@ impl SequentialFrame {
                             let dc = quant[0];
                             let diff = dc - previous_dc[c];
                             previous_dc[c] = dc;
-                            write_value(&mut bits, &tables.dc[c.min(1)], diff)?;
-                            let mut run = 0u8;
-                            for &index in ZIGZAG.iter().skip(1) {
-                                let value = quant[index];
-                                if value == 0 {
-                                    run += 1;
-                                    if run == 16 {
-                                        tables.ac[c.min(1)].encode(0xf0, &mut bits)?;
-                                        run = 0;
-                                    }
-                                } else {
-                                    let size = category(value);
-                                    tables.ac[c.min(1)].encode((run << 4) | size, &mut bits)?;
-                                    bits.write_bits(amplitude(value, size), size)?;
-                                    run = 0;
-                                }
-                            }
-                            if run > 0 {
-                                tables.ac[c.min(1)].encode(0, &mut bits)?;
-                            }
+                            visit(ScanStep::Block {
+                                slot: c.min(1),
+                                diff,
+                                block: &quant,
+                            })?;
                         }
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    fn write_scan(
+        &self,
+        out: &mut MarkerWriter,
+        tables: &Tables,
+        sampling: &[(u8, u8); 3],
+        smoothing: u32,
+        components: &[u8],
+        restart_interval: Option<u16>,
+    ) -> Result<(), String> {
+        let mut bits = BitWriter::default();
+        self.walk_scan(
+            &tables.q,
+            sampling,
+            smoothing,
+            components,
+            restart_interval,
+            |step| match step {
+                ScanStep::Restart(index) => {
+                    bits.flush_to_byte();
+                    out.write_raw(&bits.take_bytes());
+                    out.write_marker(Marker::Restart(index))
+                }
+                ScanStep::Block { slot, diff, block } => {
+                    write_value(&mut bits, &tables.dc[slot].table, diff)?;
+                    for_each_ac(block, |symbol, value, size| {
+                        tables.ac[slot].table.encode(symbol, &mut bits)?;
+                        if size > 0 {
+                            bits.write_bits(value, size)?;
+                        }
+                        Ok(())
+                    })
+                }
+            },
+        )?;
         out.write_raw(&bits.finish()?);
         Ok(())
     }
@@ -978,6 +1008,33 @@ fn write_value(w: &mut BitWriter, h: &HuffmanTable, v: i32) -> Result<(), String
         Ok(())
     }
 }
+/// Emits `(symbol, extra bits, bit count)` for every AC coefficient of a
+/// quantized block: runs of sixteen zeros as `0xF0`, the end of block as `0x00`,
+/// and otherwise `(run << 4) | size`.
+fn for_each_ac(
+    quant: &[i32; 64],
+    mut emit: impl FnMut(u8, u32, u8) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut run = 0u8;
+    for &index in ZIGZAG.iter().skip(1) {
+        let value = quant[index];
+        if value == 0 {
+            run += 1;
+            if run == 16 {
+                emit(0xf0, 0, 0)?;
+                run = 0;
+            }
+        } else {
+            let size = category(value);
+            emit((run << 4) | size, amplitude(value, size), size)?;
+            run = 0;
+        }
+    }
+    if run > 0 {
+        emit(0, 0, 0)?;
+    }
+    Ok(())
+}
 fn read_value(r: &mut BitReader<'_>, h: &HuffmanTable, max_category: u8) -> Result<i32, String> {
     let n = h.decode(r)?;
     if n > max_category {
@@ -1050,39 +1107,17 @@ fn dqt_payload(q: &[[u16; 64]; 2]) -> Result<Vec<u8>, String> {
     }
     Ok(p)
 }
-fn dht_payload(extended: bool) -> Vec<u8> {
+fn dht_payload(tables: &Tables) -> Vec<u8> {
     let mut p = Vec::new();
-    p.push(0);
-    if extended {
-        p.extend(COUNTS_DC_EXTENDED);
-        p.extend(VALUES_DC_EXTENDED);
-    } else {
-        p.extend(COUNTS_DC_LUMA);
-        p.extend(VALUES_DC_LUMA);
-    }
-    p.push(0x10);
-    if extended {
-        p.extend(COUNTS_AC_EXTENDED);
-        p.extend(0..=u8::MAX);
-    } else {
-        p.extend(COUNTS_AC_LUMA);
-        p.extend(VALUES_AC_LUMA);
-    }
-    p.push(1);
-    if extended {
-        p.extend(COUNTS_DC_EXTENDED);
-        p.extend(VALUES_DC_EXTENDED);
-    } else {
-        p.extend(COUNTS_DC_CHROMA);
-        p.extend(VALUES_DC_CHROMA);
-    }
-    p.push(0x11);
-    if extended {
-        p.extend(COUNTS_AC_EXTENDED);
-        p.extend(0..=u8::MAX);
-    } else {
-        p.extend(COUNTS_AC_CHROMA);
-        p.extend(VALUES_AC_CHROMA);
+    for (identifier, spec) in [
+        (0x00u8, &tables.dc[0]),
+        (0x10u8, &tables.ac[0]),
+        (0x01u8, &tables.dc[1]),
+        (0x11u8, &tables.ac[1]),
+    ] {
+        p.push(identifier);
+        p.extend(&spec.counts);
+        p.extend(&spec.values);
     }
     p
 }

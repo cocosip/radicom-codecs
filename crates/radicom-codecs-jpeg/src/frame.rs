@@ -17,7 +17,6 @@ pub(crate) struct Layout {
     bits_stored: u8,
     components: u8,
     planar: u16,
-    pixel_representation: u16,
     photometric: PhotometricInterpretation,
     frame_length: usize,
 }
@@ -138,7 +137,6 @@ impl Layout {
             bits_stored,
             components,
             planar,
-            pixel_representation,
             photometric,
             frame_length,
         })
@@ -345,14 +343,15 @@ pub(crate) fn encode_sequential(
             "convert_colorspace_to_rgb is a decode-only parameter for sequential JPEG",
         ));
     }
-    let layout = Layout::from_source(src, false).map_err(|m| operation_error(codec, &m))?;
-    if layout.pixel_representation != 0
-        || (baseline && layout.bits_stored != 8)
-        || (!baseline && !matches!(layout.bits_stored, 8 | 12))
+    let layout = Layout::from_source(src, true).map_err(|m| operation_error(codec, &m))?;
+    // Signed samples are coded as their two's-complement bit patterns, which is
+    // what libjpeg sees too; the level shift cancels on decode. Only the bit
+    // depth restricts the process.
+    if (baseline && layout.bits_stored != 8) || (!baseline && !matches!(layout.bits_stored, 8 | 12))
     {
         return Err(operation_error(
             codec,
-            "sequential JPEG supports unsigned 8-bit Process 1 or unsigned 8/12-bit Process 2/4",
+            "sequential JPEG supports 8-bit Process 1 or 8/12-bit Process 2/4 samples",
         ));
     }
     let sampling_half = matches!(
@@ -481,8 +480,7 @@ pub(crate) fn decode_sequential(
             "color conversion is unsupported for signed samples",
         ));
     }
-    let mut layout =
-        Layout::from_destination(dst, false).map_err(|m| operation_error(codec, &m))?;
+    let mut layout = Layout::from_destination(dst, true).map_err(|m| operation_error(codec, &m))?;
     if convert
         && (layout.photometric == PhotometricInterpretation::YbrFull422 || layout.planar == 1)
     {
@@ -503,12 +501,6 @@ pub(crate) fn decode_sequential(
             false,
         )
         .map_err(|m| operation_error(codec, &m))?;
-    }
-    if layout.pixel_representation != 0 {
-        return Err(operation_error(
-            codec,
-            "sequential JPEG signed samples are unsupported",
-        ));
     }
     let mut output = Vec::with_capacity(frames.len());
     for mut frame in frames {
