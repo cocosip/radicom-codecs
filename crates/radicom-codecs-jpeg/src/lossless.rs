@@ -1,13 +1,19 @@
 #![allow(clippy::chunks_exact_to_as_chunks, clippy::too_many_arguments)]
 
 use super::bit::{BitReader, BitWriter};
+use super::color::JpegColorSpace;
 use super::huffman::HuffmanTable;
 use super::marker::{check_trailing, Marker, MarkerReader, MarkerWriter};
 use super::sequential::FrameExpectation;
 
-/// One item of the scan walk: a coded difference or a restart boundary.
+/// One built lossless DC Huffman table: symbol counts, symbol values and the
+/// derived code table.
+type DcTable = (Vec<u8>, Vec<u8>, HuffmanTable);
+
+/// One item of the scan walk: a coded difference (with its component) or a
+/// restart boundary.
 enum ScanEvent {
-    Difference(i32),
+    Difference(u8, i32),
     Restart(u8),
 }
 
@@ -76,29 +82,66 @@ impl LosslessFrame {
         })
     }
 
+    pub(crate) fn encode_with_colorspace(
+        &self,
+        predictor: u8,
+        point_transform: u8,
+        restart_interval: Option<u16>,
+        colorspace: JpegColorSpace,
+    ) -> Result<Vec<u8>, String> {
+        let components = (0..self.components).collect::<Vec<_>>();
+        self.encode_scans_with_colorspace(
+            predictor,
+            point_transform,
+            restart_interval,
+            std::slice::from_ref(&components),
+            colorspace,
+        )
+    }
+
+    /// Test entry point: synthetic frames use the YCbCr table layout.
+    #[cfg(test)]
     pub(crate) fn encode(
         &self,
         predictor: u8,
         point_transform: u8,
         restart_interval: Option<u16>,
     ) -> Result<Vec<u8>, String> {
-        let components = (0..self.components).collect::<Vec<_>>();
-        self.encode_scans(
+        self.encode_with_colorspace(
             predictor,
             point_transform,
             restart_interval,
-            std::slice::from_ref(&components),
+            test_colorspace(self.components),
         )
     }
 
-    /// Encode one or more scans. A scan is a list of component indices carried
-    /// by that scan; T.81 permits a non-interleaved scan per component.
+    /// Test entry point: synthetic frames use the YCbCr table layout.
+    #[cfg(test)]
     fn encode_scans(
         &self,
         predictor: u8,
         point_transform: u8,
         restart_interval: Option<u16>,
         scans: &[Vec<u8>],
+    ) -> Result<Vec<u8>, String> {
+        self.encode_scans_with_colorspace(
+            predictor,
+            point_transform,
+            restart_interval,
+            scans,
+            test_colorspace(self.components),
+        )
+    }
+
+    /// Encode one or more scans. A scan is a list of component indices carried
+    /// by that scan; T.81 permits a non-interleaved scan per component.
+    fn encode_scans_with_colorspace(
+        &self,
+        predictor: u8,
+        point_transform: u8,
+        restart_interval: Option<u16>,
+        scans: &[Vec<u8>],
+        colorspace: JpegColorSpace,
     ) -> Result<Vec<u8>, String> {
         validate_predictor(predictor)?;
         validate_point_transform(self.precision, point_transform)?;
@@ -139,10 +182,16 @@ impl LosslessFrame {
             }
         }
 
-        // libjpeg (`optimize_coding = TRUE`) sizes the DC table from the actual
-        // differences before coding them. The fixed T.81 default table costs
-        // about 50% more, so this encoder now follows libjpeg instead.
-        let mut frequencies = [0u32; 256];
+        // libjpeg (`optimize_coding = TRUE`) sizes each DC table from the actual
+        // differences before coding them. Components that share a table (all of
+        // them for grayscale/RGB, luma vs chroma for YCbCr) share statistics.
+        let mut used = [false; 2];
+        for scan in scans {
+            for &component in scan {
+                used[usize::from(colorspace.table_id(usize::from(component)))] = true;
+            }
+        }
+        let mut frequencies = [[0u32; 256]; 2];
         let mut reconstructed = allocate_samples(self.samples.len())?;
         for scan in scans {
             self.walk_scan(
@@ -154,26 +203,53 @@ impl LosslessFrame {
                 effective_precision,
                 initial,
                 |event| {
-                    if let ScanEvent::Difference(difference) = event {
-                        frequencies[usize::from(category(difference))] += 1;
+                    if let ScanEvent::Difference(component, difference) = event {
+                        let table = usize::from(colorspace.table_id(usize::from(component)));
+                        frequencies[table][usize::from(category(difference))] += 1;
                     }
                     Ok(())
                 },
             )?;
         }
-        let (huffman_counts, huffman_values) = HuffmanTable::optimal(&frequencies);
-        let huffman = HuffmanTable::new(&huffman_counts, &huffman_values)?;
+        let mut tables: [Option<DcTable>; 2] = [None, None];
+        for (id, used) in used.iter().enumerate() {
+            if !used {
+                continue;
+            }
+            let (counts, values) = HuffmanTable::optimal(&frequencies[id]);
+            let table = HuffmanTable::new(&counts, &values)?;
+            tables[id] = Some((counts, values, table));
+        }
 
         let mut output = MarkerWriter::default();
-        output.write_marker(Marker::Soi)?;
-        output.write_segment(Marker::Sof3, &sof_payload(self)?)?;
-        output.write_segment(Marker::Dht, &dht_payload(&huffman_counts, &huffman_values))?;
-        if let Some(interval) = restart_interval {
-            output.write_segment(Marker::Dri, &interval.to_be_bytes())?;
-        }
+        colorspace.write_file_header(&mut output)?;
+        output.write_segment(Marker::Sof3, &sof_payload(self, colorspace)?)?;
+        let mut sent = [false; 2];
+        let mut last_restart_interval = 0u16;
         reconstructed.fill(0);
         for scan in scans {
-            output.write_segment(Marker::Sos, &sos_payload(scan, predictor, point_transform)?)?;
+            // jcmarker.c `write_scan_header`: the scan's DC DHT(s) first, then
+            // DRI if the interval changed, then SOS.
+            for &component in scan {
+                let id = usize::from(colorspace.table_id(usize::from(component)));
+                if !sent[id] {
+                    let (counts, values, _) = tables[id]
+                        .as_ref()
+                        .ok_or_else(|| "JPEG lossless Huffman table was not built".to_owned())?;
+                    output.write_segment(Marker::Dht, &dht_payload(id as u8, counts, values))?;
+                    sent[id] = true;
+                }
+            }
+            if let Some(interval) = restart_interval {
+                if interval != last_restart_interval {
+                    output.write_segment(Marker::Dri, &interval.to_be_bytes())?;
+                    last_restart_interval = interval;
+                }
+            }
+            output.write_segment(
+                Marker::Sos,
+                &sos_payload(scan, predictor, point_transform, colorspace)?,
+            )?;
             let mut entropy = BitWriter::default();
             self.walk_scan(
                 scan,
@@ -184,7 +260,11 @@ impl LosslessFrame {
                 effective_precision,
                 initial,
                 |event| match event {
-                    ScanEvent::Difference(difference) => {
+                    ScanEvent::Difference(component, difference) => {
+                        let id = usize::from(colorspace.table_id(usize::from(component)));
+                        let (_, _, huffman) = tables[id].as_ref().ok_or_else(|| {
+                            "JPEG lossless Huffman table was not built".to_owned()
+                        })?;
                         let category = category(difference);
                         huffman.encode(category, &mut entropy)?;
                         if category != 0 && category != 16 {
@@ -252,10 +332,10 @@ impl LosslessFrame {
                     initial,
                     y == interval_start_row,
                 );
-                visit(ScanEvent::Difference(encode_difference(
-                    shifted - prediction,
-                    effective_precision,
-                )))?;
+                visit(ScanEvent::Difference(
+                    component,
+                    encode_difference(shifted - prediction, effective_precision),
+                ))?;
                 reconstructed[index] = u16::try_from(shifted)
                     .map_err(|_| "JPEG reconstructed sample is outside u16".to_owned())?;
             }
@@ -506,34 +586,61 @@ fn validate_point_transform(precision: u8, point_transform: u8) -> Result<(), St
     }
 }
 
-fn sof_payload(frame: &LosslessFrame) -> Result<Vec<u8>, String> {
+/// Test entry points encode synthetic frames without colour metadata, so they
+/// use the table layout libjpeg assigns to YCbCr.
+#[cfg(test)]
+fn test_colorspace(components: u8) -> JpegColorSpace {
+    if components == 1 {
+        JpegColorSpace::Grayscale
+    } else {
+        JpegColorSpace::Ycbcr
+    }
+}
+
+fn sof_payload(frame: &LosslessFrame, colorspace: JpegColorSpace) -> Result<Vec<u8>, String> {
     let mut payload = Vec::with_capacity(6 + usize::from(frame.components) * 3);
     payload.push(frame.precision);
     payload.extend((frame.height as u16).to_be_bytes());
     payload.extend((frame.width as u16).to_be_bytes());
     payload.push(frame.components);
-    for component in 0..frame.components {
-        payload.extend([component + 1, 0x11, 0]);
+    for component in 0..usize::from(frame.components) {
+        payload.extend([
+            colorspace.component_id(component),
+            0x11,
+            colorspace.table_id(component),
+        ]);
     }
     Ok(payload)
 }
 
-fn dht_payload(counts: &[u8], values: &[u8]) -> Vec<u8> {
+fn dht_payload(id: u8, counts: &[u8], values: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + counts.len() + values.len());
-    payload.push(0);
+    // DC table class, identified by the selector libjpeg assigns the components.
+    payload.push(id & 0x0f);
     payload.extend(counts);
     payload.extend(values);
     payload
 }
 
-fn sos_payload(scan: &[u8], predictor: u8, point_transform: u8) -> Result<Vec<u8>, String> {
+fn sos_payload(
+    scan: &[u8],
+    predictor: u8,
+    point_transform: u8,
+    colorspace: JpegColorSpace,
+) -> Result<Vec<u8>, String> {
     validate_predictor(predictor)?;
     let count =
         u8::try_from(scan.len()).map_err(|_| "JPEG scan has too many components".to_owned())?;
     let mut payload = Vec::with_capacity(2 + scan.len() * 2 + 3);
     payload.push(count);
     for &component in scan {
-        payload.extend([component + 1, 0]);
+        let table = colorspace.table_id(usize::from(component));
+        // Lossless scans carry the predictor in Ss, so libjpeg's `emit_sos`
+        // writes 0 for the table selectors even when the entropy coder uses a
+        // per-component DC table. That is self-inconsistent for YCbCr input,
+        // and decoders (including libjpeg's own) select the DC table from the
+        // SOS selector, so write the table that was actually used.
+        payload.extend([colorspace.component_id(usize::from(component)), table << 4]);
     }
     payload.extend([predictor, 0, point_transform]);
     Ok(payload)
@@ -555,8 +662,13 @@ fn parse_sof(payload: &[u8]) -> Result<(usize, usize, u8, u8, [u8; 3]), String> 
     }
     let mut ids = [0u8; 3];
     for (index, component) in payload[6..].chunks_exact(3).enumerate() {
-        if component[1] != 0x11 || component[2] != 0 {
+        if component[1] != 0x11 {
             return Err("JPEG lossless only supports 1x1 component sampling".to_owned());
+        }
+        // The quantisation-table selector is unused by a lossless process but is
+        // still present in SOF3; libjpeg writes 0/1 per colour component.
+        if component[2] > 3 {
+            return Err("JPEG lossless SOF3 quantization table selector is invalid".to_owned());
         }
         if ids[..index].contains(&component[0]) {
             return Err("JPEG lossless component identifiers must be unique".to_owned());
@@ -800,6 +912,42 @@ mod tests {
     }
 
     #[test]
+    fn palette_lossless_writes_no_app_and_component_id_zero() {
+        let frame = sample_frame(8, 1);
+        let encoded = frame
+            .encode_with_colorspace(1, 0, None, JpegColorSpace::Unknown)
+            .unwrap();
+        // JCS_UNKNOWN: SOI is followed directly by SOF3.
+        assert_eq!(&encoded[..4], &[0xff, 0xd8, 0xff, 0xc3]);
+        assert_eq!(encoded[2 + 4 + 6], 0, "SOF component id");
+        let sos = encoded
+            .windows(2)
+            .position(|window| window == [0xff, 0xda])
+            .unwrap();
+        assert_eq!(encoded[sos + 4 + 1], 0, "SOS component id");
+    }
+
+    #[test]
+    fn rgb_lossless_writes_adobe_app14_and_rgb_component_ids() {
+        let frame = sample_frame(8, 3);
+        let encoded = frame
+            .encode_with_colorspace(1, 0, None, JpegColorSpace::Rgb)
+            .unwrap();
+        assert_eq!(&encoded[..4], &[0xff, 0xd8, 0xff, 0xee]);
+        assert_eq!(&encoded[4..6], &[0x00, 0x0e]);
+        assert_eq!(&encoded[6..11], b"Adobe");
+        assert_eq!(encoded[18..20], [0xff, 0xc3], "SOF3 follows APP14");
+        assert_eq!(encoded[18 + 4 + 6], b'R');
+        assert_eq!(encoded[18 + 4 + 9], b'G');
+        assert_eq!(encoded[18 + 4 + 12], b'B');
+        let sos = encoded
+            .windows(2)
+            .position(|window| window == [0xff, 0xda])
+            .unwrap();
+        assert_eq!(&encoded[sos + 4..sos + 10], &[3, b'R', 0, b'G', 0, b'B']);
+    }
+
+    #[test]
     fn round_trips_8_bit_predictor_one() {
         let frame = sample_frame(8, 1);
         let encoded = frame.encode(1, 0, None).unwrap();
@@ -859,11 +1007,13 @@ mod tests {
     /// predictor (which would code x1 as 40-(30+20-10)=0): a decoder that only
     /// restarts the predictor for the first pixel diverges here.
     const P4_DRI2_FIXTURE: &[u8] = &[
-        0xff, 0xd8, 0xff, 0xc3, 0x00, 0x0b, 0x08, 0x00, 0x02, 0x00, 0x02, 0x01, 0x01, 0x11, 0x00,
-        0xff, 0xc4, 0x00, 0x15, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x07, 0xff, 0xdd, 0x00, 0x04, 0x00, 0x02, 0xff,
-        0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x04, 0x00, 0x00, 0x84, 0xab, 0xff, 0xd0, 0x8e, 0xab,
-        0xff, 0xd9,
+        0xff, 0xd8, // SOI
+        0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00,
+        0x01, 0x00, 0x00, // JFIF APP0 (grayscale)
+        0xff, 0xc3, 0x00, 0x0b, 0x08, 0x00, 0x02, 0x00, 0x02, 0x01, 0x01, 0x11, 0x00, 0xff, 0xc4,
+        0x00, 0x15, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0x07, 0xff, 0xdd, 0x00, 0x04, 0x00, 0x02, 0xff, 0xda, 0x00,
+        0x08, 0x01, 0x01, 0x00, 0x04, 0x00, 0x00, 0x84, 0xab, 0xff, 0xd0, 0x8e, 0xab, 0xff, 0xd9,
     ];
 
     #[test]
@@ -928,14 +1078,17 @@ mod tests {
             let mut stream = MarkerWriter::default();
             stream.write_marker(Marker::Soi).unwrap();
             stream
-                .write_segment(Marker::Sof3, &sof_payload(&frame).unwrap())
+                .write_segment(
+                    Marker::Sof3,
+                    &sof_payload(&frame, JpegColorSpace::Grayscale).unwrap(),
+                )
                 .unwrap();
             for id in 0..=3u8 {
                 let mut payload = dht_payload.to_vec();
                 payload[0] = id;
                 stream.write_segment(Marker::Dht, &payload).unwrap();
             }
-            let mut sos_payload = sos_payload(&[0], 1, 0).unwrap();
+            let mut sos_payload = sos_payload(&[0], 1, 0, JpegColorSpace::Grayscale).unwrap();
             sos_payload[2] = table << 4;
             stream.write_segment(Marker::Sos, &sos_payload).unwrap();
             stream.write_raw(entropy);

@@ -94,23 +94,25 @@ PS3.5 requires for a codestream whose MCT flag is set; decoding converts back an
 labels the native dataset `RGB`. The reversible path writes its step table with
 two reserved bit-planes (`precision + 2`, the same magnitude bound the CAP marker
 advertises), which covers the extra range the RCT and the 5/3 gain introduce.
-`.202` forces
-RPCL and validates it on decode; `.201` and `.203` honour the requested
-progression order when it is LRCP/RLCP/RPCL, with LRCP as the default, and
-reject PCRL/CPRL. `.203` uses OpenJPH's default scalar-expounded steps
-(`baseDelta = 1 / 2^precision`) when `quality` is 0 and the fo-dicom quality
-table for `quality` 1..=100, which is pinned to the reference
-`CreateQualityScalarExpoundedSteps` output. `insert_tlm_markers` emits a
-one-entry TLM before SOT and is accepted and parsed on decode.
+All three HT codecs default to RPCL and to writing a TLM, matching
+`fo-dicom.Codecs`: `.201` and `.203` pass `PROG_UNKNOWN` to OpenJPH, whose
+default is RPCL, and `.202` explicitly requests RPCL. `.203` uses OpenJPH's
+default scalar-expounded steps (`baseDelta = 1 / 2^precision`) when `quality`
+is 0 and the fo-dicom quality table for `quality` 1..=100, which is pinned to
+the reference `CreateQualityScalarExpoundedSteps` output. A requested
+LRCP/RLCP/RPCL is still honoured when a caller sets it explicitly; PCRL/CPRL
+are rejected.
 
 The reference encoder is the native
 `Native/Common/OpenJPH/interface/ojph_interface.cpp`
 (`HTJpeg2000EncodeStream`), whose hard-coded defaults are `decompositions_ = 5`,
 64×64 code blocks, `quantizationStep_ = -1.0f` (derive the irreversible steps,
-the same table `quality = 0` selects) and `request_tlm_marker_ = true`. It also
-splits one tile-part per resolution, so its TLM carries several entries; a
-single tile-part with a single TLM entry is equally valid and is what fo-dicom
-accepts from this encoder.
+the same table `quality = 0` selects), `request_tlm_marker_ = true` and
+`set_tilepart_divisions(resolutions = true, components = false)`. The encoder
+therefore writes one tile-part per resolution (six parts with the default five
+decompositions) and a TLM with one entry per part, plus the OpenJPH COM marker
+`OpenJPH Ver 0.21.2.` (`Rcom=1`); these are part of the byte-identical reference
+output.
 
 
 HTJ2K quality layers are fixed at 1: the cleanup pass codes every bit plane, so

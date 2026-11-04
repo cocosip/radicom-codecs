@@ -260,13 +260,20 @@ operations exactly. Restart intervals reset the predictor state at MCU
 boundaries. No DCT, quantization, smoothing, or chroma subsampling is permitted
 on this path.
 
-The encoder sizes its DC table from the image itself: it walks the prediction
-differences first, builds the optimal canonical table with the T.81 K.2 merge
-algorithm (the same procedure libjpeg runs under `optimize_coding = TRUE`), and
-writes that table in DHT before the scan. The fixed Annex K table costs about 50%
-more on real images, which is why the encoder always optimizes; the decoder is
-unchanged because it already accepts any DHT. Sequential DCT still writes the
-Annex K default tables.
+The encoder sizes its Huffman tables from the image itself: it walks the
+prediction differences or DCT symbols first, builds the optimal canonical tables
+with the T.81 K.2 merge algorithm (the same procedure libjpeg runs under
+`optimize_coding = TRUE`), and writes each table as its own DHT segment in
+libjpeg order (`DC0`, `AC0`, then any chroma tables). The fixed Annex K table
+costs about 50% more on real images, which is why the encoder always optimizes;
+the decoder is unchanged because it already accepts any DHT. The marker layout
+also follows libjpeg byte for byte: SOF0 for 8-bit data and SOF1 for 12-bit,
+only the DQT tables a component references, the JFIF APP0 segment for gray and
+YCbCr streams (Adobe APP14 for RGB, none for an unknown colour space), and the
+component identifiers and table selectors `jccolor.c`/`jcmarker.c` derive for
+that colour space. The forward transform is `jfdctint.c`'s integer ISLOW
+algorithm and quantization is `jcdctmgr.c`'s reciprocal/`DESCALE` path, not an
+ideal floating-point DCT, because the reference encoder is libjpeg-turbo.
 
 ## 7. Error and resource rules
 

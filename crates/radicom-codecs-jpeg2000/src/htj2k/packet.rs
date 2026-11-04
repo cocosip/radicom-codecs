@@ -20,6 +20,7 @@ struct HtTree {
     heights: Vec<usize>,
     values: Vec<Vec<i32>>,
     levels: usize,
+    padding: i32,
 }
 
 impl HtTree {
@@ -43,6 +44,7 @@ impl HtTree {
             heights,
             values,
             levels,
+            padding: initial,
         }
     }
 
@@ -71,6 +73,7 @@ impl HtTree {
             band.code_block_count_y.max(1) as usize,
             1,
         );
+        tree.padding = 255;
         for block in &band.code_blocks {
             let empty = !(block.total_passes > 0 && !block.data.is_empty());
             tree.set(
@@ -90,6 +93,7 @@ impl HtTree {
             band.code_block_count_y.max(1) as usize,
             0,
         );
+        tree.padding = 255;
         for block in &band.code_blocks {
             tree.set(
                 block.local_x.max(0) as usize,
@@ -102,14 +106,27 @@ impl HtTree {
         tree
     }
 
+    /// Reads a child entry the way OpenJPH's `tag_tree::get` does: the flat
+    /// index uses the level stride without clamping, so a child past the right
+    /// edge wraps into the next row, and entries past the tree capacity read
+    /// the initialization value. Mirroring this is required for byte-identical
+    /// packet headers on bands whose edge code blocks are empty.
+    fn raw_get(&self, level: usize, x: usize, y: usize) -> i32 {
+        let stride = self.widths[level];
+        self.values[level]
+            .get(x + y * stride)
+            .copied()
+            .unwrap_or(self.padding)
+    }
+
     fn propagate_min(&mut self) {
         for level in 1..self.levels {
             for y in 0..self.heights[level] {
                 for x in 0..self.widths[level] {
-                    let a = self.get(x << 1, y << 1, level - 1);
-                    let b = self.get((x << 1) + 1, y << 1, level - 1);
-                    let c = self.get(x << 1, (y << 1) + 1, level - 1);
-                    let d = self.get((x << 1) + 1, (y << 1) + 1, level - 1);
+                    let a = self.raw_get(level - 1, x << 1, y << 1);
+                    let b = self.raw_get(level - 1, (x << 1) + 1, y << 1);
+                    let c = self.raw_get(level - 1, x << 1, (y << 1) + 1);
+                    let d = self.raw_get(level - 1, (x << 1) + 1, (y << 1) + 1);
                     self.set(x, y, level, a.min(b).min(c.min(d)));
                 }
             }
@@ -456,7 +473,40 @@ mod tests {
             zero_bitplanes,
             data,
             segments: Vec::new(),
+            passes: Vec::new(),
+            layer_passes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn tag_tree_propagation_wraps_like_openjph() {
+        // OpenJPH's tag_tree::get indexes each level with its own stride but
+        // does not clamp, so propagating node (1,0) of a 3x3 band reads the
+        // leaf that follows the row (here the empty block at (0,2)) and the
+        // node resolves to 0. Real 6.dcm streams depend on this.
+        let mut blocks = Vec::new();
+        for y in 0..3i32 {
+            for x in 0..3i32 {
+                let mut coded = block(vec![1, 2, 3], 16);
+                coded.local_x = x;
+                coded.local_y = y;
+                if x == 0 && y == 2 {
+                    coded.total_passes = 0;
+                    coded.zero_bitplanes = 0;
+                    coded.data.clear();
+                }
+                blocks.push(coded);
+            }
+        }
+        let band = PrecinctBand {
+            orientation: 1,
+            code_block_count_x: 3,
+            code_block_count_y: 3,
+            code_blocks: blocks,
+        };
+        let tree = HtTree::from_missing_msb(&band);
+        assert_eq!(tree.get(1, 0, 1), 0);
+        assert_eq!(tree.get(0, 0, 2), 0);
     }
 
     #[test]

@@ -19,6 +19,30 @@ const DWT_NORMS_97: [[f64; 10]; 4] = [
     ],
 ];
 
+/// Table E-1 DWT normalization factors for the reversible 5-3 transform
+/// (OpenJPEG `opj_dwt_norms`). Used only by the rate allocator's weighted
+/// distortion estimate.
+const DWT_NORMS_53: [[f64; 10]; 4] = [
+    [
+        1.000, 1.500, 2.750, 5.375, 10.68, 21.34, 42.67, 85.33, 170.7, 341.3,
+    ],
+    [
+        1.038, 1.592, 2.919, 5.703, 11.33, 22.64, 45.25, 90.48, 180.9, 0.0,
+    ],
+    [
+        1.038, 1.592, 2.919, 5.703, 11.33, 22.64, 45.25, 90.48, 180.9, 0.0,
+    ],
+    [
+        0.7186, 0.9218, 1.586, 3.043, 6.019, 12.01, 24.00, 47.97, 95.93, 0.0,
+    ],
+];
+
+/// Reversible multiple-component-transform norms (OpenJPEG `opj_mct_norms`).
+pub(crate) const MCT_NORMS_RCT: [f64; 3] = [1.732, 0.8292, 0.8292];
+/// Irreversible multiple-component-transform norms
+/// (OpenJPEG `opj_mct_norms_real`).
+pub(crate) const MCT_NORMS_ICT: [f64; 3] = [1.732, 1.805, 1.573];
+
 pub(crate) fn gain_bits(orientation: u8) -> u8 {
     match orientation {
         0 => 0,
@@ -76,6 +100,25 @@ pub(crate) fn dwt_norm_97(level: i32, orientation: u8) -> f64 {
     let max_level = if orientation == 0 { 9 } else { 8 };
     let level = level.clamp(0, max_level);
     DWT_NORMS_97[orientation][level as usize]
+}
+
+/// Reversible 5-3 band norm, clamped exactly like OpenJPEG's
+/// `opj_dwt_getnorm()`.
+pub(crate) fn dwt_norm_53(level: i32, orientation: u8) -> f64 {
+    let orientation = usize::from(orientation.min(3));
+    let max_level = if orientation == 0 { 9 } else { 8 };
+    let level = level.clamp(0, max_level);
+    DWT_NORMS_53[orientation][level as usize]
+}
+
+/// Band step size as OpenJPEG computes it in `opj_tcd_init_tile`: a double
+/// expression cast to `OPJ_FLOAT32` (so the encoder's coefficient division and
+/// the rate allocator's distortion weights both see the rounded f32 value).
+pub(crate) fn band_stepsize(encoded: u16, precision: u8, gain: u8) -> f32 {
+    let exponent = (encoded >> 11) & 0x1F;
+    let mantissa = encoded & 0x07FF;
+    let rb = i32::from(precision) + i32::from(gain);
+    ((1.0 + f64::from(mantissa) / 2048.0) * 2f64.powi(rb - i32::from(exponent))) as f32
 }
 
 /// Encodes a step size into the 16-bit scalar-expounded representation.

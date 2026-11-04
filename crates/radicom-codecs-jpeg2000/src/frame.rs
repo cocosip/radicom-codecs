@@ -361,7 +361,7 @@ pub(crate) fn encode(
     raw: &[u8],
     reversible: bool,
     mct: bool,
-    quant_scale: f64,
+    rates: &[f64],
 ) -> Result<Vec<u8>, String> {
     if matches!(
         layout.pi,
@@ -378,7 +378,7 @@ pub(crate) fn encode(
         layout.signed,
         codestream::DEFAULT_LEVELS,
     )?;
-    codestream::encode_with_mct_scaled(&mut components, reversible, mct, quant_scale)
+    codestream::encode_with_precincts(&mut components, reversible, None, mct, rates)
 }
 
 pub(crate) fn encode_ht(
@@ -392,12 +392,24 @@ pub(crate) fn encode_ht(
     ) {
         return Err("native source cannot use YBR_RCT or YBR_ICT".into());
     }
-    let planes = layout.read(raw)?;
+    // fo-dicom passes `BitsAllocated` to OpenJPH, so a narrow sample range is
+    // encoded inside a wider codestream: the SIZ precision and the level shift
+    // both follow the allocated width.
+    let precision = layout.bits_allocated as u8;
+    let mut planes = layout.read(raw)?;
+    if !layout.signed && layout.bits_allocated > u16::from(layout.bits_stored) {
+        let extra = (1i32 << (layout.bits_allocated - 1)) - (1i32 << (layout.bits_stored - 1));
+        for plane in &mut planes {
+            for value in plane.iter_mut() {
+                *value -= extra;
+            }
+        }
+    }
     let mut components = codestream::build_components(
         &planes,
         layout.width as i32,
         layout.height as i32,
-        layout.bits_stored,
+        precision,
         layout.signed,
         options.levels,
     )?;

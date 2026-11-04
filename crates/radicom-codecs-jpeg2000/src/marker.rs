@@ -507,11 +507,9 @@ impl Quantization {
     }
 }
 
-/// CAP `Ccap` value for an HTJ2K codestream. OpenJPH writes the magnitude
-/// bound `B` of its default step table, which is `precision + 2` for both the
-/// reversible and the irreversible transform; bit 5 marks the irreversible
-/// transform and the low five bits carry the bound bucket. fo-dicom writes
-/// 0x0002 (8-bit lossless), 0x000A (16-bit lossless) and 0x002A (16-bit lossy).
+/// CAP `Ccap` value for an HTJ2K codestream, used by the reference-value test.
+/// The production encoder computes the same bucket in `htj2k::codestream`.
+#[cfg(test)]
 pub(crate) fn cap_ccap(precision: u8, reversible: bool) -> u16 {
     let magnitude_bound = u32::from(precision) + 2;
     let bucket = if magnitude_bound <= 8 {
@@ -812,16 +810,6 @@ pub(crate) fn write_cap(out: &mut Vec<u8>, ccap: u16) {
     out.extend_from_slice(&8u16.to_be_bytes());
     out.extend_from_slice(&[0x00, 0x02, 0x00, 0x00]); // Pcap: JPH capability bit 15
     out.extend_from_slice(&ccap.to_be_bytes());
-}
-
-/// Writes a single-entry tile-part length table: `Ztlm = 1`, `Stlm` carries
-/// `ST = 0` (no tile index bytes) and `SP = 1` (32-bit length).
-pub(crate) fn write_tlm(out: &mut Vec<u8>, tile_part_length: u32) {
-    out.extend_from_slice(&TLM.to_be_bytes());
-    out.extend_from_slice(&8u16.to_be_bytes());
-    out.push(1);
-    out.push(0x40);
-    out.extend_from_slice(&tile_part_length.to_be_bytes());
 }
 
 pub(crate) fn write_eoc(out: &mut Vec<u8>) {

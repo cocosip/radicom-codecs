@@ -39,16 +39,19 @@ pub(crate) fn encode_segment(source: &[u8]) -> Result<Vec<u8>, String> {
     }
     match repeat_count {
         0 => {}
-        1 | 2 => {
-            for _ in 0..repeat_count {
-                literals.push(previous.ok_or_else(|| "missing previous byte".to_owned())?);
-            }
+        1 => literals.push(previous.ok_or_else(|| "missing previous byte".to_owned())?),
+        // A run that is still open when the segment ends is a repeat run, even
+        // for two bytes: fo-dicom's `Flush` emits `FF xx` there, while a run of
+        // two seen mid-stream would have gone into the literal buffer. Match that
+        // byte-for-byte; the literal buffer must be emitted first.
+        count => {
+            flush_literals(&mut output, &mut literals);
+            write_repeats(
+                &mut output,
+                previous.ok_or_else(|| "missing previous byte".to_owned())?,
+                count,
+            );
         }
-        count => write_repeats(
-            &mut output,
-            previous.ok_or_else(|| "missing previous byte".to_owned())?,
-            count,
-        ),
     }
     flush_literals(&mut output, &mut literals);
     Ok(output)
@@ -198,12 +201,13 @@ mod tests {
     }
 
     #[test]
-    fn encodes_a_two_byte_tail_run_as_a_literal() {
+    fn encodes_a_two_byte_tail_run_as_a_repeat_like_the_reference() {
         let encoded = encode_segment(&[1, 2, 3, 3]).unwrap();
-        assert_eq!(encoded, [3, 1, 2, 3, 3]);
+        assert_eq!(encoded, [1, 1, 2, 0xff, 3]);
         assert_eq!(decode_segment(&encoded, 4).unwrap(), [1, 2, 3, 3]);
-        assert_eq!(encode_segment(&[7, 7]).unwrap(), [1, 7, 7]);
-        // fo-dicom's repeat-2 form of the same bytes must still decode.
+        assert_eq!(encode_segment(&[7, 7]).unwrap(), [0xff, 7]);
+        // A run of two followed by another byte stays a literal run.
+        assert_eq!(encode_segment(&[7, 7, 9]).unwrap(), [2, 7, 7, 9]);
         assert_eq!(
             decode_segment(&[1, 1, 2, 0xff, 3], 4).unwrap(),
             [1, 2, 3, 3]

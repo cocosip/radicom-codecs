@@ -2,8 +2,8 @@
 use crate::{
     color,
     marker::{
-        parse_header, write_color_transform, write_dri, write_eoi, write_sof55, write_soi,
-        write_sos, write_sos_ids, FrameHeader,
+        parse_header, write_color_transform, write_dri, write_eoi, write_lse, write_sof55,
+        write_soi, write_sos, write_sos_ids, FrameHeader,
     },
     preset::Preset,
     scan::{decode_line_scan_planes, decode_scan, encode_restart_scan, ScanConfig},
@@ -251,6 +251,12 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
         write_color_transform(&mut out, color_transformation)?;
     }
     write_sof55(&mut out, &f)?;
+    // CharLS's C encoder enables `include_pc_parameters_jai` by default, so it
+    // emits the LSE segment (resolved values, T.87 C.2.4.1.1) for every image
+    // whose precision exceeds 12 bits. Below that the defaults are implied.
+    if f.precision > 12 {
+        write_lse(&mut out, &preset)?;
+    }
     let restart = u32::from(p.restart_interval);
     if restart != 0 {
         write_dri(&mut out, p.restart_interval);
@@ -662,6 +668,66 @@ mod tests {
         for raw in [0u8, 1, 124, 125, 126, 127, 128, 129, 130, 131, 255] {
             assert!(encode(&layout, &[raw], &params).is_ok(), "sample={raw}");
         }
+    }
+
+    #[test]
+    fn precisions_above_twelve_bits_write_the_charls_lse_segment() {
+        // CharLS's C encoder enables `include_pc_parameters_jai` by default and
+        // writes the resolved preset parameters whenever precision > 12. The
+        // reference bytes are the ones fo-dicom.Codecs emits for 1.dcm.
+        let mut layout = mono8();
+        layout.width = 8;
+        layout.bits_allocated = 16;
+        layout.bits_stored = 16;
+        layout.signed = true;
+        layout.frame_len = 16;
+        let raw: Vec<u8> = (0..8u16)
+            .flat_map(|value| (value * 1000).to_le_bytes())
+            .collect();
+        for (near, thresholds) in [
+            (0u32, [0x00u8, 0x12, 0x00, 0x43, 0x01, 0x14]),
+            // NEAR=3 (the fo-dicom `.81` default) raises all three thresholds.
+            (3, [0x00, 0x1b, 0x00, 0x52, 0x01, 0x29]),
+        ] {
+            let encoded = encode(
+                &layout,
+                &raw,
+                &JpegLsParams {
+                    near_lossless: near,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // SOI (2) + SOF55 (2 + 2 length + 6 payload + 3 per component) = 15.
+            let lse = &encoded[15..30];
+            let mut expected = vec![0xff, 0xf8, 0x00, 0x0d, 0x01, 0xff, 0xff];
+            expected.extend(thresholds);
+            expected.extend([0x00, 0x40]);
+            assert_eq!(lse, expected.as_slice(), "NEAR={near}");
+            // CharLS does not enable even destination sizing, so the codestream
+            // ends exactly at EOI.
+            assert_eq!(&encoded[encoded.len() - 2..], [0xff, 0xd9], "NEAR={near}");
+        }
+    }
+
+    #[test]
+    fn twelve_bit_precision_omits_the_lse_segment_like_charls() {
+        let mut layout = mono8();
+        layout.width = 4;
+        layout.bits_allocated = 16;
+        layout.bits_stored = 12;
+        layout.frame_len = 8;
+        let encoded = encode(&layout, &[0u8; 8], &JpegLsParams::default()).unwrap();
+        let sos = encoded
+            .windows(2)
+            .position(|window| window == [0xff, 0xda])
+            .unwrap();
+        assert!(
+            !encoded[..sos]
+                .windows(2)
+                .any(|window| window == [0xff, 0xf8]),
+            "12-bit images use the implied T.87 defaults"
+        );
     }
 
     #[test]

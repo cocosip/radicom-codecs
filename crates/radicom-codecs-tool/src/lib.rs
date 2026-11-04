@@ -10,7 +10,7 @@ use std::sync::Arc;
 use radicom::error::Error;
 use radicom::io::file::DicomFile;
 use radicom::model::transfer_syntax::TransferSyntax;
-use radicom::pixel::codec::{CodecParams, J2kParams, JpegParams, SampleFactor};
+use radicom::pixel::codec::{CodecParams, J2kParams};
 use radicom::pixel::photometric::PhotometricInterpretation;
 use radicom::pixel::{PixelDataRef, PIXEL_DATA};
 
@@ -183,7 +183,7 @@ pub fn compress(
             });
             continue;
         }
-        let params = effective_params(&target, &pixel);
+        let params = effective_params(&target);
         let (status, output_size, message) = match transcode_one(
             file,
             &source_uid,
@@ -271,19 +271,14 @@ fn unsupported_reason(target: &TargetFormat, pixel: &PixelDataRef<'_>) -> Option
     }
 }
 
-/// Parameters that make the tool's output match the fo-dicom reference: 4:2:2
-/// for colour sequential JPEG, and the component transform for JPEG 2000.
-fn effective_params(target: &TargetFormat, pixel: &PixelDataRef<'_>) -> Option<CodecParams> {
+/// Parameters that make the tool's output match the fo-dicom reference: the
+/// codec defaults for sequential JPEG (4:4:4, quality 90), and the component
+/// transform plus rate levels for JPEG 2000.
+fn effective_params(target: &TargetFormat) -> Option<CodecParams> {
     if target.params.is_some() {
         return target.params.clone();
     }
     match target.suffix {
-        "jpeg_baseline" | "jpeg_process2_4" if pixel.samples_per_pixel() == 3 => {
-            Some(CodecParams::Jpeg(JpegParams {
-                sample_factor: SampleFactor::Half,
-                ..Default::default()
-            }))
-        }
         "j2k_lossless" => Some(CodecParams::Jpeg2000(J2kParams {
             irreversible: false,
             allow_mct: true,

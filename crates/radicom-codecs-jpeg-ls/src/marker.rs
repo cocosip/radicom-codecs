@@ -103,6 +103,18 @@ pub(crate) fn write_sos_ids(
     p.extend([near, ilv, 0]);
     segment(out, 0xda, &p)
 }
+/// Writes the JPEG-LS preset coding parameters segment (LSE, id 1). CharLS's
+/// encoder API enables `include_pc_parameters_jai` by default, so for sample
+/// precisions above 12 bits it writes the resolved threshold values even when
+/// they equal the T.87 defaults (T.87 C.2.4.1.1).
+pub(crate) fn write_lse(out: &mut Vec<u8>, preset: &Preset) -> Result<(), String> {
+    let mut p = Vec::with_capacity(11);
+    p.push(1);
+    for value in [preset.maxval, preset.t1, preset.t2, preset.t3, preset.reset] {
+        p.extend(value.to_be_bytes());
+    }
+    segment(out, 0xf8, &p)
+}
 /// Writes a DRI restart-interval segment; the interval is counted in MCUs.
 pub(crate) fn write_dri(out: &mut Vec<u8>, interval: u16) {
     segment(out, 0xdd, &interval.to_be_bytes()).expect("DRI payload fits a segment")

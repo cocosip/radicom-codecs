@@ -124,15 +124,12 @@ For input file `study1.dcm`, output names include:
   decoded once per target format; a source already in the target format is
   saved as-is instead of being decoded and re-encoded, so lossy input is never
   compressed twice.
-- Each target starts from the codec's default parameters, with two adjustments
-  that align the tool with the native `fo-dicom.Codecs` reference: JPEG 2000
-  uses the reversible or irreversible component transform, and colour sequential
-  JPEG uses 4:2:2 chroma sampling. The reference tool instead leaves the codec
-  default of 4:4:4, which costs roughly 15% more payload for the same quality
-  target, so 4:2:2 is kept here. JPEG 2000 Lossy (`.91`) is coded at `rate = 16`
-  and the encoder bisects a continuous quantization scale until the frame
-  payload reaches that ratio, so the achieved size lands within 2% of the
-  reference instead of overshooting it. `rate = 0` means "keep every bit-plane".
+- Each target starts from the codec's default parameters, adjusted only where
+  the native `fo-dicom.Codecs` reference tool passes an explicit value: JPEG 2000
+  uses the reversible or irreversible component transform, and JPEG 2000 Lossy
+  (`.91`) is coded at `rate = 16` with the reference rate-level ladder. Sequential
+  JPEG keeps the codec defaults (quality 90, 4:4:4) so the output matches the
+  reference byte for byte instead of trading payload for chroma subsampling.
 - The JPEG lossless targets (`.57`/`.70`) derive a per-image Huffman table from
   the actual prediction differences, matching libjpeg with
   `optimize_coding = TRUE` instead of the larger Annex K default table. The

@@ -1,5 +1,6 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
+use super::color::{rgb_to_ycc, JpegColorSpace};
 use super::lossless::{LosslessFrame, Selection};
 use super::sequential::{fancy_upsample, FrameExpectation, SequentialFrame};
 use radicom::error::{CodecError, Error};
@@ -269,23 +270,6 @@ impl Layout {
     }
 }
 
-fn rgb_to_ybr(samples: &mut [u16], precision: u8) {
-    let max = f64::from((1u32 << precision) - 1);
-    let center = max / 2.0;
-    for pixel in samples.chunks_exact_mut(3) {
-        let r = f64::from(pixel[0]);
-        let g = f64::from(pixel[1]);
-        let b = f64::from(pixel[2]);
-        pixel[0] = (0.299 * r + 0.587 * g + 0.114 * b).round().clamp(0.0, max) as u16;
-        pixel[1] = (-0.168736 * r - 0.331264 * g + 0.5 * b + center)
-            .round()
-            .clamp(0.0, max) as u16;
-        pixel[2] = (0.5 * r - 0.418688 * g - 0.081312 * b + center)
-            .round()
-            .clamp(0.0, max) as u16;
-    }
-}
-
 fn ybr_to_rgb(samples: &mut [u16], precision: u8) {
     let max = f64::from((1u32 << precision) - 1);
     let center = max / 2.0;
@@ -378,6 +362,14 @@ pub(crate) fn encode_sequential(
         ));
     }
     let mut frames = Vec::new();
+    // The lossy encoder always writes YCbCr for a three-component frame:
+    // libjpeg's jpeg_set_defaults converts RGB input to YCbCr, and
+    // YBR_FULL/YBR_FULL_422 input is passed through as YCbCr.
+    let colorspace = if layout.components == 3 {
+        JpegColorSpace::Ycbcr
+    } else {
+        JpegColorSpace::from_photometric(layout.photometric)
+    };
     for i in 0..src.number_of_frames() {
         let frame = src
             .get_frame(i)
@@ -389,7 +381,7 @@ pub(crate) fn encode_sequential(
             .read_samples(bytes.as_ref())
             .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?;
         if layout.photometric == PhotometricInterpretation::Rgb {
-            rgb_to_ybr(&mut samples, layout.bits_stored);
+            rgb_to_ycc(&mut samples, layout.bits_stored);
         }
         let frame = SequentialFrame::new(
             layout.width,
@@ -401,12 +393,13 @@ pub(crate) fn encode_sequential(
         .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?;
         frames.push(
             frame
-                .encode_with_smoothing(
+                .encode_with_colorspace(
                     params.quality,
                     !baseline,
                     sampling_half,
                     params.smoothing_factor,
                     (params.restart_interval != 0).then_some(params.restart_interval),
+                    colorspace,
                 )
                 .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?,
         );
@@ -568,6 +561,7 @@ pub(crate) fn encode_lossless(
         ));
     }
     let mut encoded_frames = Vec::new();
+    let colorspace = JpegColorSpace::from_photometric(layout.photometric);
     for frame_index in 0..src.number_of_frames() {
         let buffer = src
             .get_frame(frame_index)
@@ -588,10 +582,11 @@ pub(crate) fn encode_lossless(
         .map_err(|message| operation_error(codec, &format!("frame {frame_index}: {message}")))?;
         encoded_frames.push(
             frame
-                .encode(
+                .encode_with_colorspace(
                     predictor,
                     point_transform,
                     (params.restart_interval != 0).then_some(params.restart_interval),
+                    colorspace,
                 )
                 .map_err(|message| {
                     operation_error(codec, &format!("frame {frame_index}: {message}"))

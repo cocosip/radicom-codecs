@@ -402,8 +402,10 @@ fn converted_decode_into_a_planar_destination_is_interleaved() {
 fn codestream_encoded_as(
     encode_as: std::sync::Arc<TransferSyntax>,
     decoded_as: std::sync::Arc<TransferSyntax>,
+    allocated: u16,
+    stored: u16,
 ) -> Dataset {
-    let mut compressed = source(8, 8, 8, 8, 1)
+    let mut compressed = source(8, 8, allocated, stored, 1)
         .clone_with_syntax(encode_as, Some(CodecParams::Jpeg(JpegParams::default())))
         .unwrap();
     compressed.set_transfer_syntax(decoded_as);
@@ -413,12 +415,15 @@ fn codestream_encoded_as(
 #[test]
 fn jpeg_process1_rejects_an_extended_sof1_codestream() {
     let _guard = install();
-    // Process 2/4 writes SOF1; the Process 1 decoder must refuse it.
+    // A 12-bit Process 2/4 stream uses SOF1; the Process 1 decoder must refuse it.
+    // (8-bit Process 2/4 streams use SOF0, matching libjpeg, and are accepted.)
     let compressed = codestream_encoded_as(
         syntaxes::JPEG_PROCESS_2_4.clone(),
         syntaxes::JPEG_PROCESS_1.clone(),
+        16,
+        12,
     );
-    let mut dst = source(8, 8, 8, 8, 1);
+    let mut dst = source(8, 8, 16, 12, 1);
     dst.remove(Tag::PIXEL_DATA);
     dst.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
     let error = JpegProcess1Codec
@@ -439,6 +444,8 @@ fn jpeg_process2_4_accepts_an_eight_bit_baseline_sof0_codestream() {
     let compressed = codestream_encoded_as(
         syntaxes::JPEG_PROCESS_1.clone(),
         syntaxes::JPEG_PROCESS_2_4.clone(),
+        8,
+        8,
     );
     let mut dst = source(8, 8, 8, 8, 1);
     dst.remove(Tag::PIXEL_DATA);

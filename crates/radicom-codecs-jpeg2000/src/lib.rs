@@ -138,12 +138,13 @@ fn progression_code(order: ProgressionOrder) -> u8 {
 
 fn ht_params(irreversible: bool, progression_order: ProgressionOrder) -> CodecParams {
     // fo-dicom.Codecs (OpenJPH) enables the colour transform whenever there is
-    // more than one component, so the same default keeps the sizes and the
-    // reconstructed samples aligned with the native reference.
+    // more than one component, always requests the TLM marker, and leaves the
+    // progression order at OpenJPH's default (RPCL) for the non-RPCL syntaxes.
     CodecParams::HtJpeg2000(HtJ2kParams {
         irreversible,
         employ_color_transform: true,
         progression_order,
+        insert_tlm_markers: true,
         ..Default::default()
     })
 }
@@ -156,7 +157,7 @@ impl Codec for HtJpeg2000LosslessCodec {
         &syntaxes::HTJ2K_LOSSLESS
     }
     fn default_params(&self) -> CodecParams {
-        ht_params(false, ProgressionOrder::Lrcp)
+        ht_params(false, ProgressionOrder::Rpcl)
     }
     fn encode(
         &self,
@@ -244,7 +245,7 @@ impl Codec for HtJpeg2000LossyCodec {
         &syntaxes::HTJ2K_LOSSY
     }
     fn default_params(&self) -> CodecParams {
-        ht_params(true, ProgressionOrder::Lrcp)
+        ht_params(true, ProgressionOrder::Rpcl)
     }
     fn encode(
         &self,
@@ -320,14 +321,6 @@ fn operate(
                 codec,
                 "encode",
                 "encode_signed_as_unsigned is not implemented",
-            ));
-        }
-        let will_be_lossy = !reversible && p.irreversible;
-        if will_be_lossy && !p.rate_levels.is_empty() {
-            return Err(error(
-                codec,
-                "encode",
-                "rate_levels (multiple quality layers) are not implemented by the classic JPEG 2000 encoder",
             ));
         }
     }
@@ -410,6 +403,28 @@ fn operate(
         let encode_reversible = if reversible { true } else { !p.irreversible };
         let apply_mct =
             p.allow_mct && p.update_photometric_interpretation && layout.components == 3;
+        // Reproduce fo-dicom.Codecs' layer list: every default RateLevel above
+        // `rate`, then `rate` scaled by the stored/allocated precision, and a
+        // final lossless layer for the reversible syntax.
+        let rate_levels: Vec<f64> = if p.rate_levels.is_empty() {
+            vec![1280.0, 640.0, 320.0, 160.0, 80.0, 40.0, 20.0, 10.0, 5.0]
+        } else {
+            p.rate_levels
+                .iter()
+                .map(|&level| f64::from(level))
+                .collect()
+        };
+        let rate = f64::from(p.rate);
+        let mut rates = Vec::new();
+        let mut level = 0;
+        while level < rate_levels.len() && rate_levels[level] > rate {
+            rates.push(rate_levels[level]);
+            level += 1;
+        }
+        rates.push(rate * f64::from(layout.bits_stored) / f64::from(layout.bits_allocated));
+        if reversible && rate > 0.0 {
+            rates.push(0.0);
+        }
         let mut frames = Vec::new();
         for i in 0..src.number_of_frames() {
             let b = src
@@ -418,65 +433,14 @@ fn operate(
             let bytes = b
                 .data()
                 .map_err(|e| error(codec, "encode", format!("frame {i}: {e}")))?;
-            // `rate` is the target compression ratio for the irreversible path:
-            // the payload may occupy `1 / rate` of the stored pixel data. The
-            // baseline files land 10% over that budget because OpenJPEG's rate
-            // allocator works in whole truncation points.
-            let target = if encode_reversible || p.rate == 0 {
-                None
-            } else {
-                Some((bytes.as_ref().len() as f64 / f64::from(p.rate)).max(1.0))
-            };
-            let mut encoded =
-                frame::encode(&layout, bytes.as_ref(), encode_reversible, apply_mct, 1.0)
-                    .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?;
-            if let Some(target) = target {
-                if encoded.len() as f64 > target {
-                    // The quantization step is continuous (`QCD` carries an
-                    // 11-bit mantissa), so bisect on log2(scale) instead of
-                    // dropping whole bit-planes: dropping a bit-plane halves the
-                    // payload and overshoots the requested ratio by up to 2x.
-                    let mut floor = 0.0f64;
-                    let mut ceiling: Option<f64> = None;
-                    let mut log = (encoded.len() as f64 / target).log2().max(0.5);
-                    let mut best: Option<Vec<u8>> = None;
-                    let mut smallest = Vec::new();
-                    for _ in 0..14 {
-                        let data = frame::encode(
-                            &layout,
-                            bytes.as_ref(),
-                            encode_reversible,
-                            apply_mct,
-                            2f64.powf(log),
-                        )
-                        .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?;
-                        let size = data.len() as f64;
-                        if size <= target {
-                            let close = size >= target * 0.98;
-                            best = Some(data);
-                            ceiling = Some(log);
-                            if close {
-                                break;
-                            }
-                        } else {
-                            floor = log;
-                            smallest = data;
-                        }
-                        log = match ceiling {
-                            Some(ceiling) => (floor + ceiling) / 2.0,
-                            None => floor + (size / target).log2().max(0.5),
-                        };
-                    }
-                    // When the target is below the codestream floor (tiny frames)
-                    // no scale fits, so keep the coarsest attempt instead of the
-                    // unquantized one.
-                    if let Some(best) = best {
-                        encoded = best;
-                    } else if !smallest.is_empty() {
-                        encoded = smallest;
-                    }
-                }
-            }
+            let encoded = frame::encode(
+                &layout,
+                bytes.as_ref(),
+                encode_reversible,
+                apply_mct,
+                &rates,
+            )
+            .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?;
             frames.push(encoded);
         }
         for frame in frames {
@@ -1070,8 +1034,17 @@ mod facade_tests {
             ..Default::default()
         });
         let encoded = encode_with(&Jpeg2000LossyCodec, &mut source, &params).unwrap();
+        // The lossy syntax does not append a lossless layer, so truncation still
+        // costs precision; the parameter only selects the reversible transform.
+        let stream = encoded_codestream(&encoded);
+        let (header, _) = crate::marker::MainHeader::parse(&stream).unwrap();
+        assert_eq!(
+            header.cod.style.transform, 1,
+            "irreversible=false must select the 5/3 transform"
+        );
+        assert_eq!(header.qcd.style, 0, "reversible quantization style");
         let decoded = decode_with(&Jpeg2000LossyCodec, &encoded, &params).unwrap();
-        assert_eq!(samples(&decoded), raw, "5/3 coding must be lossless");
+        assert_eq!(samples(&decoded).len(), raw.len());
     }
 
     #[test]
@@ -1201,23 +1174,15 @@ mod facade_tests {
             .unwrap()
             .add_frame(&raw)
             .unwrap();
-        for params in [
-            J2kParams {
-                rate_levels: vec![32],
-                ..Default::default()
-            },
-            J2kParams {
-                encode_signed_as_unsigned: true,
-                ..Default::default()
-            },
-        ] {
-            let params = CodecParams::Jpeg2000(params);
-            let error = encode_with(&Jpeg2000LossyCodec, &mut source, &params).unwrap_err();
-            assert!(
-                error.contains("not implemented"),
-                "unexpected error: {error}"
-            );
-        }
+        let params = CodecParams::Jpeg2000(J2kParams {
+            encode_signed_as_unsigned: true,
+            ..Default::default()
+        });
+        let error = encode_with(&Jpeg2000LossyCodec, &mut source, &params).unwrap_err();
+        assert!(
+            error.contains("not implemented"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1371,5 +1336,68 @@ mod facade_tests {
             }
             other => panic!("expected a fragment sequence, got {other:?}"),
         }
+    }
+    fn encoded_codestream(encoded: &Dataset) -> Vec<u8> {
+        let frame = PixelDataRef::from_dataset(encoded)
+            .unwrap()
+            .get_frame(0)
+            .unwrap();
+        let data = frame.data().unwrap();
+        let bytes = data.as_ref();
+        let mut eoc = bytes.len();
+        for index in (0..bytes.len().saturating_sub(1)).rev() {
+            if bytes[index] == 0xFF && bytes[index + 1] == 0xD9 {
+                eoc = index + 2;
+                break;
+            }
+        }
+        bytes[..eoc].to_vec()
+    }
+
+    #[test]
+    fn lossless_encoder_writes_the_default_eight_layers_and_openjpeg_comment() {
+        let raw: Vec<u8> = (0..32 * 32).map(|i| ((i * 13 + 7) % 256) as u8).collect();
+        let mut source = ds(32, 32, 8, 1, 0, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let encoded = encode_with(
+            &Jpeg2000LosslessCodec,
+            &mut source,
+            &Jpeg2000LosslessCodec.default_params(),
+        )
+        .unwrap();
+        let stream = encoded_codestream(&encoded);
+        let (header, _) = crate::marker::MainHeader::parse(&stream).unwrap();
+        assert_eq!(header.cod.layers, 8);
+        assert_eq!(header.cod.mct, 0);
+        assert!(
+            stream
+                .windows(33)
+                .any(|window| window == b"Created by OpenJPEG version 2.5.4"),
+            "missing OpenJPEG COM marker"
+        );
+    }
+
+    #[test]
+    fn custom_rate_levels_and_rate_determine_the_layer_count() {
+        let raw: Vec<u8> = (0..32 * 32).map(|i| ((i * 5) % 256) as u8).collect();
+        let mut source = ds(32, 32, 8, 1, 0, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let params = CodecParams::Jpeg2000(J2kParams {
+            irreversible: true,
+            rate: 8,
+            rate_levels: vec![32, 16],
+            ..Default::default()
+        });
+        let encoded = encode_with(&Jpeg2000LossyCodec, &mut source, &params).unwrap();
+        let stream = encoded_codestream(&encoded);
+        let (header, _) = crate::marker::MainHeader::parse(&stream).unwrap();
+        // [32, 16] are above the target 8, so the list is [32, 16, 8].
+        assert_eq!(header.cod.layers, 3);
     }
 }

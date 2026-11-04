@@ -84,6 +84,11 @@ pub(crate) fn inverse_53(
     Ok(())
 }
 
+/// Forward 9/7 transform over `f64` planes. The classic encoder now uses the
+/// OpenJPEG-compatible `f32` path (see `codestream::forward_97_f32`) so its
+/// coefficient rounding matches the reference bit for bit; this variant remains
+/// for the wavelet unit tests and decoder-side experiments.
+#[allow(dead_code)]
 pub(crate) fn forward_97(
     data: &mut [f64],
     width: usize,

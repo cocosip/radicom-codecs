@@ -5,7 +5,11 @@
 )]
 
 use super::bit::{BitReader, BitWriter};
-use super::dct::{forward, inverse, scaled_table, CHROMA_Q, LUMA_Q, MAX_QUANTIZATION, ZIGZAG};
+use super::color::JpegColorSpace;
+use super::dct::{
+    inverse, islow_forward, scaled_table, ForwardQuantizer, CHROMA_Q, LUMA_Q, MAX_QUANTIZATION,
+    ZIGZAG,
+};
 use super::huffman::HuffmanTable;
 use super::marker::{check_trailing, Marker, MarkerReader, MarkerWriter};
 
@@ -135,6 +139,29 @@ impl SequentialFrame {
 
     /// Encode with libjpeg's input smoothing_factor (`0..=100`). It only shapes
     /// the encoder input; DICOM has no decode-side field for it.
+    pub(crate) fn encode_with_colorspace(
+        &self,
+        quality: u32,
+        extended: bool,
+        sampling_half: bool,
+        smoothing: u32,
+        restart_interval: Option<u16>,
+        colorspace: JpegColorSpace,
+    ) -> Result<Vec<u8>, String> {
+        let components = (0..self.components).collect::<Vec<_>>();
+        self.encode_scans_colors(
+            quality,
+            extended,
+            sampling_half,
+            smoothing,
+            restart_interval,
+            std::slice::from_ref(&components),
+            colorspace,
+        )
+    }
+
+    /// Test entry point: synthetic frames use the YCbCr table layout.
+    #[cfg(test)]
     pub(crate) fn encode_with_smoothing(
         &self,
         quality: u32,
@@ -143,19 +170,21 @@ impl SequentialFrame {
         smoothing: u32,
         restart_interval: Option<u16>,
     ) -> Result<Vec<u8>, String> {
-        let components = (0..self.components).collect::<Vec<_>>();
-        self.encode_scans(
+        self.encode_with_colorspace(
             quality,
             extended,
             sampling_half,
             smoothing,
             restart_interval,
-            std::slice::from_ref(&components),
+            test_colorspace(self.components),
         )
     }
 
     /// Encode one or more scans. A scan is a list of component indices carried
-    /// by that scan; T.81 permits a non-interleaved scan per component.
+    /// by that scan; T.81 permits a non-interleaved scan per component. This is
+    /// a test entry point for multi-scan streams over synthetic three-component
+    /// frames, so it uses the YCbCr table layout.
+    #[cfg(test)]
     fn encode_scans(
         &self,
         quality: u32,
@@ -164,6 +193,28 @@ impl SequentialFrame {
         smoothing: u32,
         restart_interval: Option<u16>,
         scans: &[Vec<u8>],
+    ) -> Result<Vec<u8>, String> {
+        self.encode_scans_colors(
+            quality,
+            extended,
+            sampling_half,
+            smoothing,
+            restart_interval,
+            scans,
+            test_colorspace(self.components),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_scans_colors(
+        &self,
+        quality: u32,
+        extended: bool,
+        sampling_half: bool,
+        smoothing: u32,
+        restart_interval: Option<u16>,
+        scans: &[Vec<u8>],
+        colorspace: JpegColorSpace,
     ) -> Result<Vec<u8>, String> {
         if sampling_half && self.components != 3 {
             return Err("JPEG 4:2:2 sampling requires three components".into());
@@ -182,19 +233,21 @@ impl SequentialFrame {
         } else {
             [(1, 1); 3]
         };
-        self.encode_scans_with(
+        self.encode_scans_with_colors(
             quality,
             extended,
             &sampling,
             smoothing,
             restart_interval,
             scans,
+            colorspace,
         )
     }
 
     /// Encode with an explicit sampling matrix. The public encoder only writes
     /// 4:4:4 and 4:2:2; the wider support exists so tests can build the 4:2:0
     /// and other T.81 layouts that this decoder accepts.
+    #[cfg(test)]
     fn encode_scans_with(
         &self,
         quality: u32,
@@ -203,6 +256,28 @@ impl SequentialFrame {
         smoothing: u32,
         restart_interval: Option<u16>,
         scans: &[Vec<u8>],
+    ) -> Result<Vec<u8>, String> {
+        self.encode_scans_with_colors(
+            quality,
+            extended,
+            sampling,
+            smoothing,
+            restart_interval,
+            scans,
+            test_colorspace(self.components),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_scans_with_colors(
+        &self,
+        quality: u32,
+        extended: bool,
+        sampling: &[(u8, u8); 3],
+        smoothing: u32,
+        restart_interval: Option<u16>,
+        scans: &[Vec<u8>],
+        colorspace: JpegColorSpace,
     ) -> Result<Vec<u8>, String> {
         if quality > 100 {
             return Err("JPEG quality must be 0..=100".into());
@@ -242,34 +317,77 @@ impl SequentialFrame {
             }
         }
         let q = quant_tables(quality.max(1), extended);
+        let quantizers = [
+            ForwardQuantizer::new(&q[0], self.precision),
+            ForwardQuantizer::new(&q[1], self.precision),
+        ];
         let mut dc_frequencies = [[0u32; 256]; 2];
         let mut ac_frequencies = [[0u32; 256]; 2];
         for scan in scans {
-            self.walk_scan(&q, sampling, smoothing, scan, restart_interval, |step| {
-                if let ScanStep::Block { slot, diff, block } = step {
-                    dc_frequencies[slot][usize::from(category(diff))] += 1;
-                    for_each_ac(block, |symbol, _, _| {
-                        ac_frequencies[slot][usize::from(symbol)] += 1;
-                        Ok(())
-                    })?;
-                }
-                Ok(())
-            })?;
+            self.walk_scan(
+                &quantizers,
+                sampling,
+                smoothing,
+                scan,
+                restart_interval,
+                colorspace,
+                |step| {
+                    if let ScanStep::Block { slot, diff, block } = step {
+                        dc_frequencies[slot][usize::from(category(diff))] += 1;
+                        for_each_ac(block, |symbol, _, _| {
+                            ac_frequencies[slot][usize::from(symbol)] += 1;
+                            Ok(())
+                        })?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
         let tables = Tables::new(q, &dc_frequencies, &ac_frequencies)?;
         let mut out = MarkerWriter::default();
-        out.write_marker(Marker::Soi)?;
-        out.write_segment(Marker::Dqt, &dqt_payload(&tables.q)?)?;
-        out.write_segment(
-            if extended { Marker::Sof1 } else { Marker::Sof0 },
-            &sof_payload(self, sampling),
-        )?;
-        out.write_segment(Marker::Dht, &dht_payload(&tables))?;
-        if let Some(interval) = restart_interval {
-            out.write_segment(Marker::Dri, &interval.to_be_bytes())?;
+        colorspace.write_file_header(&mut out)?;
+        // jcmarker.c `write_frame_header`: one DQT per quantization table
+        // referenced by a component, in component order, duplicates suppressed.
+        let mut written_quant = [false; 2];
+        for component in 0..usize::from(self.components) {
+            let id = usize::from(colorspace.table_id(component));
+            if !written_quant[id] {
+                out.write_segment(Marker::Dqt, &dqt_payload(id as u8, &tables.q[id]))?;
+                written_quant[id] = true;
+            }
         }
+        // libjpeg emits SOF0 for 8-bit data and SOF1 otherwise, independently of
+        // the DICOM process the caller asked for.
+        let sof = if self.precision == 8 {
+            Marker::Sof0
+        } else {
+            Marker::Sof1
+        };
+        out.write_segment(sof, &sof_payload(self, sampling, colorspace))?;
+        // jcmarker.c `write_scan_header`: DHT(s) for the scan's tables, then DRI
+        // if the interval changed, then SOS.
+        let mut sent_dc = [false; 2];
+        let mut sent_ac = [false; 2];
+        let mut last_restart_interval = 0u16;
         for scan in scans {
-            out.write_segment(Marker::Sos, &sos_payload(scan))?;
+            for &component in scan {
+                let id = usize::from(colorspace.table_id(usize::from(component)));
+                if !sent_dc[id] {
+                    out.write_segment(Marker::Dht, &dht_payload(id as u8, false, &tables.dc[id]))?;
+                    sent_dc[id] = true;
+                }
+                if !sent_ac[id] {
+                    out.write_segment(Marker::Dht, &dht_payload(id as u8, true, &tables.ac[id]))?;
+                    sent_ac[id] = true;
+                }
+            }
+            if let Some(interval) = restart_interval {
+                if interval != last_restart_interval {
+                    out.write_segment(Marker::Dri, &interval.to_be_bytes())?;
+                    last_restart_interval = interval;
+                }
+            }
+            out.write_segment(Marker::Sos, &sos_payload(scan, colorspace))?;
             self.write_scan(
                 &mut out,
                 &tables,
@@ -277,6 +395,8 @@ impl SequentialFrame {
                 smoothing,
                 scan,
                 restart_interval,
+                &quantizers,
+                colorspace,
             )?;
         }
         out.write_marker(Marker::Eoi)?;
@@ -286,13 +406,15 @@ impl SequentialFrame {
     /// Walks one scan's blocks in coding order, yielding the quantized block and
     /// its DC difference. The statistics pass and the entropy pass both use it,
     /// so they always agree on the symbol sequence.
+    #[allow(clippy::too_many_arguments)]
     fn walk_scan(
         &self,
-        q: &[[u16; 64]; 2],
+        quantizers: &[ForwardQuantizer; 2],
         sampling: &[(u8, u8); 3],
         smoothing: u32,
         components: &[u8],
         restart_interval: Option<u16>,
+        colorspace: JpegColorSpace,
         mut visit: impl FnMut(ScanStep<'_>) -> Result<(), String>,
     ) -> Result<(), String> {
         let interleaved = components.len() > 1;
@@ -319,6 +441,7 @@ impl SequentialFrame {
                 mcu += 1;
                 for &component in components {
                     let c = usize::from(component);
+                    let table = usize::from(colorspace.table_id(c));
                     let (h, v) = sampling[c];
                     let (blocks_x, blocks_y) = if interleaved {
                         (usize::from(h), usize::from(v))
@@ -338,18 +461,13 @@ impl SequentialFrame {
                             let block_y = my * blocks_y + local_y;
                             let mut block = [0i32; 64];
                             self.load_block(pooling, block_x, block_y, &mut block);
-                            let coeff = forward(&block);
-                            let table = &q[c.min(1)];
-                            let mut quant = [0i32; 64];
-                            for i in 0..64 {
-                                quant[i] =
-                                    (f64::from(coeff[i]) / f64::from(table[i])).round() as i32;
-                            }
+                            let coefficients = islow_forward(&block, self.precision);
+                            let quant = quantizers[table].quantize(&coefficients);
                             let dc = quant[0];
                             let diff = dc - previous_dc[c];
                             previous_dc[c] = dc;
                             visit(ScanStep::Block {
-                                slot: c.min(1),
+                                slot: table,
                                 diff,
                                 block: &quant,
                             })?;
@@ -361,6 +479,7 @@ impl SequentialFrame {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_scan(
         &self,
         out: &mut MarkerWriter,
@@ -369,14 +488,17 @@ impl SequentialFrame {
         smoothing: u32,
         components: &[u8],
         restart_interval: Option<u16>,
+        quantizers: &[ForwardQuantizer; 2],
+        colorspace: JpegColorSpace,
     ) -> Result<(), String> {
         let mut bits = BitWriter::default();
         self.walk_scan(
-            &tables.q,
+            quantizers,
             sampling,
             smoothing,
             components,
             restart_interval,
+            colorspace,
             |step| match step {
                 ScanStep::Restart(index) => {
                     bits.flush_to_byte();
@@ -1010,25 +1132,27 @@ fn write_value(w: &mut BitWriter, h: &HuffmanTable, v: i32) -> Result<(), String
 }
 /// Emits `(symbol, extra bits, bit count)` for every AC coefficient of a
 /// quantized block: runs of sixteen zeros as `0xF0`, the end of block as `0x00`,
-/// and otherwise `(run << 4) | size`.
+/// and otherwise `(run << 4) | size`. Like libjpeg's `encode_one_block` (and its
+/// statistics twin `htest_one_block`), run-length-16 codes are only emitted when
+/// a nonzero coefficient actually follows; a trailing zero run is one EOB.
 fn for_each_ac(
     quant: &[i32; 64],
     mut emit: impl FnMut(u8, u32, u8) -> Result<(), String>,
 ) -> Result<(), String> {
-    let mut run = 0u8;
+    let mut run = 0u32;
     for &index in ZIGZAG.iter().skip(1) {
         let value = quant[index];
         if value == 0 {
             run += 1;
-            if run == 16 {
-                emit(0xf0, 0, 0)?;
-                run = 0;
-            }
-        } else {
-            let size = category(value);
-            emit((run << 4) | size, amplitude(value, size), size)?;
-            run = 0;
+            continue;
         }
+        while run >= 16 {
+            emit(0xf0, 0, 0)?;
+            run -= 16;
+        }
+        let size = category(value);
+        emit(((run as u8) << 4) | size, amplitude(value, size), size)?;
+        run = 0;
     }
     if run > 0 {
         emit(0, 0, 0)?;
@@ -1065,7 +1189,11 @@ fn expect(r: &mut MarkerReader<'_>, m: Marker) -> Result<(), String> {
         Ok(())
     }
 }
-fn sof_payload(f: &SequentialFrame, sampling: &[(u8, u8); 3]) -> Vec<u8> {
+fn sof_payload(
+    f: &SequentialFrame,
+    sampling: &[(u8, u8); 3],
+    colorspace: JpegColorSpace,
+) -> Vec<u8> {
     let mut p = vec![
         f.precision,
         (f.height as u16 >> 8) as u8,
@@ -1074,52 +1202,62 @@ fn sof_payload(f: &SequentialFrame, sampling: &[(u8, u8); 3]) -> Vec<u8> {
         f.width as u8,
         f.components,
     ];
-    for c in 0..f.components {
-        let (h, v) = sampling[usize::from(c)];
-        p.extend([c + 1, (h << 4) | v, if c == 0 { 0 } else { 1 }]);
+    for c in 0..usize::from(f.components) {
+        let (h, v) = sampling[c];
+        p.extend([
+            colorspace.component_id(c),
+            (h << 4) | v,
+            colorspace.table_id(c),
+        ]);
     }
     p
 }
-fn sos_payload(components: &[u8]) -> Vec<u8> {
+fn sos_payload(components: &[u8], colorspace: JpegColorSpace) -> Vec<u8> {
     let mut p = vec![components.len() as u8];
     for &component in components {
-        p.extend([component + 1, if component == 0 { 0x00 } else { 0x11 }]);
+        let table = colorspace.table_id(usize::from(component));
+        p.extend([
+            colorspace.component_id(usize::from(component)),
+            (table << 4) | table,
+        ]);
     }
     p.extend([0, 63, 0]);
     p
 }
-fn dqt_payload(q: &[[u16; 64]; 2]) -> Result<Vec<u8>, String> {
-    let mut p = Vec::with_capacity(130);
-    for (id, t) in q.iter().enumerate() {
-        // libjpeg emits 16-bit entries (Pq=1) as soon as one table value
-        // exceeds 255; that cannot happen on the baseline path, where the
-        // tables are clamped to 255 like force_baseline = TRUE.
-        let wide = t.iter().any(|&value| value > 255);
-        p.push((u8::from(wide) << 4) | id as u8);
-        for &index in &ZIGZAG {
-            let value = t[index];
-            if wide {
-                p.extend(value.to_be_bytes());
-            } else {
-                p.push(value as u8);
-            }
+/// One DQT segment carrying a single table, the way `emit_dqt` writes it.
+fn dqt_payload(id: u8, t: &[u16; 64]) -> Vec<u8> {
+    // libjpeg emits 16-bit entries (Pq=1) as soon as one table value exceeds
+    // 255.
+    let wide = t.iter().any(|&value| value > 255);
+    let mut p = Vec::with_capacity(if wide { 130 } else { 65 });
+    p.push((u8::from(wide) << 4) | id);
+    for &index in &ZIGZAG {
+        let value = t[index];
+        if wide {
+            p.extend(value.to_be_bytes());
+        } else {
+            p.push(value as u8);
         }
     }
-    Ok(p)
-}
-fn dht_payload(tables: &Tables) -> Vec<u8> {
-    let mut p = Vec::new();
-    for (identifier, spec) in [
-        (0x00u8, &tables.dc[0]),
-        (0x10u8, &tables.ac[0]),
-        (0x01u8, &tables.dc[1]),
-        (0x11u8, &tables.ac[1]),
-    ] {
-        p.push(identifier);
-        p.extend(&spec.counts);
-        p.extend(&spec.values);
-    }
     p
+}
+/// One DHT segment carrying a single table, the way `emit_dht` writes it.
+fn dht_payload(id: u8, is_ac: bool, spec: &Spec) -> Vec<u8> {
+    let mut p = Vec::with_capacity(1 + spec.counts.len() + spec.values.len());
+    p.push(if is_ac { 0x10 | id } else { id });
+    p.extend(&spec.counts);
+    p.extend(&spec.values);
+    p
+}
+/// Multi-scan test helpers encode synthetic frames without colour metadata, so
+/// they use the table layout libjpeg assigns to YCbCr.
+#[cfg(test)]
+fn test_colorspace(components: u8) -> JpegColorSpace {
+    if components == 1 {
+        JpegColorSpace::Grayscale
+    } else {
+        JpegColorSpace::Ycbcr
+    }
 }
 fn parse_sof(p: &[u8], marker: Marker, baseline: bool) -> Result<FrameHeader, String> {
     if p.len() < 6 {
@@ -1578,6 +1716,103 @@ mod tests {
         precisions
     }
 
+    /// Number of `0xFF`-prefixed segments with the given marker code.
+    fn segment_offsets(stream: &[u8], marker: u8) -> Vec<usize> {
+        stream
+            .windows(2)
+            .enumerate()
+            .filter(|(_, window)| window[0] == 0xff && window[1] == marker)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn sequential_palette_writes_no_app_single_dqt_and_component_id_zero() {
+        let samples = (0..16 * 8).map(|value| (value % 256) as u16).collect();
+        let frame = SequentialFrame::new(16, 8, 8, 1, samples).unwrap();
+        let encoded = frame
+            .encode_with_colorspace(90, true, false, 0, None, JpegColorSpace::Unknown)
+            .unwrap();
+        // JCS_UNKNOWN: no APP marker, one DQT for the only referenced table.
+        assert_eq!(&encoded[..2], &[0xff, 0xd8]);
+        assert_eq!(&encoded[2..4], &[0xff, 0xdb]);
+        let (start, total) = dqt_segment(&encoded);
+        assert_eq!(total, 2 + 2 + 65);
+        // 8-bit extended data still uses SOF0, and JCS_UNKNOWN numbers the
+        // component from zero.
+        let sof = start + total;
+        assert_eq!(&encoded[sof..sof + 2], &[0xff, 0xc0]);
+        assert_eq!(encoded[sof + 4 + 6], 0, "SOF component id");
+        let sos = segment_offsets(&encoded, 0xda)[0];
+        assert_eq!(encoded[sos + 4 + 1], 0, "SOS component id");
+        // DC and AC tables are separate DHT segments, as libjpeg writes them.
+        assert_eq!(segment_offsets(&encoded, 0xc4).len(), 2);
+    }
+
+    #[test]
+    fn sequential_rgb_writes_jfif_two_dqts_and_ycbcr_ids() {
+        let samples = (0..16 * 8 * 3).map(|value| (value % 256) as u16).collect();
+        let frame = SequentialFrame::new(16, 8, 8, 3, samples).unwrap();
+        let encoded = frame
+            .encode_with_colorspace(90, true, false, 0, None, JpegColorSpace::Ycbcr)
+            .unwrap();
+        assert_eq!(
+            &encoded[..6],
+            &[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10],
+            "JFIF APP0 follows SOI"
+        );
+        // One DQT segment per referenced quantization table.
+        let (first, first_total) = dqt_segment(&encoded);
+        assert_eq!(first, 20);
+        let second = first + first_total;
+        assert_eq!(&encoded[second..second + 2], &[0xff, 0xdb]);
+        let second_length = usize::from(u16::from_be_bytes([
+            encoded[second + 2],
+            encoded[second + 3],
+        ]));
+        assert_eq!(2 + second_length, 2 + 2 + 65);
+        // SOF0 (8-bit data) with component IDs 1/2/3, 1x1 sampling, tables 0/1/1.
+        let sof = second + 2 + second_length;
+        assert_eq!(&encoded[sof..sof + 2], &[0xff, 0xc0]);
+        let components = &encoded[sof + 4 + 6..sof + 4 + 15];
+        assert_eq!(components, &[1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1]);
+        // Separate DHTs in jcmarker.c order: DC0, AC0, DC1, AC1.
+        let dhts: Vec<u8> = segment_offsets(&encoded, 0xc4)
+            .into_iter()
+            .map(|offset| encoded[offset + 4])
+            .collect();
+        assert_eq!(dhts, [0x00, 0x10, 0x01, 0x11]);
+        let sos = segment_offsets(&encoded, 0xda)[0];
+        assert_eq!(&encoded[sos + 4..sos + 10], &[3, 1, 0x00, 2, 0x11, 3]);
+    }
+
+    #[test]
+    fn ac_runs_only_emit_zrl_before_a_nonzero_coefficient() {
+        // Trailing zeros are one EOB, never a run of ZRL codes.
+        let mut quant = [0i32; 64];
+        quant[0] = 5;
+        let mut symbols = Vec::new();
+        for_each_ac(&quant, |symbol, _, _| {
+            symbols.push(symbol);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(symbols, [0x00]);
+
+        // A full run of sixteen zeros before a coefficient is one 0xF0, then
+        // the coefficient's symbol, then the EOB for the trailing zeros.
+        let mut quant = [0i32; 64];
+        quant[0] = 5;
+        quant[ZIGZAG[17]] = 1;
+        let mut symbols = Vec::new();
+        for_each_ac(&quant, |symbol, _, _| {
+            symbols.push(symbol);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(symbols, [0xf0, 0x01, 0x00]);
+    }
+
     #[test]
     fn twelve_bit_quality_ten_emits_sixteen_bit_quantization_tables() {
         let samples = (0..8 * 8).map(|v| ((v * 53) % 4096) as u16).collect();
@@ -1588,7 +1823,7 @@ mod tests {
         let (start, total) = dqt_segment(&encoded);
         assert_eq!(
             dqt_precisions(&encoded[start + 4..start + total]),
-            [1, 1],
+            [1],
             "a 12-bit table above 255 uses Pq=1, like libjpeg with force_baseline=FALSE"
         );
         let decoded = SequentialFrame::decode(&encoded).unwrap();
@@ -1610,9 +1845,10 @@ mod tests {
             .encode_with_smoothing(90, true, false, 0, None)
             .unwrap();
         let (start, total) = dqt_segment(&encoded);
-        assert_eq!(dqt_precisions(&encoded[start + 4..start + total]), [0, 0]);
-        // Two tables, one byte per entry: the default path is byte-identical.
-        assert_eq!(total, 2 + 2 + 130);
+        assert_eq!(dqt_precisions(&encoded[start + 4..start + total]), [0]);
+        // A one-component frame references only table 0, so libjpeg emits one
+        // DQT segment with one byte per entry.
+        assert_eq!(total, 2 + 2 + 65);
     }
 
     #[test]
@@ -1659,16 +1895,21 @@ mod tests {
         let mut encoded = frame
             .encode_with_smoothing(90, false, false, 0, None)
             .unwrap();
-        let dqt = encoded
+        // libjpeg writes one DQT segment per referenced table, so the chroma
+        // table is the second `ff db` segment.
+        let first = encoded
             .windows(2)
             .position(|window| window == [0xff, 0xdb])
             .unwrap();
-        let length = usize::from(u16::from_be_bytes([encoded[dqt + 2], encoded[dqt + 3]]));
-        let payload_start = dqt + 4;
-        let keep = 1 + 64;
-        encoded.drain(payload_start + keep..payload_start + length - 2);
-        let shortened = (2 + keep) as u16;
-        encoded[dqt + 2..dqt + 4].copy_from_slice(&shortened.to_be_bytes());
+        let first_total =
+            2 + usize::from(u16::from_be_bytes([encoded[first + 2], encoded[first + 3]]));
+        let second = first + first_total;
+        assert_eq!(&encoded[second..second + 2], &[0xff, 0xdb]);
+        let second_total = 2 + usize::from(u16::from_be_bytes([
+            encoded[second + 2],
+            encoded[second + 3],
+        ]));
+        encoded.drain(second..second + second_total);
         let error = SequentialFrame::decode(&encoded).unwrap_err();
         assert!(error.contains("quantization table 1"), "{error}");
     }

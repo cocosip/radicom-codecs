@@ -199,6 +199,17 @@ fn high_subband(
     }
 }
 
+/// One Tier-1 coding pass of an encoded code block: the cumulative byte offset
+/// where the pass ends (OpenJPEG's `pass->rate`) and the cumulative weighted
+/// distortion (`pass->distortiondec`). Both are needed by the quality-layer
+/// rate allocator.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CodeBlockPass {
+    pub(crate) rate: u32,
+    pub(crate) distortiondec: f64,
+    pub(crate) term: bool,
+}
+
 /// One code block inside a precinct band.
 #[derive(Debug, Clone)]
 pub(crate) struct CodeBlock {
@@ -216,6 +227,10 @@ pub(crate) struct CodeBlock {
     pub(crate) zero_bitplanes: u8,
     pub(crate) data: Vec<u8>,
     pub(crate) segments: Vec<CodeBlockSegment>,
+    /// Per-pass Tier-1 metadata; empty for the HTJ2K encoder.
+    pub(crate) passes: Vec<CodeBlockPass>,
+    /// Number of passes assigned to each quality layer (classic encoder).
+    pub(crate) layer_passes: Vec<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -505,6 +520,8 @@ impl Component {
                                     zero_bitplanes: 0,
                                     data: Vec::new(),
                                     segments: Vec::new(),
+                                    passes: Vec::new(),
+                                    layer_passes: Vec::new(),
                                 });
                                 global_index += 1;
                             }

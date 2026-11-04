@@ -189,24 +189,28 @@ encoder never emits it.
 
 ### 5.4 Encoder packetization
 
-The encoder uses the same deterministic packetization as the existing
-PureCodecs implementation, with one deliberate exception: a one- or two-byte
-run at the end of a segment is emitted as a literal (item 6) instead of a
-repeat. Both forms are valid PackBits and decode identically, but the bytes
-differ from fo-dicom's `Flush` for a two-byte tail. Reference packetization
-tests remain useful for every other input:
+The encoder uses the same deterministic packetization as
+`fo-dicom.Codecs`/PureCodecs, including its `Flush` behavior at the end of a
+segment: a run that is still open when the segment ends is a repeat run even
+when it is only two bytes. That keeps the encoded bytes identical to the
+reference, including for images whose last sample run is a pair:
 
 1. Delay a repeat run until the next byte is known.
-2. Runs of one or two equal bytes remain in the literal buffer.
+2. A run of one or two equal bytes followed by a different byte remains in the
+   literal buffer.
 3. A run of three or more equal bytes flushes pending literals, then emits repeat
    packets of at most 128 bytes.
 4. Literal packets are emitted in chunks of at most 128 bytes.
 5. A literal buffer may temporarily hold at most 132 bytes while a run boundary
    is being decided; it must never grow without a bound.
-6. A source ending in one or two equal bytes is emitted as a literal run.
+6. At segment end, pending literals are emitted first, then an open run of one
+   or more bytes is emitted: a one-byte run as a literal, a two-byte run as
+   `0xFF xx` (`Flush`'s repeat form), and longer runs as repeat packets. The
+   frame then pads the segment to an even length with `0x00`.
 
 The compressed bytes do not define correctness by themselves, but deterministic
-packetization is required for the reference packetization regression test.
+packetization is required for the reference packetization regression test and
+for byte-identical output.
 
 ## 6. Pixel-plane mapping
 

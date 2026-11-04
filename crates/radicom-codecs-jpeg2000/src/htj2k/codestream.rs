@@ -6,18 +6,19 @@
 
 use crate::geometry::{CodeBlock, Component, PrecinctBand};
 use crate::marker::{
-    cap_ccap, write_cap, write_eoc, write_soc, write_sod, write_tlm, Cod, CodingStyle, MainHeader,
-    QStep, Quantization, Siz, SizComp, Sot, EOC, SOD, SOT,
+    write_cap, write_eoc, write_soc, write_sod, Cod, CodingStyle, MainHeader, QStep, Quantization,
+    Siz, SizComp, Sot, COM, EOC, SOD, SOT, TLM,
 };
-use crate::quantization::{bit_plane_depth, reversible_steps, subband_index};
+use crate::quantization::{bit_plane_depth, subband_index};
 use crate::wavelet;
 
 use super::cleanup::{decode_cleanup, encode_cleanup};
 use super::packet::{decode_ht_packet, encode_ht_packet};
 use super::quant::{
-    create_openjph_steps, create_quality_steps, decode_delta, from_sign_magnitude, kmax,
-    to_sign_magnitude,
+    cap_ccap, create_openjph_steps, create_quality_steps, decode_delta, from_sign_magnitude,
+    irrev_delta_inv_f32, kmax, openjph_reversible_exponents, to_sign_magnitude_f32,
 };
+use super::wavelet as ht_wavelet;
 
 const CODE_BLOCK: i32 = 64;
 const GUARD_BITS: u8 = 1;
@@ -69,7 +70,6 @@ pub(crate) fn encode(
     if reversible && mct != 0 {
         forward_rct(components);
     }
-    let scale = 2f64.powi(i32::from(precision));
     for component in components.iter_mut() {
         if component.levels != levels {
             return Err("components disagree on the decomposition level count".into());
@@ -86,50 +86,51 @@ pub(crate) fn encode(
             )?;
         }
     }
+    let mut irreversible_planes: Vec<Vec<f32>> = Vec::new();
     if !reversible {
-        let mut planes: Vec<Vec<f64>> = components
+        // OpenJPH normalises the integer samples to [0.5, 0.5) with a single
+        // float multiply (`mul = (float)(1.0 / (double)(1 << bit_depth))`) and
+        // then runs the whole irreversible path in single precision.
+        let mul = (1.0f64 / (1u64 << precision) as f64) as f32;
+        let mut planes: Vec<Vec<f32>> = components
             .iter()
             .map(|component| {
                 component
                     .coefficients
                     .iter()
-                    .map(|&value| f64::from(value) / scale)
+                    .map(|&value| value as f32 * mul)
                     .collect()
             })
             .collect();
         if mct != 0 {
-            forward_ict_planes(&mut planes);
+            forward_ict_f32(&mut planes);
         }
-        for (component, mut plane) in components.iter_mut().zip(planes) {
-            wavelet::forward_97(
-                &mut plane,
+        for (component, plane) in components.iter().zip(planes.iter_mut()) {
+            ht_wavelet::forward_97(
+                plane,
                 component.width as usize,
                 component.height as usize,
                 levels as u8,
-            )?;
-            component.irreversible = Some(plane);
+            );
         }
+        irreversible_planes = planes;
     }
 
-    let (steps, encoded_steps, quant_style) = if reversible {
-        // OpenJPH's default lossless table (and the CAP `Ccap` magnitude bound)
-        // reserves two extra bit-planes on top of the component precision: one
-        // for the reversible colour transform's U/V and one for 5/3 gain.
-        // Without the headroom the cleanup pass drops the high bits of any
-        // coefficient that exceeds the nominal range.
-        let step_bytes = reversible_steps(precision.saturating_add(2), levels as u8);
-        let steps: Vec<QStep> = step_bytes
+    let (steps, encoded_steps, quant_style, guard_bits) = if reversible {
+        // OpenJPH's reversible table: the exponent follows the component
+        // precision (plus one bit for the reversible colour transform) and the
+        // 5/3 bibo gains; the guard bits follow from the magnitude bound.
+        let (exponents, guard_bits) =
+            openjph_reversible_exponents(levels as u8, precision, mct != 0);
+        let encoded: Vec<u16> = exponents.iter().map(|&e| u16::from(e) << 11).collect();
+        let steps: Vec<QStep> = exponents
             .iter()
-            .map(|&byte| QStep {
-                exponent: byte >> 3,
-                mantissa: u16::from(byte & 0x07),
+            .map(|&exponent| QStep {
+                exponent,
+                mantissa: 0,
             })
             .collect();
-        let encoded = steps
-            .iter()
-            .map(|step| (u16::from(step.exponent) << 11) | (step.mantissa & 0x07FF))
-            .collect();
-        (steps, encoded, 0u8)
+        (steps, encoded, 0u8, guard_bits)
     } else {
         let encoded = if options.quality == 0 {
             create_openjph_steps(levels as u8, precision, -1.0)
@@ -143,12 +144,15 @@ pub(crate) fn encode(
                 mantissa: value & 0x07FF,
             })
             .collect();
-        (steps, encoded, 2u8)
+        (steps, encoded, 2u8, GUARD_BITS)
     };
 
-    let mut tile_data = Vec::new();
+    // OpenJPH's `set_tilepart_divisions(resolutions = true)` starts a new tile
+    // part at every resolution, so the tile data is collected per resolution.
+    let mut resolution_data: Vec<Vec<u8>> = Vec::with_capacity(levels as usize + 1);
     for resolution in 0..=levels {
-        for component in components.iter_mut() {
+        let mut tile_data = Vec::new();
+        for (component_index, component) in components.iter_mut().enumerate() {
             let precincts = component.precincts_including_empty(resolution);
             for precinct in precincts {
                 let plane_width = component.width as usize;
@@ -160,7 +164,7 @@ pub(crate) fn encode(
                     for band in bands.iter_mut() {
                         let index = subband_index(resolution, band.orientation).max(0) as usize;
                         let encoded = encoded_steps.get(index).copied().unwrap_or(0);
-                        let subband_bits = bit_plane_depth(encoded, GUARD_BITS);
+                        let subband_bits = bit_plane_depth(encoded, guard_bits);
                         let k_max = subband_bits.max(1);
                         let missing = (k_max - 1).max(0) as u32;
                         let shift = (31 - k_max).clamp(0, 30) as u32;
@@ -173,9 +177,8 @@ pub(crate) fn encode(
                     tile_data.extend_from_slice(&packet);
                     component.coefficients = plane;
                 } else {
-                    let plane = component
-                        .irreversible
-                        .take()
+                    let plane = irreversible_planes
+                        .get(component_index)
                         .ok_or_else(|| "missing irreversible plane".to_string())?;
                     let bands = component
                         .bands_mut(resolution, precinct)
@@ -183,20 +186,26 @@ pub(crate) fn encode(
                     for band in bands.iter_mut() {
                         let index = subband_index(resolution, band.orientation).max(0) as usize;
                         let encoded = encoded_steps.get(index).copied().unwrap_or(0);
-                        let k_max = kmax(encoded, GUARD_BITS).max(1);
-                        let delta = decode_delta(encoded, band.orientation, k_max);
+                        let k_max = kmax(encoded, guard_bits).max(1);
+                        let delta_inv = irrev_delta_inv_f32(encoded, band.orientation, k_max);
                         let missing = (k_max - 1).max(0) as u32;
                         for block in band.code_blocks.iter_mut() {
-                            encode_block_irreversible(block, &plane, plane_width, missing, delta)?;
+                            encode_block_irreversible(
+                                block,
+                                plane,
+                                plane_width,
+                                missing,
+                                delta_inv,
+                            )?;
                         }
                     }
                     let refs: Vec<&PrecinctBand> = bands.iter().collect();
                     let packet = encode_ht_packet(&refs);
                     tile_data.extend_from_slice(&packet);
-                    component.irreversible = Some(plane);
                 }
             }
         }
+        resolution_data.push(tile_data);
     }
     let width = components[0].width;
     let height = components[0].height;
@@ -234,11 +243,16 @@ pub(crate) fn encode(
         },
     };
     let quant = Quantization {
-        guard_bits: GUARD_BITS,
+        guard_bits,
         style: quant_style,
         steps,
     };
-    let cap = cap_ccap(precision, reversible);
+    let cap = cap_ccap(&encoded_steps, levels as u8, reversible, guard_bits);
+    let tile_parts = resolution_data.len();
+    let tile_part_lengths: Vec<u32> = resolution_data
+        .iter()
+        .map(|data| (14 + data.len()) as u32)
+        .collect();
 
     let mut output = Vec::new();
     write_soc(&mut output);
@@ -246,29 +260,52 @@ pub(crate) fn encode(
     write_cap(&mut output, cap);
     cod.write(&mut output);
     quant.write(&mut output);
-    let tile_part_length = (14 + tile_data.len()) as u32;
+    write_com(&mut output, "OpenJPH Ver 0.21.2.");
     if options.insert_tlm {
-        write_tlm(&mut output, tile_part_length);
+        write_tile_part_lengths(&mut output, &tile_part_lengths);
     }
-    let sot = Sot {
-        tile: 0,
-        length: tile_part_length,
-        part: 0,
-        parts: 1,
-    };
-    sot.write(&mut output);
-    write_sod(&mut output);
-    output.extend_from_slice(&tile_data);
+    for (index, (data, &length)) in resolution_data.iter().zip(&tile_part_lengths).enumerate() {
+        let sot = Sot {
+            tile: 0,
+            length,
+            part: index as u8,
+            parts: tile_parts as u8,
+        };
+        sot.write(&mut output);
+        write_sod(&mut output);
+        output.extend_from_slice(data);
+    }
     write_eoc(&mut output);
     Ok(output)
 }
 
+/// Writes the OpenJPH COM marker that names the reference encoder version.
+fn write_com(out: &mut Vec<u8>, text: &str) {
+    out.extend_from_slice(&COM.to_be_bytes());
+    out.extend_from_slice(&((text.len() + 4) as u16).to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // Rcom: general use (Latin)
+    out.extend_from_slice(text.as_bytes());
+}
+
+/// Writes OpenJPH's TLM segment: one entry per tile part, each with a 2-byte
+/// tile index and a 4-byte tile-part length (`Ztlm = 0`, `Stlm = 0x60`).
+fn write_tile_part_lengths(out: &mut Vec<u8>, lengths: &[u32]) {
+    out.extend_from_slice(&TLM.to_be_bytes());
+    out.extend_from_slice(&((4 + 6 * lengths.len()) as u16).to_be_bytes());
+    out.push(0x00);
+    out.push(0x60);
+    for &length in lengths {
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&length.to_be_bytes());
+    }
+}
+
 fn encode_block_irreversible(
     block: &mut CodeBlock,
-    plane: &[f64],
+    plane: &[f32],
     plane_width: usize,
     missing: u32,
-    delta: f64,
+    delta_inv: f32,
 ) -> Result<(), String> {
     let width = block.width.max(0) as usize;
     let height = block.height.max(0) as usize;
@@ -293,7 +330,10 @@ fn encode_block_irreversible(
     if !any {
         return Ok(());
     }
-    let coefficients = to_sign_magnitude(&values, delta);
+    let coefficients = to_sign_magnitude_f32(&values, delta_inv);
+    if irreversible_block_is_empty(&coefficients, missing) {
+        return Ok(());
+    }
     let data = encode_cleanup(&coefficients, width, height, missing)?;
     block.total_passes = 1;
     block.zero_bitplanes = missing.min(255) as u8;
@@ -303,6 +343,16 @@ fn encode_block_irreversible(
         pass_count: 1,
     }];
     Ok(())
+}
+/// OpenJPH's zero-block test is `max_val < 1 << (31 - K_max)`, where `max_val`
+/// is the OR of the magnitudes: any coefficient below the first coded bit-plane
+/// is effectively zero, so such blocks are omitted from the packet instead of
+/// being emitted as an all-zero cleanup segment.
+fn irreversible_block_is_empty(coefficients: &[i32], missing: u32) -> bool {
+    let zero_limit = 1u32.checked_shl(30 - missing).unwrap_or(u32::MAX);
+    coefficients
+        .iter()
+        .all(|&value| ((value & 0x7FFF_FFFF) as u32) < zero_limit)
 }
 fn encode_block(
     block: &mut CodeBlock,
@@ -697,7 +747,14 @@ fn find_next_tile_marker(data: &[u8], start: usize) -> Result<usize, String> {
     Err("unterminated tile-part".into())
 }
 
-fn forward_ict_planes(planes: &mut [Vec<f64>]) {
+/// OpenJPH's irreversible colour transform, in single precision with the same
+/// constants and evaluation order as `gen_ict_forward`.
+fn forward_ict_f32(planes: &mut [Vec<f32>]) {
+    const ALPHA_RF: f32 = 0.299;
+    const ALPHA_GF: f32 = 0.587;
+    const ALPHA_BF: f32 = 0.114;
+    let beta_cb = (0.5f64 / (1.0f64 - f64::from(ALPHA_BF))) as f32;
+    let beta_cr = (0.5f64 / (1.0f64 - f64::from(ALPHA_RF))) as f32;
     let (red, rest) = planes.split_at_mut(1);
     let (green, blue) = rest.split_at_mut(1);
     for ((r, g), b) in red[0]
@@ -705,9 +762,9 @@ fn forward_ict_planes(planes: &mut [Vec<f64>]) {
         .zip(green[0].iter_mut())
         .zip(blue[0].iter_mut())
     {
-        let y = 0.299 * *r + 0.587 * *g + 0.114 * *b;
-        *g = (0.5 / (1.0 - 0.114)) * (*b - y);
-        *b = (0.5 / (1.0 - 0.299)) * (*r - y);
+        let y = ALPHA_RF * *r + ALPHA_GF * *g + ALPHA_BF * *b;
+        *g = beta_cb * (*b - y);
+        *b = beta_cr * (*r - y);
         *r = y;
     }
 }
@@ -867,7 +924,20 @@ mod tests {
     }
 
     #[test]
-    fn tlm_marker_lists_the_tile_part_length() {
+    fn irreversible_blocks_below_the_coding_bit_plane_are_skipped() {
+        // missing_msbs = K_max - 1 = 16 puts the first coded bit-plane at 14.
+        let missing = 16;
+        assert!(irreversible_block_is_empty(&[0, (1 << 14) - 1], missing));
+        assert!(!irreversible_block_is_empty(&[0, 1 << 14], missing));
+        // The sign bit must not count towards the magnitude.
+        assert!(irreversible_block_is_empty(
+            &[0x8000_0000u32 as i32 | ((1 << 14) - 1)],
+            missing
+        ));
+    }
+
+    #[test]
+    fn tlm_marker_lists_one_tile_part_per_resolution() {
         let mut components = build_components(&[vec![7i32; 64]], 8, 8, 8, false, 1).unwrap();
         let opts = EncodeOptions {
             insert_tlm: true,
@@ -878,19 +948,24 @@ mod tests {
             .windows(2)
             .position(|pair| pair == [0xFF, 0x55])
             .expect("TLM marker");
+        let entries = 2; // levels + 1
         assert_eq!(
             &encoded[position + 2..position + 6],
-            &[0x00, 0x08, 0x01, 0x40]
+            &[0x00, (4 + 6 * entries) as u8, 0x00, 0x60]
         );
+        for part in 0..entries {
+            let entry = position + 6 + 6 * part;
+            assert_eq!(&encoded[entry..entry + 2], &[0x00, 0x00]);
+        }
         let sot = encoded
             .windows(2)
             .position(|pair| pair == [0xFF, 0x90])
             .expect("SOT marker");
         let target = u32::from_be_bytes([
-            encoded[position + 6],
-            encoded[position + 7],
             encoded[position + 8],
             encoded[position + 9],
+            encoded[position + 10],
+            encoded[position + 11],
         ]);
         let length = u32::from_be_bytes([
             encoded[sot + 6],
@@ -899,6 +974,7 @@ mod tests {
             encoded[sot + 9],
         ]);
         assert_eq!(target, length);
+        assert_eq!(encoded[sot + 11], entries as u8);
         assert_eq!(decode(&encoded, None).unwrap()[0].samples, vec![7i32; 64]);
     }
 
@@ -966,19 +1042,21 @@ mod tests {
 
     #[test]
     fn cap_ccap_follows_precision_and_transform() {
-        let mut eight = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
+        // Ccap is the OpenJPH magnitude bound, so it needs the full default
+        // decomposition count to reach the reference bucket.
+        let mut eight = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 5).unwrap();
         let opts = options(&eight, true);
         let encoded = encode(&mut eight, &opts).unwrap();
         assert_eq!(cap_ccap_of(&encoded), 0x0002);
 
         let sixteen_bit: Vec<i32> = (0..16).map(|i| i * 1000 - 8000).collect();
         let mut sixteen =
-            build_components(std::slice::from_ref(&sixteen_bit), 4, 4, 16, false, 0).unwrap();
+            build_components(std::slice::from_ref(&sixteen_bit), 4, 4, 16, false, 5).unwrap();
         let opts = options(&sixteen, true);
         let encoded = encode(&mut sixteen, &opts).unwrap();
         assert_eq!(cap_ccap_of(&encoded), 0x000A);
 
-        let mut lossy = build_components(&[sixteen_bit], 4, 4, 16, false, 0).unwrap();
+        let mut lossy = build_components(&[sixteen_bit], 4, 4, 16, false, 5).unwrap();
         let opts = options(&lossy, false);
         let encoded = encode(&mut lossy, &opts).unwrap();
         assert_eq!(cap_ccap_of(&encoded), 0x002A);
@@ -1068,7 +1146,7 @@ mod tests {
         let mut encoded = encode(&mut components, &opts).unwrap();
         let sot = encoded
             .windows(2)
-            .position(|pair| pair == [0xFF, 0x90])
+            .rposition(|pair| pair == [0xFF, 0x90])
             .expect("SOT marker");
         let psot = u32::from_be_bytes([
             encoded[sot + 6],

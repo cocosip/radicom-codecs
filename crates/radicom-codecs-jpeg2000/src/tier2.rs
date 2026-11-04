@@ -371,109 +371,224 @@ fn decode_pass_count(reader: &mut BitReader<'_>) -> Result<u32, String> {
     Ok(37 + reader.read_bits(7)?)
 }
 
-fn required_length_bits(length: u32, pass_count: u32) -> u32 {
-    let bits = if length == 0 {
-        0
-    } else {
-        32 - length.leading_zeros()
-    };
-    bits.saturating_sub(floor_log2(pass_count)).max(3)
+/// How [`encode_packets`] runs: write the tile data, or only measure how many
+/// bytes the packets for the requested layers would occupy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PacketMode {
+    Final,
+    Measure { max_len: usize },
 }
 
-/// Encodes one quality layer of packets for all components (LRCP by default).
-pub(crate) fn encode_packets(
-    components: &mut [Component],
-    layer_count: u16,
-    progression: u8,
-) -> Result<Vec<u8>, String> {
-    if layer_count != 1 {
-        return Err("the encoder currently emits a single quality layer".into());
-    }
-    let order = packet_order(components, layer_count, progression)?;
-    let mut output = Vec::new();
-    for key in order {
-        let component = &mut components[key.component];
-        if !component.has_precinct(key.resolution, key.precinct) {
-            continue;
-        }
-        let bands = component.bands(key.resolution, key.precinct).to_vec();
-        let contributes = bands
-            .iter()
-            .any(|band| band.code_blocks.iter().any(|block| block.total_passes > 0));
-        let mut header = BitWriter::new_stuffed();
-        header.write_bit(contributes);
-        if !contributes {
-            let bytes = header.into_bytes();
-            output.extend_from_slice(&bytes);
-            continue;
-        }
-        let mut body = Vec::new();
-        let mut trees: Vec<(TagTree, TagTree)> = bands
+/// OpenJPEG's `opj_tcd_makelayer` state for one code block while packets are
+/// being emitted: passes already placed in earlier layers and the current
+/// length-indicator width.
+#[derive(Debug, Clone)]
+struct BlockEncState {
+    numpasses: u32,
+    numlenbits: u32,
+}
+
+#[derive(Debug, Clone)]
+struct BandEncState {
+    inclusion: TagTree,
+    zero_bitplanes: TagTree,
+    blocks: Vec<BlockEncState>,
+}
+
+#[derive(Debug, Clone)]
+struct PrecinctEncState {
+    bands: Vec<BandEncState>,
+}
+
+fn new_precinct_enc_state(
+    component: &Component,
+    resolution: i32,
+    precinct: i32,
+) -> PrecinctEncState {
+    let bands = component.bands(resolution, precinct);
+    PrecinctEncState {
+        bands: bands
             .iter()
             .map(|band| {
-                (
-                    TagTree::new(
-                        band.code_block_count_x.max(1) as usize,
-                        band.code_block_count_y.max(1) as usize,
-                    ),
-                    TagTree::new(
-                        band.code_block_count_x.max(1) as usize,
-                        band.code_block_count_y.max(1) as usize,
-                    ),
-                )
-            })
-            .collect();
-        for (band_index, band) in bands.iter().enumerate() {
-            let (inclusion, zero_bitplanes) = &mut trees[band_index];
-            for block in &band.code_blocks {
-                if block.total_passes > 0 {
-                    inclusion.set_value(
-                        block.local_x as usize,
-                        block.local_y as usize,
-                        i32::from(key.layer),
-                    );
+                let mut zero_bitplanes = TagTree::new(
+                    band.code_block_count_x.max(1) as usize,
+                    band.code_block_count_y.max(1) as usize,
+                );
+                // OpenJPEG seeds the zero-bit-plane tag tree for every block
+                // when the layer-0 packet resets it.
+                for block in &band.code_blocks {
                     zero_bitplanes.set_value(
                         block.local_x as usize,
                         block.local_y as usize,
                         i32::from(block.zero_bitplanes),
                     );
                 }
+                BandEncState {
+                    inclusion: TagTree::new(
+                        band.code_block_count_x.max(1) as usize,
+                        band.code_block_count_y.max(1) as usize,
+                    ),
+                    zero_bitplanes,
+                    blocks: band
+                        .code_blocks
+                        .iter()
+                        .map(|_| BlockEncState {
+                            numpasses: 0,
+                            numlenbits: 0,
+                        })
+                        .collect(),
+                }
+            })
+            .collect(),
+    }
+}
+
+fn layer_pass_count(block: &crate::geometry::CodeBlock, layer: u16) -> u32 {
+    block.layer_passes.get(layer as usize).copied().unwrap_or(0) as u32
+}
+
+fn pass_offset(block: &crate::geometry::CodeBlock, pass: usize) -> u32 {
+    if pass == 0 {
+        0
+    } else {
+        block.passes[pass - 1].rate
+    }
+}
+
+fn write_commacode(writer: &mut BitWriter, mut n: u32) {
+    while n > 0 {
+        writer.write_bit(true);
+        n -= 1;
+    }
+    writer.write_bit(false);
+}
+
+/// Encodes the quality-layer packets for one tile (LRCP by default).
+///
+/// `block.layer_passes[layer]` holds the number of Tier-1 passes assigned to
+/// that layer. `PacketMode::Measure` replicates OpenJPEG's `THRESH_CALC` pass:
+/// the same header bytes are produced, but the packets are discarded as soon as
+/// the running byte count exceeds `max_len`.
+pub(crate) fn encode_packets(
+    components: &[Component],
+    layer_count: u16,
+    progression: u8,
+    mode: PacketMode,
+) -> Result<(Vec<u8>, usize, bool), String> {
+    let order = packet_order(components, layer_count, progression)?;
+    let mut states: Vec<HashMap<(i32, i32), PrecinctEncState>> =
+        (0..components.len()).map(|_| HashMap::new()).collect();
+    let mut output = Vec::new();
+    let mut written = 0usize;
+    for key in order {
+        let component = &components[key.component];
+        if !component.has_precinct(key.resolution, key.precinct) {
+            continue;
+        }
+        let bands_meta = component.bands(key.resolution, key.precinct);
+        let state = states[key.component]
+            .entry((key.resolution, key.precinct))
+            .or_insert_with(|| new_precinct_enc_state(component, key.resolution, key.precinct));
+        // OpenJPEG writes the "empty packet" header bit unconditionally in this
+        // build (ENABLE_EMPTY_PACKET_OPTIMIZATION is not defined), so a packet
+        // always starts with a one bit and always carries its header.
+        let mut header = BitWriter::new_stuffed();
+        header.write_bit(true);
+        let mut body = Vec::new();
+        let mut body_len = 0usize;
+        for (band_index, band) in bands_meta.iter().enumerate() {
+            if band.code_blocks.is_empty() {
+                continue;
             }
-            for block in &band.code_blocks {
-                inclusion.encode(
-                    &mut header,
-                    block.local_x as usize,
-                    block.local_y as usize,
-                    i32::from(key.layer) + 1,
-                );
-                if block.total_passes == 0 {
+            let band_state = &mut state.bands[band_index];
+            let layer = key.layer;
+            for (block_index, block) in band.code_blocks.iter().enumerate() {
+                let passes = layer_pass_count(block, layer);
+                if passes > 0 && band_state.blocks[block_index].numpasses == 0 {
+                    band_state.inclusion.set_value(
+                        block.local_x as usize,
+                        block.local_y as usize,
+                        i32::from(layer),
+                    );
+                }
+            }
+            for (block_index, block) in band.code_blocks.iter().enumerate() {
+                let block_state = &mut band_state.blocks[block_index];
+                let passes = layer_pass_count(block, layer);
+                if block_state.numpasses == 0 {
+                    band_state.inclusion.encode(
+                        &mut header,
+                        block.local_x as usize,
+                        block.local_y as usize,
+                        i32::from(layer) + 1,
+                    );
+                } else {
+                    header.write_bit(passes != 0);
+                }
+                if passes == 0 {
                     continue;
                 }
-                zero_bitplanes.encode(
-                    &mut header,
-                    block.local_x as usize,
-                    block.local_y as usize,
-                    32,
-                );
-                encode_pass_count(&mut header, block.total_passes);
-                let mut num_len_bits = 3u32;
-                let required = required_length_bits(block.data.len() as u32, block.total_passes);
-                while num_len_bits < required {
-                    header.write_bit(true);
-                    num_len_bits += 1;
+                if block_state.numpasses == 0 {
+                    block_state.numlenbits = 3;
+                    band_state.zero_bitplanes.encode(
+                        &mut header,
+                        block.local_x as usize,
+                        block.local_y as usize,
+                        999,
+                    );
                 }
-                header.write_bit(false);
-                header.write_bits(
-                    block.data.len() as u32,
-                    (num_len_bits + floor_log2(block.total_passes)) as u8,
-                );
-                body.extend_from_slice(&block.data);
+                encode_pass_count(&mut header, passes);
+                let start = block_state.numpasses as usize;
+                let end = start + passes as usize;
+                let mut increment = 0i32;
+                let mut len = 0u32;
+                let mut nump = 0u32;
+                for pass in start..end {
+                    nump += 1;
+                    len += block.passes[pass].rate - pass_offset(block, pass);
+                    if block.passes[pass].term || pass + 1 == end {
+                        increment = increment.max(
+                            floor_log2(len) as i32 + 1
+                                - (block_state.numlenbits as i32 + floor_log2(nump) as i32),
+                        );
+                        len = 0;
+                        nump = 0;
+                    }
+                }
+                write_commacode(&mut header, increment as u32);
+                block_state.numlenbits += increment as u32;
+                let mut len = 0u32;
+                let mut nump = 0u32;
+                for pass in start..end {
+                    nump += 1;
+                    len += block.passes[pass].rate - pass_offset(block, pass);
+                    if block.passes[pass].term || pass + 1 == end {
+                        header.write_bits(len, (block_state.numlenbits + floor_log2(nump)) as u8);
+                        len = 0;
+                        nump = 0;
+                    }
+                }
+                block_state.numpasses += passes;
+                let offset = pass_offset(block, start) as usize;
+                let segment_len = (pass_offset(block, end) - offset as u32) as usize;
+                body_len += segment_len;
+                if mode == PacketMode::Final {
+                    body.extend_from_slice(&block.data[offset..offset + segment_len]);
+                }
             }
         }
-        output.extend_from_slice(&header.into_bytes());
-        output.extend_from_slice(&body);
+        let header_bytes = header.into_bytes();
+        written += header_bytes.len() + body_len;
+        if let PacketMode::Measure { max_len } = mode {
+            if written > max_len {
+                return Ok((Vec::new(), written, false));
+            }
+        } else {
+            output.extend_from_slice(&header_bytes);
+            output.extend_from_slice(&body);
+        }
     }
-    Ok(output)
+    Ok((output, written, true))
 }
 
 #[derive(Debug, Clone)]

@@ -9,6 +9,7 @@ use radicom::pixel::codec::{Codec, CodecParams, JpegParams};
 use radicom::pixel::{PixelData, PixelDataRef};
 
 mod bit;
+mod color;
 mod dct;
 mod frame;
 mod huffman;

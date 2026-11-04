@@ -171,6 +171,13 @@ impl MqEncoder {
         }
     }
 
+    /// Bytes emitted so far, matching OpenJPEG's `opj_mqc_numbytes()`. The
+    /// encoder's `bp` points at the last emitted byte, while OpenJPEG starts
+    /// its pointer one before the buffer; both therefore report `bp - start`.
+    pub(crate) fn numbytes(&self) -> u32 {
+        (self.bp as i64 - 1) as u32
+    }
+
     #[allow(dead_code)]
     pub(crate) fn current_length(&self) -> usize {
         self.bp.saturating_sub(1)

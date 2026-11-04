@@ -44,8 +44,9 @@ must independently own its memory, bounds checks, and error handling.
 
 - Encode and decode both DICOM JPEG-LS UIDs through the frozen `Codec` trait.
 - Produce and accept valid T.87 codestreams with SOI, SOF55, SOS, scan data,
-  and EOI, plus the LSE preset segment when non-default coding parameters are
-  selected.
+  and EOI, plus the LSE preset segment that CharLS emits for precisions above
+  12 bits (`include_pc_parameters_jai`), so the encoded bytes match
+  `fo-dicom.Codecs`.
 - Support exact lossless reconstruction and the JPEG-LS near-lossless bound
   `abs(source - decoded) <= NEAR` for every sample.
 - Support the DICOM layouts used by the current pixel facade: 8/16
@@ -286,7 +287,7 @@ Encoder output is one or more JPEG-LS scans per frame:
 SOI       FFD8
 APP8      FFE8  (only with a requested HP color transform: "mrfx" + id)
 SOF55     FFF7  (precision, height, width, component descriptors)
-LSE       FFF8  (only when a non-default preset is selected)
+LSE       FFF8  (precision > 12, matching CharLS's include_pc_parameters_jai)
 DRI       FFDD  (only in accepted streams; interval counted in MCUs)
 SOS       FFDA  (component selectors, NEAR, ILV, point transform)
 scan data (bit-stuffed), split by RST0..RST7 when DRI is present

@@ -1,15 +1,16 @@
 //! JPEG 2000 codestream assembly and parsing (ISO/IEC 15444-1 Annex A).
 
-use crate::geometry::{CodeBlockSegment, Component};
+use crate::geometry::{CodeBlock, CodeBlockSegment, Component};
 use crate::marker::{
     write_eoc, write_soc, write_sod, Cod, CodingStyle, MainHeader, QStep, Quantization, Siz,
-    SizComp, Sot, EOC, SOD, SOT,
+    SizComp, Sot, COM, EOC, SOD, SOT,
 };
 use crate::quantization::{
-    bit_plane_depth, decode_step_size, encode_step_size, gain_bits, irreversible_steps,
-    reversible_steps, subband_index,
+    band_stepsize, bit_plane_depth, decode_step_size, dwt_norm_53, dwt_norm_97, encode_step_size,
+    gain_bits, irreversible_steps, reversible_steps, subband_index, MCT_NORMS_ICT, MCT_NORMS_RCT,
 };
-use crate::{tier1, tier2, wavelet};
+use crate::tier1::{self, PassWeight};
+use crate::{tier2, wavelet};
 
 pub(crate) const DEFAULT_LEVELS: i32 = 5;
 pub(crate) const DEFAULT_CODE_BLOCK: i32 = 64;
@@ -48,27 +49,22 @@ pub(crate) fn encode_with_mct(
     reversible: bool,
     mct: bool,
 ) -> Result<Vec<u8>, String> {
-    encode_with_precincts(components, reversible, None, mct, 1.0)
+    encode_with_precincts(components, reversible, None, mct, &[0.0])
 }
 
-/// Encodes one tile with the irreversible quantization steps scaled by
-/// `quant_scale`, which is how `rate` reaches a smaller codestream.
-pub(crate) fn encode_with_mct_scaled(
-    components: &mut [Component],
-    reversible: bool,
-    mct: bool,
-    quant_scale: f64,
-) -> Result<Vec<u8>, String> {
-    encode_with_precincts(components, reversible, None, mct, quant_scale)
-}
-
-/// Encodes one tile, optionally with explicit precinct exponents per resolution.
+/// Encodes one tile, optionally with explicit precinct exponents per
+/// resolution, using OpenJPEG-compatible quality-layer rate allocation.
+///
+/// `rates` are the per-layer compression ratios OpenJPEG receives in
+/// `tcp_rates`; a final `0.0` means the last layer carries every remaining
+/// coding pass (lossless for the reversible transform). An empty slice is
+/// treated as a single lossless layer.
 pub(crate) fn encode_with_precincts(
     components: &mut [Component],
     reversible: bool,
     precincts: Option<&[(u8, u8)]>,
     mct: bool,
-    quant_scale: f64,
+    rates: &[f64],
 ) -> Result<Vec<u8>, String> {
     if components.is_empty() {
         return Err("no components to encode".into());
@@ -78,29 +74,30 @@ pub(crate) fn encode_with_precincts(
         return Err("invalid decomposition level count".into());
     }
     let precision = components[0].precision;
+    if components
+        .iter()
+        .any(|component| component.levels != levels)
+    {
+        return Err("components disagree on the decomposition level count".into());
+    }
     let mct = mct && components.len() >= 3;
     if mct && reversible {
         forward_rct(components);
     }
-    let mut ict_planes: Option<Vec<Vec<f64>>> = None;
+    let mut irreversible_planes: Option<Vec<Vec<f32>>> = None;
     if mct && !reversible {
-        let mut planes: Vec<Vec<f64>> = components
+        let mut planes: Vec<Vec<f32>> = components
             .iter()
-            .map(|component| {
-                component
-                    .coefficients
-                    .iter()
-                    .map(|&v| f64::from(v))
-                    .collect()
-            })
+            .map(|component| component.coefficients.iter().map(|&v| v as f32).collect())
             .collect();
-        forward_ict_planes(&mut planes);
-        ict_planes = Some(planes);
+        forward_ict_planes_f32(&mut planes);
+        irreversible_planes = Some(planes);
     }
+
+    // Reversible coding keeps integer coefficients (already level shifted and
+    // transformed); irreversible coding carries the OpenJPEG f32 9/7 result.
+    let mut float_planes: Vec<Vec<f32>> = Vec::with_capacity(components.len());
     for (index, component) in components.iter_mut().enumerate() {
-        if component.levels != levels {
-            return Err("components disagree on the decomposition level count".into());
-        }
         component.build_code_blocks(DEFAULT_CODE_BLOCK, DEFAULT_CODE_BLOCK, precincts)?;
         if reversible {
             wavelet::forward_53(
@@ -111,26 +108,23 @@ pub(crate) fn encode_with_precincts(
                 0,
                 0,
             )?;
+            float_planes.push(Vec::new());
         } else {
-            let mut plane: Vec<f64> = match &ict_planes {
+            let mut plane: Vec<f32> = match &irreversible_planes {
                 Some(planes) => planes[index].clone(),
-                None => component
-                    .coefficients
-                    .iter()
-                    .map(|&v| f64::from(v))
-                    .collect(),
+                None => component.coefficients.iter().map(|&v| v as f32).collect(),
             };
-            wavelet::forward_97(
+            forward_97_f32(
                 &mut plane,
                 component.width as usize,
                 component.height as usize,
                 levels as u8,
             )?;
-            component.irreversible = Some(plane);
+            float_planes.push(plane);
         }
     }
 
-    let quant = if reversible {
+    let quantization = if reversible {
         let bytes = reversible_steps(precision, levels as u8);
         Quantization {
             guard_bits: GUARD_BITS,
@@ -144,7 +138,8 @@ pub(crate) fn encode_with_precincts(
                 .collect(),
         }
     } else {
-        let steps = irreversible_steps(levels as u8, quant_scale);
+        // OpenJPEG's default irreversible step sizes: `2^gain / norm`.
+        let steps = irreversible_steps(levels as u8, 1.0);
         Quantization {
             guard_bits: GUARD_BITS,
             style: 2,
@@ -160,29 +155,70 @@ pub(crate) fn encode_with_precincts(
                 .collect(),
         }
     };
-    let encoded_steps: Vec<u16> = quant
+    let encoded_steps: Vec<u16> = quantization
         .steps
         .iter()
         .map(|step| (u16::from(step.exponent) << 11) | (step.mantissa & 0x07FF))
         .collect();
 
-    for component in components.iter_mut() {
+    let layer_rates: Vec<f64> = if rates.is_empty() {
+        vec![0.0]
+    } else {
+        rates.to_vec()
+    };
+    let layer_count =
+        u16::try_from(layer_rates.len()).map_err(|_| "too many quality layers".to_string())?;
+
+    for (component_index, component) in components.iter_mut().enumerate() {
         let plane_width = component.width as usize;
         let reversible_plane = std::mem::take(&mut component.coefficients);
-        let irreversible_plane = component.irreversible.take();
+        let float_plane = std::mem::take(&mut float_planes[component_index]);
+        let mct_norm = if mct {
+            let norms = if reversible {
+                MCT_NORMS_RCT
+            } else {
+                MCT_NORMS_ICT
+            };
+            norms[component_index.min(2)]
+        } else {
+            1.0
+        };
         for resolution in 0..=levels {
-            let precincts = component.precincts_including_empty(resolution);
-            for precinct in precincts {
+            let precinct_list = component.precincts_including_empty(resolution);
+            for precinct in precinct_list {
                 let bands = component
                     .bands_mut(resolution, precinct)
                     .ok_or_else(|| "missing precinct geometry".to_string())?;
                 for band in bands.iter_mut() {
-                    let index = subband_index(resolution, band.orientation);
-                    let encoded = encoded_steps
-                        .get(index.max(0) as usize)
-                        .copied()
-                        .unwrap_or(0);
+                    let index = subband_index(resolution, band.orientation).max(0) as usize;
+                    let encoded = encoded_steps.get(index).copied().unwrap_or(0);
                     let subband_bits = bit_plane_depth(encoded, GUARD_BITS);
+                    let orientation = band.orientation;
+                    let gain = gain_bits(orientation);
+                    let level = levels - resolution;
+                    let log2_gain = match orientation {
+                        0 => 0,
+                        3 => 2,
+                        _ => 1,
+                    };
+                    let band_step = if reversible {
+                        1.0f32
+                    } else {
+                        band_stepsize(encoded, precision, gain)
+                    };
+                    let weight = if reversible {
+                        PassWeight {
+                            w1: mct_norm,
+                            w2: dwt_norm_53(level, orientation),
+                            stepsize: 1.0,
+                        }
+                    } else {
+                        PassWeight {
+                            w1: mct_norm,
+                            w2: dwt_norm_97(level, orientation),
+                            stepsize: f64::from(band_step) / f64::from(1u32 << log2_gain),
+                        }
+                    };
                     for block in band.code_blocks.iter_mut() {
                         let width = block.width.max(0) as usize;
                         let height = block.height.max(0) as usize;
@@ -200,21 +236,15 @@ pub(crate) fn encode_with_precincts(
                                 }
                             }
                         } else {
-                            let plane = irreversible_plane
-                                .as_ref()
-                                .ok_or_else(|| "missing irreversible plane".to_string())?;
-                            // The QCD carries `1/norm`; the subband's 2-D gain
-                            // multiplies it in the inverse transform of OpenJPEG
-                            // and OpenJPH (E-4), so the coefficient domain here
-                            // uses `gain * 1/norm` as well.
-                            let step = decode_step_size(encoded, precision)
-                                * f64::from(1u32 << gain_bits(band.orientation));
                             for y in 0..height {
                                 for x in 0..width {
                                     let sx = block.x0 as usize + x;
                                     let sy = block.y0 as usize + y;
+                                    // OpenJPEG: lrintf((coef / band->stepsize) * 64).
                                     coefficients[y * width + x] =
-                                        (plane[sy * plane_width + sx] / step * 64.0).round() as i32;
+                                        (float_plane[sy * plane_width + sx] / band_step * 64.0f32)
+                                            .round_ties_even()
+                                            as i32;
                                 }
                             }
                         }
@@ -222,12 +252,15 @@ pub(crate) fn encode_with_precincts(
                             &coefficients,
                             width,
                             height,
-                            band.orientation,
+                            orientation,
                             0,
+                            &weight,
                         )?;
                         let bit_count = (encoded_block.max_bit_plane - 5).max(0);
                         block.zero_bitplanes = (subband_bits - bit_count).clamp(0, 31) as u8;
                         block.total_passes = encoded_block.pass_count;
+                        block.layer_passes = vec![0u16; layer_count as usize];
+                        block.passes = encoded_block.passes;
                         block.data = encoded_block.data.clone();
                         block.segments = if encoded_block.pass_count == 0 {
                             Vec::new()
@@ -242,10 +275,9 @@ pub(crate) fn encode_with_precincts(
             }
         }
         component.coefficients = reversible_plane;
-        component.irreversible = irreversible_plane;
+        component.irreversible = None;
     }
 
-    let tile_data = tier2::encode_packets(components, 1, 0)?;
     let width = components[0].width;
     let height = components[0].height;
     let siz = Siz {
@@ -270,7 +302,7 @@ pub(crate) fn encode_with_precincts(
     let cod = Cod {
         scod: if precincts.is_some() { 1 } else { 0 },
         progression: 0,
-        layers: 1,
+        layers: layer_count,
         mct: u8::from(mct),
         style: CodingStyle {
             decompositions: levels as u8,
@@ -285,7 +317,22 @@ pub(crate) fn encode_with_precincts(
     write_soc(&mut output);
     siz.write(&mut output);
     cod.write(&mut output);
-    quant.write(&mut output);
+    quantization.write(&mut output);
+    write_comment(&mut output);
+    let header_len = output.len();
+
+    let targets = rate_byte_targets(
+        &layer_rates,
+        header_len,
+        width,
+        height,
+        components.len(),
+        precision,
+    );
+    allocate_layers(components, &targets)?;
+
+    let (tile_data, _, _) =
+        tier2::encode_packets(components, layer_count, 0, tier2::PacketMode::Final)?;
     let sot = Sot {
         tile: 0,
         length: (14 + tile_data.len()) as u32,
@@ -297,6 +344,389 @@ pub(crate) fn encode_with_precincts(
     output.extend_from_slice(&tile_data);
     write_eoc(&mut output);
     Ok(output)
+}
+
+/// Writes the `Created by OpenJPEG version 2.5.4` comment marker that OpenJPEG
+/// adds by default (Rcom = 1).
+fn write_comment(out: &mut Vec<u8>) {
+    const TEXT: &[u8; 33] = b"Created by OpenJPEG version 2.5.4";
+    out.extend_from_slice(&COM.to_be_bytes());
+    out.extend_from_slice(&(4 + TEXT.len() as u16).to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(TEXT);
+}
+
+/// Converts OpenJPEG's `tcp_rates` for one tile into byte budgets, replicating
+/// `opj_j2k_update_rates()` (single tile, no tile-parts, no cinema profile).
+///
+/// The arithmetic is performed in `f32` exactly like the reference: the
+/// bisection thresholds in the rate allocator are sensitive to the last bit.
+fn rate_byte_targets(
+    rates: &[f64],
+    header_len: usize,
+    width: i32,
+    height: i32,
+    components: usize,
+    precision: u8,
+) -> Vec<f64> {
+    if rates.is_empty() {
+        return Vec::new();
+    }
+    let size_pixel = components as u32 * u32::from(precision);
+    let numerator = f64::from(size_pixel) * f64::from(width) * f64::from(height);
+    let bits_empty = 8.0f32;
+    let sot_remove = header_len as f32;
+    let mut values: Vec<f32> = rates
+        .iter()
+        .map(|&rate| {
+            if rate > 0.0 {
+                let denominator = (rate as f32) * bits_empty;
+                (numerator / f64::from(denominator)) as f32
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let last = values.len() - 1;
+    if values[0] > 0.0 {
+        values[0] -= sot_remove;
+        if values[0] < 30.0 {
+            values[0] = 30.0;
+        }
+    }
+    for index in 1..last {
+        if values[index] > 0.0 {
+            values[index] -= sot_remove;
+            if values[index] < values[index - 1] + 10.0 {
+                values[index] = values[index - 1] + 20.0;
+            }
+        }
+    }
+    // A single layer is only adjusted by the first-layer rule above; OpenJPEG
+    // never reaches the last-layer adjustment for it.
+    if last > 0 && values[last] > 0.0 {
+        values[last] -= sot_remove + 2.0;
+        if values[last] < values[last - 1] + 10.0 {
+            values[last] = values[last - 1] + 20.0;
+        }
+    }
+    values.into_iter().map(f64::from).collect()
+}
+
+fn for_each_code_block_mut(components: &mut [Component], mut f: impl FnMut(&mut CodeBlock)) {
+    for component in components.iter_mut() {
+        for resolution in 0..=component.levels {
+            let precincts = component.precincts_including_empty(resolution);
+            for precinct in precincts {
+                if let Some(bands) = component.bands_mut(resolution, precinct) {
+                    for band in bands.iter_mut() {
+                        for block in band.code_blocks.iter_mut() {
+                            f(block);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn passes_before(block: &CodeBlock, layer: usize) -> u32 {
+    block
+        .layer_passes
+        .iter()
+        .take(layer)
+        .map(|&passes| u32::from(passes))
+        .sum()
+}
+
+/// OpenJPEG's `opj_tcd_makelayer`: assigns pass truncation points for one layer
+/// at the given rate/distortion threshold and reports whether the allocation is
+/// unchanged from the previous call for this layer.
+///
+/// The comparison below is OpenJPEG's `thresh - dd/dr < DBL_EPSILON` verbatim;
+/// adding `abs()` (as clippy suggests) would change which passes each layer
+/// keeps.
+#[allow(clippy::float_equality_without_abs)]
+fn make_layer(components: &mut [Component], layer: usize, threshold: f64) -> bool {
+    let mut allocation_is_same = true;
+    for_each_code_block_mut(components, |block| {
+        if layer >= block.layer_passes.len() {
+            return;
+        }
+        let start = passes_before(block, layer);
+        let total = block.passes.len() as u32;
+        let end = if threshold < 0.0 {
+            total
+        } else {
+            let mut end = start;
+            for passno in start..total {
+                let pass = &block.passes[passno as usize];
+                let (dr, dd) = if end == 0 {
+                    (pass.rate, pass.distortiondec)
+                } else {
+                    let previous = &block.passes[(end - 1) as usize];
+                    (
+                        pass.rate.wrapping_sub(previous.rate),
+                        pass.distortiondec - previous.distortiondec,
+                    )
+                };
+                let dr = dr as i32;
+                if dr == 0 {
+                    if dd != 0.0 {
+                        end = passno + 1;
+                    }
+                    continue;
+                }
+                if threshold - dd / f64::from(dr) < f64::EPSILON {
+                    end = passno + 1;
+                }
+            }
+            end
+        };
+        let count = (end - start) as u16;
+        if block.layer_passes[layer] != count {
+            allocation_is_same = false;
+            block.layer_passes[layer] = count;
+        }
+    });
+    allocation_is_same
+}
+
+/// Global minimum/maximum pass slope, exactly as `opj_tcd_rateallocate` derives
+/// its bisection brackets.
+fn slope_bounds(components: &[Component]) -> (f64, f64) {
+    let mut min = f64::MAX;
+    let mut max = 0.0f64;
+    for component in components {
+        for resolution in 0..=component.levels {
+            for precinct in component.precincts_including_empty(resolution) {
+                for band in component.bands(resolution, precinct) {
+                    for block in &band.code_blocks {
+                        for (passno, pass) in block.passes.iter().enumerate() {
+                            let (dr, dd) = if passno == 0 {
+                                (pass.rate, pass.distortiondec)
+                            } else {
+                                let previous = &block.passes[passno - 1];
+                                (
+                                    pass.rate - previous.rate,
+                                    pass.distortiondec - previous.distortiondec,
+                                )
+                            };
+                            if dr == 0 {
+                                continue;
+                            }
+                            let slope = dd / f64::from(dr as i32);
+                            if slope < min {
+                                min = slope;
+                            }
+                            if slope > max {
+                                max = slope;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (min, max)
+}
+
+/// Runs OpenJPEG's rate/distortion layer allocation over the encoded code
+/// blocks, filling `block.layer_passes`.
+fn allocate_layers(components: &mut [Component], targets: &[f64]) -> Result<(), String> {
+    let layer_count = targets.len();
+    for_each_code_block_mut(components, |block| {
+        block.layer_passes = vec![0u16; layer_count];
+    });
+    let (min, max) = slope_bounds(components);
+    for (layer, &target) in targets.iter().enumerate() {
+        let good_threshold = if target > 0.0 {
+            let max_len = target.ceil() as u32 as usize;
+            let mut lo = min;
+            let mut hi = max;
+            let mut threshold = 0.0f64;
+            let mut stable = 0.0f64;
+            let mut last_ok = false;
+            for iteration in 0..128 {
+                let new_threshold = (lo + hi) / 2.0;
+                if (new_threshold - threshold).abs() <= 0.5e-5 * threshold {
+                    break;
+                }
+                threshold = new_threshold;
+                let same = make_layer(components, layer, threshold) && iteration != 0;
+                let fits = if same {
+                    true
+                } else {
+                    tier2::encode_packets(
+                        components,
+                        (layer + 1) as u16,
+                        0,
+                        tier2::PacketMode::Measure { max_len },
+                    )?
+                    .2
+                };
+                if (same && !last_ok) || (!same && !fits) {
+                    last_ok = false;
+                    lo = threshold;
+                    continue;
+                }
+                last_ok = true;
+                hi = threshold;
+                stable = threshold;
+            }
+            if stable == 0.0 {
+                threshold
+            } else {
+                stable
+            }
+        } else {
+            -1.0
+        };
+        make_layer(components, layer, good_threshold);
+    }
+    Ok(())
+}
+
+/// OpenJPEG's irreversible 9/7 lifting constants (f32, from Table F.4). They
+/// are copied verbatim so the compiler rounds them to the same `f32` as the C
+/// build.
+#[allow(clippy::excessive_precision)]
+const DWT_ALPHA_F32: f32 = -1.586134342;
+#[allow(clippy::excessive_precision)]
+const DWT_BETA_F32: f32 = -0.052980118;
+#[allow(clippy::excessive_precision)]
+const DWT_GAMMA_F32: f32 = 0.882911075;
+#[allow(clippy::excessive_precision)]
+const DWT_DELTA_F32: f32 = 0.443506852;
+#[allow(clippy::excessive_precision)]
+const DWT_K_F32: f32 = 1.230174105;
+const DWT_INV_K_F32: f32 = (1.0f64 / 1.230174105) as f32;
+
+/// OpenJPEG `opj_dwt_encode_step2` on an interleaved f32 line.
+fn dwt_step2_f32(
+    data: &mut [f32],
+    fl: usize,
+    mut fw: usize,
+    end: usize,
+    middle: usize,
+    coefficient: f32,
+) {
+    let imax = end.min(middle);
+    if imax > 0 {
+        data[fw - 1] += (data[fl] + data[fw]) * coefficient;
+        fw += 2;
+        for _ in 1..imax {
+            data[fw - 1] += (data[fw - 2] + data[fw]) * coefficient;
+            fw += 2;
+        }
+    }
+    if middle < end {
+        data[fw - 1] += (2.0f32 * data[fw - 2]) * coefficient;
+    }
+}
+
+fn dwt_step1_combined_f32(data: &mut [f32], iters_c1: usize, iters_c2: usize, c1: f32, c2: f32) {
+    let common = iters_c1.min(iters_c2);
+    let mut i = 0;
+    while i < common {
+        data[2 * i] *= c1;
+        data[2 * i + 1] *= c2;
+        i += 1;
+    }
+    if i < iters_c1 {
+        data[2 * i] *= c1;
+    } else if i < iters_c2 {
+        data[2 * i + 1] *= c2;
+    }
+}
+
+/// OpenJPEG `opj_dwt_encode_1_real` on one f32 line.
+fn dwt_encode_1d_f32(data: &mut [f32], dn: usize, sn: usize, cas: usize) {
+    let (a, b) = if cas == 0 {
+        (0usize, 1usize)
+    } else {
+        (1usize, 0usize)
+    };
+    let alpha_m = dn.min(sn.saturating_sub(b));
+    dwt_step2_f32(data, a, b + 1, dn, alpha_m, DWT_ALPHA_F32);
+    let beta_m = sn.min(dn.saturating_sub(a));
+    dwt_step2_f32(data, b, a + 1, sn, beta_m, DWT_BETA_F32);
+    dwt_step2_f32(data, a, b + 1, dn, alpha_m, DWT_GAMMA_F32);
+    dwt_step2_f32(data, b, a + 1, sn, beta_m, DWT_DELTA_F32);
+    if a == 0 {
+        dwt_step1_combined_f32(data, sn, dn, DWT_INV_K_F32, DWT_K_F32);
+    } else {
+        dwt_step1_combined_f32(data, dn, sn, DWT_K_F32, DWT_INV_K_F32);
+    }
+}
+
+/// OpenJPEG's f32 forward 9/7 transform (`opj_dwt_encode_real`). The tile
+/// always starts at (0, 0) in this encoder, so every level uses the even
+/// (non-inverted) lifting order.
+fn forward_97_f32(data: &mut [f32], width: usize, height: usize, levels: u8) -> Result<(), String> {
+    if width == 0 || height == 0 || data.len() != width * height {
+        return Err("invalid irreversible wavelet plane".into());
+    }
+    let mut current_width = width;
+    let mut current_height = height;
+    for _ in 0..levels {
+        if current_width <= 1 && current_height <= 1 {
+            break;
+        }
+        let low_width = current_width.div_ceil(2);
+        let low_height = current_height.div_ceil(2);
+        if current_height > 1 {
+            let mut column = vec![0f32; current_height];
+            for x in 0..current_width {
+                for y in 0..current_height {
+                    column[y] = data[y * width + x];
+                }
+                dwt_encode_1d_f32(&mut column, current_height - low_height, low_height, 0);
+                for y in 0..low_height {
+                    data[y * width + x] = column[2 * y];
+                }
+                for y in 0..(current_height - low_height) {
+                    data[(low_height + y) * width + x] = column[2 * y + 1];
+                }
+            }
+        }
+        if current_width > 1 {
+            let mut row = vec![0f32; current_width];
+            for y in 0..current_height {
+                row.copy_from_slice(&data[y * width..y * width + current_width]);
+                dwt_encode_1d_f32(&mut row, current_width - low_width, low_width, 0);
+                for x in 0..low_width {
+                    data[y * width + x] = row[2 * x];
+                }
+                for x in 0..(current_width - low_width) {
+                    data[y * width + low_width + x] = row[2 * x + 1];
+                }
+            }
+        }
+        current_width = low_width;
+        current_height = low_height;
+    }
+    Ok(())
+}
+
+/// OpenJPEG's irreversible multiple-component transform, in f32 and with its
+/// exact constants (`opj_mct_encode_real`).
+fn forward_ict_planes_f32(planes: &mut [Vec<f32>]) {
+    if planes.len() < 3 {
+        return;
+    }
+    let (red, rest) = planes.split_at_mut(1);
+    let (green, blue) = rest.split_at_mut(1);
+    for ((r, g), b) in red[0]
+        .iter_mut()
+        .zip(green[0].iter_mut())
+        .zip(blue[0].iter_mut())
+    {
+        let (ro, go, bo) = (*r, *g, *b);
+        *r = 0.299f32 * ro + 0.587f32 * go + 0.114f32 * bo;
+        *g = -0.16875f32 * ro - 0.331260f32 * go + 0.5f32 * bo;
+        *b = 0.5f32 * ro - 0.41869f32 * go - 0.08131f32 * bo;
+    }
 }
 
 /// Decodes a complete codestream into components with integer samples.
@@ -571,24 +1001,6 @@ fn forward_rct(components: &mut [Component]) {
     }
 }
 
-fn forward_ict_planes(planes: &mut [Vec<f64>]) {
-    if planes.len() < 3 {
-        return;
-    }
-    let (red, rest) = planes.split_at_mut(1);
-    let (green, blue) = rest.split_at_mut(1);
-    for ((r, g), b) in red[0]
-        .iter_mut()
-        .zip(green[0].iter_mut())
-        .zip(blue[0].iter_mut())
-    {
-        let y = 0.299 * *r + 0.587 * *g + 0.114 * *b;
-        *g = (0.5 / (1.0 - 0.114)) * (*b - y);
-        *b = (0.5 / (1.0 - 0.299)) * (*r - y);
-        *r = y;
-    }
-}
-
 fn inverse_rct(components: &mut [Component]) {
     let count = components
         .iter()
@@ -705,7 +1117,7 @@ mod tests {
         let mut components =
             build_components(&samples, width as i32, height as i32, 8, false, 5).unwrap();
         let codestream =
-            encode_with_precincts(&mut components, true, Some(&precincts), false, 1.0).unwrap();
+            encode_with_precincts(&mut components, true, Some(&precincts), false, &[0.0]).unwrap();
         let decoded = decode(&codestream).unwrap();
         assert_eq!(decoded[0].samples, samples[0]);
         let (header, _) = MainHeader::parse(&codestream).unwrap();
@@ -1117,6 +1529,77 @@ mod tests {
         patched.extend_from_slice(&stream[end..]);
         let decoded = decode(&patched).unwrap();
         assert_eq!(decoded[0].samples, samples[0]);
+    }
+
+    /// Samples for the golden vectors: a 32x32 8-bit ramp, level-shifted the
+    /// way the DICOM adapter shifts unsigned data before encoding.
+    fn golden_samples() -> Vec<i32> {
+        (0..32 * 32)
+            .map(|index| (index * 13 + 7) % 256 - 128)
+            .collect()
+    }
+
+    /// 32x32 8-bit `golden_samples()` encoded by OpenJPEG 2.5.4 through the
+    /// fo-dicom.Codecs parameter set (COM marker, 6 resolutions, 64x64 code
+    /// blocks, 8 quality layers ending in the lossless layer). Byte equality
+    /// pins the rate allocator, packet headers and Tier-1 output together.
+    #[test]
+    fn lossless_multi_layer_codestream_matches_openjpeg() {
+        const EXPECTED: &str = "
+            ff4fff510029000000000020000000200000000000000000000000200000002000000000000000000001070101ff52000c00000008000504040001ff5c00134040484850484850484850484850484850ff640025000143726561746564206279204f70656e4a5045472076657273696f6e20322e352e34ff90000a0000000002820001ff93808080a31418256e7c8180808080808080808080808080a5d30013b168c0d8abf756abe19cf5d27449b7aea1a86faead115cb1531481dfe1afb819481a28c3fe80808080808080808080a716221f601829c5becbf6e6e1b0a8214240778c265ed47ffa2cbd71379f2b3954c87f9e80808080c5401e740e38614a45278080808090e180114f14ecde5dc290a2a4e1c6504780c02103c07c20c010c03e1040030704c1f3848074381f384007779bcf0c1b3f04e65bdfc3ea0efac2bea0a02198e719d0b9e1ee97369029aedf041b766b2f791fc58ee7a551dfd220cdd74b48a3fd631fb0da3f0440b57c19881bd895e4dda5ba9801e9f122778e12895f7a2ae40debbb34d4d8e5d888573ddf8bcd867f51f44c5b925a915e4f583fb5226262b1d12784c212d19647c1bdadc4f1ce91d49e158fe70d1f4dd329e789e0d063c92d27f1123122caf7d753a0b5f69e4c2915da5c445bd96ee2b582da0367f51884c30c87e16d197218dfe220c95155be87a5f5e90e3e96c52a82fccebcdba03000192b9300bca3386cde5ef44fd06949aca22ffcd8c7dac1f68438fc0d801f5907a00d978a0d50b2eccc2933c55b06cf62879fc583eff20f36410e15e00b6bd7cbfdaede5f901ba350afd38bd4624f760b192b67c05d9f603edd0c21e0ded6f13eb4fda386f860ccf8bb1e39b901ff4730409f989ca8ec06b278687ddd86fd33497e458db4ba2b20008263876afc3393316f4126958568368595a838bf691671f1eba2925f590b38514beb21670a297d66155ea1782778936f11779907f40737c70f374f945c2f6533b2abb143e2372347e590aa47d6e7a02fb2df70fe2bf282be060f5eb1ee7518d63250376f5bd5ff7fff7fff7fff7fffd9";
+        let mut components = build_components(&[golden_samples()], 32, 32, 8, false, 5).unwrap();
+        let rates = [1280.0, 640.0, 320.0, 160.0, 80.0, 40.0, 20.0, 0.0];
+        let stream = encode_with_precincts(&mut components, true, None, false, &rates).unwrap();
+        assert_eq!(stream, hex_bytes(EXPECTED));
+    }
+
+    /// The irreversible counterpart of the golden vector, with the layer list
+    /// fo-dicom uses for the lossy syntax (`Rate = 16`, no appended zero).
+    #[test]
+    fn irreversible_multi_layer_codestream_matches_openjpeg() {
+        const EXPECTED: &str = "
+            ff4fff510029000000000020000000200000000000000000000000200000002000000000000000000001070101ff52000c00000008000504040000ff5c002342772076f076f076c06f006f006ee067506750676850055005504757d357d35762ff640025000143726561746564206279204f70656e4a5045472076657273696f6e20322e352e34ff90000a0000000000b50001ff938080808080a2e98013b168c0d8abf756abe19cf5d27449b7aea1a86faead115cb1531481dfe1afb81650862d5f758080808080808080808080808080808080b0909023f9ea5388ccdad0544a57fc3b01ccbb6380808080a2a40f4ea56d0116076d778080808080c74a8c36a41e23465d575920750b2daf4414a58080808090708012771e1fa0c6587f2f7f58165a0f1f8bf6fde980808080a0480e85feb198c015a780c8689380ffd9";
+        let mut components = build_components(&[golden_samples()], 32, 32, 8, false, 5).unwrap();
+        let rates = [1280.0, 640.0, 320.0, 160.0, 80.0, 40.0, 20.0, 16.0];
+        let stream = encode_with_precincts(&mut components, false, None, false, &rates).unwrap();
+        assert_eq!(stream, hex_bytes(EXPECTED));
+    }
+
+    /// The lossless last layer must carry every Tier-1 pass, and earlier layers
+    /// may only take prefixes of the same pass sequence.
+    #[test]
+    fn layer_allocations_are_monotonic_and_end_lossless() {
+        let samples = vec![pattern(48, 40, 23)];
+        let mut components = build_components(&samples, 48, 40, 8, false, 5).unwrap();
+        let rates = [1280.0, 640.0, 320.0, 160.0, 80.0, 40.0, 20.0, 0.0];
+        let codestream = encode_with_precincts(&mut components, true, None, false, &rates).unwrap();
+        // The decoder consumes the same layered packets, so the lossless path
+        // must still reconstruct every sample.
+        let decoded = decode(&codestream).unwrap();
+        assert_eq!(decoded[0].samples, samples[0]);
+        let mut saw_passes = false;
+        for component in &components {
+            for resolution in 0..=component.levels {
+                for precinct in component.precincts_including_empty(resolution) {
+                    for band in component.bands(resolution, precinct) {
+                        for block in &band.code_blocks {
+                            let assigned: u32 = block
+                                .layer_passes
+                                .iter()
+                                .map(|&passes| u32::from(passes))
+                                .sum();
+                            assert_eq!(
+                                assigned,
+                                block.passes.len() as u32,
+                                "lossless layer must include every pass"
+                            );
+                            saw_passes |= assigned > 0;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_passes);
     }
 
     #[test]
