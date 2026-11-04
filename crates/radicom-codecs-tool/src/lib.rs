@@ -10,8 +10,9 @@ use std::sync::Arc;
 use radicom::error::Error;
 use radicom::io::file::DicomFile;
 use radicom::model::transfer_syntax::TransferSyntax;
-use radicom::pixel::codec::CodecParams;
-use radicom::pixel::PIXEL_DATA;
+use radicom::pixel::codec::{CodecParams, J2kParams, JpegParams, SampleFactor};
+use radicom::pixel::photometric::PhotometricInterpretation;
+use radicom::pixel::{PixelDataRef, PIXEL_DATA};
 
 /// One compression target.
 #[derive(Debug, Clone)]
@@ -117,6 +118,9 @@ pub fn target_formats() -> Vec<TargetFormat> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Success,
+    /// The target syntax cannot represent this image, so it was skipped
+    /// without writing a file.
+    Unsupported,
     Failed,
 }
 
@@ -163,26 +167,45 @@ pub fn compress(
         .and_then(|value| value.to_str())
         .ok_or_else(|| Error::other("input file name has no usable stem"))?;
 
+    let pixel = PixelDataRef::from_dataset(&file.dataset)?;
     let mut outcomes = Vec::with_capacity(targets.len());
     for target in targets {
         let output_path = output_dir.join(format!("{stem}_{}.dcm", target.suffix));
-        let (status, output_size, message) =
-            match transcode_one(file, &source_uid, &target, &output_path) {
-                Ok(already) => {
-                    let output_size = std::fs::metadata(&output_path)
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0);
-                    let message = if already {
-                        format!("already {}; copied", target.name)
-                    } else if output_size > 0 {
-                        format!("{:.2}x compression", input_size as f64 / output_size as f64)
-                    } else {
-                        String::new()
-                    };
-                    (Status::Success, output_size, message)
-                }
-                Err(error) => (Status::Failed, 0, error.to_string()),
-            };
+        if let Some(reason) = unsupported_reason(&target, &pixel) {
+            outcomes.push(CompressionOutcome {
+                format_name: target.name,
+                suffix: target.suffix,
+                transfer_syntax_uid: target.syntax.uid().to_owned(),
+                output_path,
+                status: Status::Unsupported,
+                output_size: 0,
+                message: reason,
+            });
+            continue;
+        }
+        let params = effective_params(&target, &pixel);
+        let (status, output_size, message) = match transcode_one(
+            file,
+            &source_uid,
+            target.syntax.clone(),
+            params,
+            &output_path,
+        ) {
+            Ok(already) => {
+                let output_size = std::fs::metadata(&output_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                let message = if already {
+                    format!("already {}; copied", target.name)
+                } else if output_size > 0 {
+                    format!("{:.2}x compression", input_size as f64 / output_size as f64)
+                } else {
+                    String::new()
+                };
+                (Status::Success, output_size, message)
+            }
+            Err(error) => (Status::Failed, 0, error.to_string()),
+        };
         outcomes.push(CompressionOutcome {
             format_name: target.name,
             suffix: target.suffix,
@@ -196,18 +219,101 @@ pub fn compress(
     Ok(outcomes)
 }
 
+/// Targets this image cannot be encoded to are skipped before transcoding, the
+/// way the fo-dicom reference tool pre-classifies them, so no partial or failed
+/// file is written. Only the JPEG sequential family has a shape matrix worth
+/// rejecting up front; every other target reports its own error.
+fn unsupported_reason(target: &TargetFormat, pixel: &PixelDataRef<'_>) -> Option<String> {
+    let process2_4 = target.suffix == "jpeg_process2_4";
+    if !process2_4 && target.suffix != "jpeg_baseline" {
+        return None;
+    }
+    let Ok(bits_allocated) = pixel.bits_allocated() else {
+        return None;
+    };
+    let bits_stored = pixel.bits_stored();
+    let samples = pixel.samples_per_pixel();
+    // Process 2/4 carries the 12-bit monochrome case that Process 1 cannot.
+    if process2_4
+        && bits_allocated == 16
+        && bits_stored == 12
+        && samples == 1
+        && matches!(
+            pixel.photometric_interpretation(),
+            Some(PhotometricInterpretation::Monochrome1 | PhotometricInterpretation::Monochrome2)
+        )
+    {
+        return None;
+    }
+    if bits_allocated != 8 || bits_stored != 8 {
+        return Some(format!(
+            "JPEG sequential DCT supports only BitsAllocated 8 and BitsStored 8; this image has BitsAllocated={bits_allocated}, BitsStored={bits_stored}."
+        ));
+    }
+    if samples != 1 && samples != 3 {
+        return Some("JPEG sequential DCT supports only SamplesPerPixel 1 or 3.".to_owned());
+    }
+    match pixel.photometric_interpretation() {
+        Some(
+            PhotometricInterpretation::Monochrome1
+            | PhotometricInterpretation::Monochrome2
+            | PhotometricInterpretation::PaletteColor
+            | PhotometricInterpretation::Rgb
+            | PhotometricInterpretation::YbrFull
+            | PhotometricInterpretation::YbrFull422,
+        ) => None,
+        other => Some(format!(
+            "JPEG sequential DCT does not support photometric interpretation {}.",
+            other
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<missing>".to_owned())
+        )),
+    }
+}
+
+/// Parameters that make the tool's output match the fo-dicom reference: 4:2:2
+/// for colour sequential JPEG, and the component transform for JPEG 2000.
+fn effective_params(target: &TargetFormat, pixel: &PixelDataRef<'_>) -> Option<CodecParams> {
+    if target.params.is_some() {
+        return target.params.clone();
+    }
+    match target.suffix {
+        "jpeg_baseline" | "jpeg_process2_4" if pixel.samples_per_pixel() == 3 => {
+            Some(CodecParams::Jpeg(JpegParams {
+                sample_factor: SampleFactor::Half,
+                ..Default::default()
+            }))
+        }
+        "j2k_lossless" => Some(CodecParams::Jpeg2000(J2kParams {
+            irreversible: false,
+            allow_mct: true,
+            update_photometric_interpretation: true,
+            ..Default::default()
+        })),
+        "j2k_lossy" => Some(CodecParams::Jpeg2000(J2kParams {
+            // The reference tool requests a ratio of 16 for the lossy syntax.
+            rate: 16,
+            allow_mct: true,
+            update_photometric_interpretation: true,
+            ..Default::default()
+        })),
+        _ => None,
+    }
+}
+
 /// Transcodes one target; returns `true` when the source already used it.
 fn transcode_one(
     file: &DicomFile,
     source_uid: &str,
-    target: &TargetFormat,
+    syntax: Arc<TransferSyntax>,
+    params: Option<CodecParams>,
     output_path: &Path,
 ) -> Result<bool, Error> {
-    if source_uid == target.syntax.uid() {
+    if source_uid == syntax.uid() {
         file.clone().save(output_path)?;
         return Ok(true);
     }
-    let transcoded = file.clone_with_syntax(target.syntax.clone(), target.params.clone())?;
+    let transcoded = file.clone_with_syntax(syntax, params)?;
     transcoded.save(output_path)?;
     Ok(false)
 }

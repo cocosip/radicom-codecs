@@ -124,17 +124,25 @@ For input file `study1.dcm`, output names include:
   decoded once per target format; a source already in the target format is
   saved as-is instead of being decoded and re-encoded, so lossy input is never
   compressed twice.
-- Each target uses the codec's default parameters. JPEG 2000 Lossy (`.91`) is
-  therefore irreversibly coded at `rate = 20`: the encoder widens its
-  quantization steps until the frame payload reaches roughly a 20:1 ratio. Each
-  step drops whole bit-planes, so the achieved ratio overshoots the target
-  slightly. `rate = 0` means "keep every bit-plane".
+- Each target starts from the codec's default parameters, with two adjustments
+  that align the tool with the native `fo-dicom.Codecs` reference: JPEG 2000
+  uses the reversible or irreversible component transform, and colour sequential
+  JPEG uses 4:2:2 chroma sampling. The reference tool instead leaves the codec
+  default of 4:4:4, which costs roughly 15% more payload for the same quality
+  target, so 4:2:2 is kept here. JPEG 2000 Lossy (`.91`) is coded at `rate = 16`
+  and the encoder bisects a continuous quantization scale until the frame
+  payload reaches that ratio, so the achieved size lands within 2% of the
+  reference instead of overshooting it. `rate = 0` means "keep every bit-plane".
 - The JPEG lossless targets (`.57`/`.70`) derive a per-image Huffman table from
   the actual prediction differences, matching libjpeg with
-  `optimize_coding = TRUE` instead of the larger Annex K default table.
-- There is no up-front "unsupported" classification. A format that cannot
-  encode the input's shape fails with the codec's own error and the remaining
-  formats still run.
+  `optimize_coding = TRUE` instead of the larger Annex K default table. The
+  sequential targets (`.50`/`.51`) do the same for their DC and AC tables.
+- Targets whose syntax cannot represent the image are classified before any file
+  is written and reported as unsupported, mirroring
+  `fo-dicom.PureCodecs.Tools/CompressionPlan.cs`: JPEG sequential DCT is limited
+  to 8-bit monochrome/palette/colour images, plus 12-bit monochrome for Process
+  2/4. Unsupported targets do not create output files. Every other shape failure
+  still surfaces as a failed target and the remaining formats keep running.
 - Lossy outputs are marked through `(0028,2110)`, `(0028,2112)` and
   `(0028,2114)` by the `radicom` transcoder.
 - The SOP Class UID and SOP Instance UID are preserved from the source, like
@@ -144,5 +152,8 @@ For input file `study1.dcm`, output names include:
 
 | Exit code | Meaning |
 | --- | --- |
-| `0` | The command ran and at least one target succeeded. |
+| `0` | The command ran and at least one target was not a failure (successes and unsupported targets both count). |
 | `1` | The input was invalid, command-line arguments were invalid, or every target failed. |
+
+The summary line reports all three outcomes, for example
+`Summary: 10 succeeded, 2 unsupported, 0 failed.`

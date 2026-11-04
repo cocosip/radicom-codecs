@@ -86,10 +86,19 @@ fn run(args: &[String]) -> i32 {
         .iter()
         .filter(|outcome| outcome.status == Status::Success)
         .count();
-    let failed = outcomes.len() - succeeded;
+    let unsupported = outcomes
+        .iter()
+        .filter(|outcome| outcome.status == Status::Unsupported)
+        .count();
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| outcome.status == Status::Failed)
+        .count();
     println!();
-    println!("Summary: {succeeded} succeeded, {failed} failed.");
-    if succeeded == 0 {
+    println!("Summary: {succeeded} succeeded, {unsupported} unsupported, {failed} failed.");
+    // Only an all-failed run is an error; unsupported targets are expected for
+    // images a syntax cannot represent.
+    if failed == outcomes.len() {
         1
     } else {
         0
@@ -174,6 +183,7 @@ fn print_outcomes(outcomes: &[CompressionOutcome]) {
                     outcome.message
                 );
             }
+            Status::Unsupported => println!("    Unsupported: {}", outcome.message),
             Status::Failed => println!("    Failed: {}", outcome.message),
         }
     }

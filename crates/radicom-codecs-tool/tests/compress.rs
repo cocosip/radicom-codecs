@@ -189,7 +189,7 @@ fn a_source_already_in_the_target_syntax_is_not_reencoded() {
 }
 
 #[test]
-fn one_failing_format_does_not_stop_the_others() {
+fn unsupported_formats_are_skipped_without_writing_a_file() {
     let dir = temp_dir("partial");
     let input = dir.join("study.dcm");
     write_sample(&input, 16, &sixteen_bit_frames());
@@ -198,15 +198,26 @@ fn one_failing_format_does_not_stop_the_others() {
     let outcomes = compress(&file, &input, Some(&dir), None).expect("compress");
 
     assert_eq!(outcomes.len(), 12);
-    let baseline = outcomes
-        .iter()
-        .find(|outcome| outcome.suffix == "jpeg_baseline")
-        .expect("baseline row");
-    assert_eq!(
-        baseline.status,
-        Status::Failed,
-        "16-bit input cannot use JPEG Baseline"
-    );
+    for suffix in ["jpeg_baseline", "jpeg_process2_4"] {
+        let outcome = outcomes
+            .iter()
+            .find(|outcome| outcome.suffix == suffix)
+            .expect("sequential JPEG row");
+        assert_eq!(
+            outcome.status,
+            Status::Unsupported,
+            "{suffix} must be classified before encoding"
+        );
+        assert!(
+            outcome.message.contains("BitsAllocated"),
+            "{}",
+            outcome.message
+        );
+        assert!(
+            !outcome.output_path.exists(),
+            "{suffix} must not leave a file behind"
+        );
+    }
     assert!(
         outcomes
             .iter()
