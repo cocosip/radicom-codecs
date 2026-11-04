@@ -320,6 +320,31 @@ pub(crate) fn encode_sequential(
             "quality and smoothing_factor must be 0..=100",
         ));
     }
+    // design §9.3: parameters the sequential process cannot use are rejected
+    // rather than silently ignored. Only `quality` and `smoothing_factor` are
+    // meaningful here; `predictor`/`point_transform` belong to Process 14 and
+    // `convert_colorspace_to_rgb` is a decode-only field.
+    for (invalid, field, value) in [
+        (params.predictor != 1, "predictor", params.predictor),
+        (
+            params.point_transform != 0,
+            "point_transform",
+            params.point_transform,
+        ),
+    ] {
+        if invalid {
+            return Err(operation_error(
+                codec,
+                &format!("sequential JPEG does not support {field} = {value}"),
+            ));
+        }
+    }
+    if params.convert_colorspace_to_rgb {
+        return Err(operation_error(
+            codec,
+            "convert_colorspace_to_rgb is a decode-only parameter for sequential JPEG",
+        ));
+    }
     let layout = Layout::from_source(src, false).map_err(|m| operation_error(codec, &m))?;
     if layout.pixel_representation != 0
         || (baseline && layout.bits_stored != 8)
@@ -433,7 +458,7 @@ pub(crate) fn decode_sequential(
         let bytes = frame_bytes
             .data()
             .map_err(|e| operation_error(codec, &format!("frame {i}: {e}")))?;
-        let frame = SequentialFrame::decode_expected(bytes.as_ref(), Some(&expected))
+        let frame = SequentialFrame::decode_expected(bytes.as_ref(), Some(&expected), baseline)
             .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?;
         if (baseline && frame.precision != 8) || (!baseline && !matches!(frame.precision, 8 | 12)) {
             return Err(operation_error(
@@ -458,9 +483,13 @@ pub(crate) fn decode_sequential(
     }
     let mut layout =
         Layout::from_destination(dst, false).map_err(|m| operation_error(codec, &m))?;
-    if convert && layout.photometric == PhotometricInterpretation::YbrFull422 {
-        // A 4:2:2 destination packs 2 bytes per pixel, but conversion produces
-        // three interleaved samples per pixel labelled RGB.
+    if convert
+        && (layout.photometric == PhotometricInterpretation::YbrFull422 || layout.planar == 1)
+    {
+        // Conversion emits three interleaved samples per pixel labelled RGB. A
+        // 4:2:2 destination packs two bytes per pixel and a planar destination
+        // writes per-plane; both must be rebuilt as interleaved RGB so the
+        // bytes match the metadata we set below.
         layout = Layout::from_values(
             dst.width(),
             dst.height(),

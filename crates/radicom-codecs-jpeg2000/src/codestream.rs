@@ -662,7 +662,7 @@ impl Siz {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::marker::{write_cap, COD, SIZ};
+    use crate::marker::{write_cap, COC, COD, SIZ};
 
     fn pattern(width: usize, height: usize, seed: i32) -> Vec<i32> {
         (0..width * height)
@@ -1104,5 +1104,31 @@ mod tests {
         patched.extend_from_slice(&stream[end..]);
         let decoded = decode(&patched).unwrap();
         assert_eq!(decoded[0].samples, samples[0]);
+    }
+
+    #[test]
+    fn coc_transform_mismatch_under_mct_is_rejected() {
+        let stream = three_component_stream(true, true); // reversible + MCT
+        let (header, _) = MainHeader::parse(&stream).unwrap();
+        let style = &header.cod.style;
+        let mut payload = vec![0u8, 0u8]; // one-byte component index 0, Scoc 0
+        payload.extend_from_slice(&[
+            style.decompositions,
+            style.code_block_width,
+            style.code_block_height,
+            style.style,
+            0, // transform 0 while the COD/MCT stream is reversible (1)
+        ]);
+        let mut coc = Vec::new();
+        coc.extend_from_slice(&COC.to_be_bytes());
+        coc.extend_from_slice(&((2 + payload.len()) as u16).to_be_bytes());
+        coc.extend_from_slice(&payload);
+
+        let (_, cod_end) = main_segment(&stream, COD).unwrap();
+        let mut patched = stream[..cod_end].to_vec();
+        patched.extend_from_slice(&coc);
+        patched.extend_from_slice(&stream[cod_end..]);
+        let error = decode(&patched).unwrap_err();
+        assert!(error.contains("transform"), "{error}");
     }
 }

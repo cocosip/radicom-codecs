@@ -1,4 +1,9 @@
-use radicom::model::{dataset::Dataset, tag::Tag, transfer_syntax::syntaxes, vr::Vr};
+use radicom::model::{
+    dataset::Dataset,
+    tag::Tag,
+    transfer_syntax::{syntaxes, TransferSyntax},
+    vr::Vr,
+};
 
 /// The codec registry is process-wide, so tests that install or reset it must
 /// not run concurrently.
@@ -12,10 +17,11 @@ fn install() -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 use radicom::pixel::{
-    codec::{CodecParams, JpegParams},
+    codec::{Codec, CodecParams, JpegParams},
     transcoder::Transcoder,
     PixelData, PixelDataRef,
 };
+use radicom_codecs::{JpegProcess1Codec, JpegProcess2_4Codec};
 
 /// 8-bit RGB or 16-bit mono source with a deterministic gradient.
 fn source(rows: u16, cols: u16, allocated: u16, stored: u16, components: u16) -> Dataset {
@@ -340,4 +346,112 @@ fn encapsulated_pixel_data_uses_ob_for_wide_samples() {
             "encapsulated BA={allocated} BS={stored} must use OB"
         );
     }
+}
+
+#[test]
+fn converted_decode_into_a_planar_destination_is_interleaved() {
+    let _guard = install();
+    // Baseline-encode an RGB source; the 4:4:4 encoder labels the stream
+    // YBR_FULL, so a converted decode applies the colour transform.
+    let compressed = source(4, 4, 8, 8, 3)
+        .clone_with_syntax(
+            syntaxes::JPEG_PROCESS_1.clone(),
+            Some(CodecParams::Jpeg(JpegParams {
+                quality: 100,
+                ..Default::default()
+            })),
+        )
+        .unwrap();
+    let decode_params = || {
+        CodecParams::Jpeg(JpegParams {
+            convert_colorspace_to_rgb: true,
+            ..Default::default()
+        })
+    };
+    let decode = |dataset: &Dataset| {
+        Transcoder::new(
+            dataset.transfer_syntax(),
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            Some(decode_params()),
+            None,
+        )
+        .transcode_dataset(dataset)
+        .unwrap()
+    };
+    let interleaved = decode(&compressed);
+    // Only the declared destination planar layout differs.
+    let mut planar_source = compressed.clone();
+    planar_source.insert_value(Tag::PLANAR_CONFIGURATION, 1u16);
+    let planar = decode(&planar_source);
+    assert_eq!(
+        frame_bytes(&planar),
+        frame_bytes(&interleaved),
+        "converted decode must emit the same interleaved RGB bytes regardless of the declared destination layout"
+    );
+    assert_eq!(
+        planar
+            .try_get::<u16>(Tag::PLANAR_CONFIGURATION)
+            .unwrap_or(0),
+        0,
+        "converted decode must declare interleaved output"
+    );
+}
+
+/// Encode `source` with one JPEG process, then relabel the encapsulated frame as
+/// `decoded_as` so a different codec decodes the same codestream.
+fn codestream_encoded_as(
+    encode_as: std::sync::Arc<TransferSyntax>,
+    decoded_as: std::sync::Arc<TransferSyntax>,
+) -> Dataset {
+    let mut compressed = source(8, 8, 8, 8, 1)
+        .clone_with_syntax(encode_as, Some(CodecParams::Jpeg(JpegParams::default())))
+        .unwrap();
+    compressed.set_transfer_syntax(decoded_as);
+    compressed
+}
+
+#[test]
+fn jpeg_process1_rejects_an_extended_sof1_codestream() {
+    let _guard = install();
+    // Process 2/4 writes SOF1; the Process 1 decoder must refuse it.
+    let compressed = codestream_encoded_as(
+        syntaxes::JPEG_PROCESS_2_4.clone(),
+        syntaxes::JPEG_PROCESS_1.clone(),
+    );
+    let mut dst = source(8, 8, 8, 8, 1);
+    dst.remove(Tag::PIXEL_DATA);
+    dst.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+    let error = JpegProcess1Codec
+        .decode(
+            &PixelDataRef::from_dataset(&compressed).unwrap(),
+            &mut PixelData::create_new(&mut dst).unwrap(),
+            &CodecParams::Jpeg(JpegParams::default()),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("SOF0"), "{error}");
+}
+
+#[test]
+fn jpeg_process2_4_accepts_an_eight_bit_baseline_sof0_codestream() {
+    let _guard = install();
+    // fo-dicom/libjpeg encode 8-bit Process 2/4 streams with the baseline SOF0
+    // marker, so the .51 decoder must accept a SOF0 8-bit codestream.
+    let compressed = codestream_encoded_as(
+        syntaxes::JPEG_PROCESS_1.clone(),
+        syntaxes::JPEG_PROCESS_2_4.clone(),
+    );
+    let mut dst = source(8, 8, 8, 8, 1);
+    dst.remove(Tag::PIXEL_DATA);
+    dst.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+    {
+        let mut pixels = PixelData::create_new(&mut dst).unwrap();
+        JpegProcess2_4Codec
+            .decode(
+                &PixelDataRef::from_dataset(&compressed).unwrap(),
+                &mut pixels,
+                &CodecParams::Jpeg(JpegParams::default()),
+            )
+            .expect("8-bit SOF0 under .51 must decode");
+    }
+    assert!(PixelDataRef::from_dataset(&dst).unwrap().number_of_frames() >= 1);
 }

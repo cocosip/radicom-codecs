@@ -140,6 +140,22 @@ impl<'a> MarkerReader<'a> {
     }
 }
 
+/// Validate the bytes after the final EOI marker (design §9.2): at most one
+/// `0x00` byte is accepted, which is the DICOM even-length pad. Anything else —
+/// including a spliced second codestream — is a managed error.
+pub(crate) fn check_trailing(data: &[u8], position: usize) -> Result<(), String> {
+    let trailing = data
+        .get(position..)
+        .ok_or_else(|| "JPEG trailing position is outside the codestream".to_owned())?;
+    if trailing.len() > 1 || trailing.first().is_some_and(|&byte| byte != 0) {
+        return Err(format!(
+            "JPEG codestream has {} trailing byte(s) after EOI; at most one 0x00 pad byte is allowed",
+            trailing.len()
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct MarkerWriter {
     bytes: Vec<u8>,

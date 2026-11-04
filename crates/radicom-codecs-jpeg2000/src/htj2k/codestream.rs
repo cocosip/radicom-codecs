@@ -359,6 +359,21 @@ pub(crate) fn decode(
     if header.cod.style.style & 0xB7 != 0 {
         return Err("unsupported HTJ2K code-block style bits".into());
     }
+    // The HT cleanup coder ignores the per-component style; validate every COC
+    // override the same way as COD so a component without the HT bit (or with an
+    // unsupported style bit) is rejected instead of silently mis-decoded.
+    for index in 0..header.siz.comps.len() {
+        let style = header.coding_style(index);
+        if style.style & 0x40 == 0 {
+            return Err("HTJ2K codestream has a component without the HT code-block style".into());
+        }
+        if style.style & 0xB7 != 0 {
+            return Err("unsupported HTJ2K code-block style bits".into());
+        }
+        if style.transform != header.cod.style.transform {
+            return Err("HTJ2K per-component transform differs from COD".into());
+        }
+    }
     if header.cod.scod & 1 != 0
         || header
             .cocs
@@ -411,6 +426,9 @@ pub(crate) fn decode(
     if width > i32::MAX as u64 || height > i32::MAX as u64 {
         return Err("HTJ2K image dimensions exceed the supported range".into());
     }
+    if header.siz.xtsiz < header.siz.xsiz || header.siz.ytsiz < header.siz.ysiz {
+        return Err("multi-tile HTJ2K codestreams are not supported".into());
+    }
     crate::geometry::checked_total(width, height, header.siz.comps.len())?;
     let levels = i32::from(header.cod.style.decompositions);
     let (code_block_width, code_block_height) = header.cod.style.code_block_size()?;
@@ -434,17 +452,21 @@ pub(crate) fn decode(
     }
 
     let mut tile_data = Vec::new();
+    let mut tile_parts = 0usize;
+    let eoc_offset;
     loop {
         if offset + 2 > data.len() {
             return Err("truncated HTJ2K codestream before SOT".into());
         }
         let marker = u16::from_be_bytes([data[offset], data[offset + 1]]);
         if marker == EOC {
+            eoc_offset = offset;
             break;
         }
         if marker != SOT {
-            // DICOM frame padding after the last tile-part is all zeroes.
-            break;
+            return Err(format!(
+                "unexpected marker 0x{marker:04X} before HTJ2K tile data"
+            ));
         }
         let sot_start = offset;
         if offset + 12 > data.len() {
@@ -454,12 +476,8 @@ pub(crate) fn decode(
         if sot.tile != 0 {
             return Err("only tile 0 is supported".into());
         }
-        if sot.length == 0
-            && (offset + 14 > data.len()
-                || u16::from_be_bytes([data[offset + 12], data[offset + 13]]) != SOD)
-        {
-            // A zero-length SOT with no SOD is trailing fragment padding.
-            break;
+        if sot.length != 0 && sot.length < 14 {
+            return Err("tile-part length is shorter than its SOT and SOD segments".into());
         }
         offset += 12;
         if offset + 2 > data.len() {
@@ -469,18 +487,34 @@ pub(crate) fn decode(
             return Err("missing SOD marker".into());
         }
         offset += 2;
-        let end = if sot.length == 0 {
-            data.len()
-        } else {
+        let end = if sot.length != 0 {
             sot_start
                 .checked_add(sot.length as usize)
                 .ok_or_else(|| "tile-part length overflow".to_string())?
+        } else {
+            // Psot=0 means "the tile-part runs to EOC", so it can only be the
+            // last tile-part of the codestream.
+            let position = find_next_tile_marker(data, offset)?;
+            if u16::from_be_bytes([data[position], data[position + 1]]) != EOC {
+                return Err("a zero-length HTJ2K tile-part must be the last one".into());
+            }
+            position
         };
         if end > data.len() || end < offset {
             return Err("tile-part extends past the codestream".into());
         }
+        tile_parts += 1;
         tile_data.extend_from_slice(&data[offset..end]);
         offset = end;
+    }
+    // fo-dicom/OpenJPH hands back the whole pooled fragment buffer as the frame,
+    // so real HTJ2K codestreams carry stale capacity bytes after EOC. Unlike the
+    // classic path we cannot require "at most one pad byte" here; bytes after a
+    // present EOC are ignored for interoperability. EOC presence is still
+    // required (the loop only breaks on EOC), and markers before it are validated.
+    let _ = eoc_offset;
+    if tile_parts == 0 {
+        return Err("codestream has no tile-part".into());
     }
 
     let mut packet_offset = 0usize;
@@ -595,6 +629,9 @@ pub(crate) fn decode(
             }
         }
     }
+    if packet_offset != tile_data.len() {
+        return Err("HTJ2K tile data has trailing bytes".into());
+    }
 
     for component in components.iter_mut() {
         if reversible {
@@ -639,6 +676,20 @@ pub(crate) fn decode(
         }
     }
     Ok(components)
+}
+
+fn find_next_tile_marker(data: &[u8], start: usize) -> Result<usize, String> {
+    let mut position = start;
+    while position + 1 < data.len() {
+        if data[position] == 0xFF {
+            let marker = u16::from_be_bytes([data[position], data[position + 1]]);
+            if marker == SOT || marker == EOC {
+                return Ok(position);
+            }
+        }
+        position += 1;
+    }
+    Err("unterminated tile-part".into())
 }
 
 fn forward_ict_planes(planes: &mut [Vec<f64>]) {
@@ -984,5 +1035,94 @@ mod tests {
         rebuilt.extend_from_slice(&encoded[offset..]);
         let error = decode(&rebuilt, None).unwrap_err();
         assert!(error.contains("unsupported HTJ2K"), "{error}");
+    }
+
+    #[test]
+    fn trailing_bytes_after_eoc_are_tolerated() {
+        // fo-dicom/OpenJPH appends stale pooled-buffer bytes after EOC, so a
+        // decoder must ignore everything after a present EOC to read real files.
+        let mut components = build_components(&[vec![3i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let opts = options(&components, true);
+        let encoded = encode(&mut components, &opts).unwrap();
+        let expected = decode(&encoded, None).unwrap();
+        for extra in [vec![0x00u8], vec![0x7F], vec![0x00, 0x00, 0xFF, 0x4F]] {
+            let mut padded = encoded.clone();
+            padded.extend_from_slice(&extra);
+            assert_eq!(
+                decode(&padded, None).unwrap()[0].samples,
+                expected[0].samples,
+                "bytes after EOC must be ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_tile_data_is_rejected() {
+        let mut components = build_components(&[vec![1i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let opts = options(&components, true);
+        let mut encoded = encode(&mut components, &opts).unwrap();
+        let sot = encoded
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0x90])
+            .expect("SOT marker");
+        let psot = u32::from_be_bytes([
+            encoded[sot + 6],
+            encoded[sot + 7],
+            encoded[sot + 8],
+            encoded[sot + 9],
+        ]);
+        encoded[sot + 6..sot + 10].copy_from_slice(&(psot + 1).to_be_bytes());
+        encoded.insert(encoded.len() - 2, 0xAA);
+        let error = decode(&encoded, None).unwrap_err();
+        assert!(error.contains("tile data"), "{error}");
+    }
+
+    #[test]
+    fn multi_tile_codestreams_are_rejected() {
+        let mut components = build_components(&[vec![5i32; 64]], 8, 8, 8, false, 0).unwrap();
+        let opts = options(&components, true);
+        let mut encoded = encode(&mut components, &opts).unwrap();
+        let siz = encoded
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0x51])
+            .expect("SIZ marker");
+        let xsiz = u32::from_be_bytes([
+            encoded[siz + 6],
+            encoded[siz + 7],
+            encoded[siz + 8],
+            encoded[siz + 9],
+        ]);
+        let xtsiz_at = siz + 4 + 18;
+        encoded[xtsiz_at..xtsiz_at + 4].copy_from_slice(&(xsiz - 1).to_be_bytes());
+        let error = decode(&encoded, None).unwrap_err();
+        assert!(error.contains("multi-tile"), "{error}");
+    }
+
+    #[test]
+    fn coc_without_ht_bit_is_rejected() {
+        let mut components = build_components(&[vec![7i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let opts = options(&components, true);
+        let encoded = encode(&mut components, &opts).unwrap();
+        let (header, _) = MainHeader::parse(&encoded).unwrap();
+        let style = &header.cod.style;
+        let mut payload = vec![0u8, 0u8]; // component index 0, Scoc 0
+        payload.extend_from_slice(&[
+            style.decompositions,
+            style.code_block_width,
+            style.code_block_height,
+            0x00, // same size/levels but no HT bit
+            style.transform,
+        ]);
+        let mut coc = Vec::new();
+        coc.extend_from_slice(&0xFF53u16.to_be_bytes());
+        coc.extend_from_slice(&((2 + payload.len()) as u16).to_be_bytes());
+        coc.extend_from_slice(&payload);
+        let siz_len = u16::from_be_bytes([encoded[4], encoded[5]]) as usize;
+        let siz_end = 4 + siz_len;
+        let mut rebuilt = encoded[..siz_end].to_vec();
+        rebuilt.extend_from_slice(&coc);
+        rebuilt.extend_from_slice(&encoded[siz_end..]);
+        let error = decode(&rebuilt, None).unwrap_err();
+        assert!(error.contains("HT code-block style"), "{error}");
     }
 }

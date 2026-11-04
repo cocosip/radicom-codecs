@@ -214,7 +214,10 @@ Segment lengths include their two length bytes and must stay inside the frame.
 APPn and COM are skipped with the same bounds checks. Standalone markers are
 recognized only where the standard permits them. A marker encountered inside
 entropy data is valid only after byte stuffing or at a legal restart/EOI
-boundary. Bytes after EOI are ignored.
+boundary. After the final EOI the decoder accepts at most one trailing `0x00`
+byte — the DICOM even-length pad — and any other trailing byte is a managed
+error (see `radicom-codecs-design.md` §9.2); this rejects spliced or
+concatenated codestreams that a single-frame fragment cannot represent.
 
 ### Process 1 and Process 2/4
 

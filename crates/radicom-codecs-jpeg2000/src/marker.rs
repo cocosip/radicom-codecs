@@ -657,6 +657,9 @@ impl MainHeader {
                 {
                     return Err("per-component code-block sizes are not supported".into());
                 }
+                if self.cod.mct != 0 && coc.style.transform != self.cod.style.transform {
+                    return Err("per-component COC transform differs from COD under MCT".into());
+                }
                 self.cocs
                     .retain(|existing| existing.component != coc.component);
                 self.cocs.push(coc);
@@ -724,6 +727,9 @@ fn finish_header(
             || coc.style.code_block_height != cod.style.code_block_height
         {
             return Err("per-component code-block sizes are not supported".into());
+        }
+        if cod.mct != 0 && coc.style.transform != cod.style.transform {
+            return Err("per-component COC transform differs from COD under MCT".into());
         }
     }
     let required_steps = |style: u8, levels: u8| {

@@ -7,7 +7,7 @@
 use super::bit::{BitReader, BitWriter};
 use super::dct::{forward, inverse, scaled_table, CHROMA_Q, LUMA_Q, MAX_QUANTIZATION, ZIGZAG};
 use super::huffman::HuffmanTable;
-use super::marker::{Marker, MarkerReader, MarkerWriter};
+use super::marker::{check_trailing, Marker, MarkerReader, MarkerWriter};
 
 const COUNTS_DC_LUMA: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
 const VALUES_DC_LUMA: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
@@ -483,10 +483,13 @@ impl SequentialFrame {
 
     /// Decode one codestream. `expected` is the destination contract: it is
     /// checked against the SOF header before the frame buffer is allocated, so a
-    /// hostile SOF cannot request a huge allocation.
+    /// hostile SOF cannot request a huge allocation. `baseline` is the process
+    /// owned by the transfer syntax: `true` is Process 1 (`.50`, SOF0/8-bit/
+    /// Pq=0), `false` is Process 2/4 (`.51`, SOF1).
     pub(crate) fn decode_expected(
         data: &[u8],
         expected: Option<&FrameExpectation>,
+        baseline: bool,
     ) -> Result<Self, String> {
         let mut r = MarkerReader::new(data);
         expect(&mut r, Marker::Soi)?;
@@ -500,14 +503,14 @@ impl SequentialFrame {
         loop {
             let (marker, payload) = r.read_segment()?;
             match marker {
-                Marker::Dqt => parse_dqt(&payload, &mut q)?,
+                Marker::Dqt => parse_dqt(&payload, &mut q, baseline)?,
                 Marker::Dht => parse_dht(&payload, &mut dcs, &mut acs)?,
                 Marker::Dri => restart_interval = parse_dri(&payload)?,
                 Marker::Sof0 | Marker::Sof1 => {
                     if header.is_some() {
                         return Err("JPEG frame has more than one SOF segment".to_owned());
                     }
-                    let frame = parse_sof(&payload, marker)?;
+                    let frame = parse_sof(&payload, marker, baseline)?;
                     if let Some(expected) = expected {
                         if frame.width != expected.width
                             || frame.height != expected.height
@@ -580,6 +583,7 @@ impl SequentialFrame {
                 other => return Err(format!("unexpected JPEG marker {other:?}")),
             }
         }
+        check_trailing(data, r.position())?;
         let header = header.ok_or("missing JPEG SOF")?;
         if decoded[..usize::from(header.components)]
             .iter()
@@ -599,10 +603,31 @@ impl SequentialFrame {
     }
 
     /// Decode without a destination contract; the marker and entropy tests use
-    /// this to exercise the codestream layers on their own.
+    /// this to exercise the codestream layers on their own. The process is
+    /// inferred from the SOF marker so the strict SOF/precision/Pq rules still
+    /// apply to crafted test streams.
     #[cfg(test)]
     pub(crate) fn decode(data: &[u8]) -> Result<Self, String> {
-        Self::decode_expected(data, None)
+        Self::decode_expected(data, None, baseline_from_sof(data)?)
+    }
+}
+
+/// Test-only helper: report whether the codestream's SOF is baseline (SOF0).
+#[cfg(test)]
+fn baseline_from_sof(data: &[u8]) -> Result<bool, String> {
+    let mut reader = MarkerReader::new(data);
+    let (first, _) = reader.read_segment()?;
+    if first != Marker::Soi {
+        return Err("expected SOI".to_owned());
+    }
+    loop {
+        let (marker, _) = reader.read_segment()?;
+        match marker {
+            Marker::Sof0 => return Ok(true),
+            Marker::Sof1 => return Ok(false),
+            Marker::Sos | Marker::Eoi => return Err("no SOF before SOS/EOI".to_owned()),
+            _ => {}
+        }
     }
 }
 
@@ -868,6 +893,9 @@ fn decode_scan(
                                     return Err("invalid JPEG AC run".into());
                                 }
                                 k += 16;
+                                if k > 64 {
+                                    return Err("JPEG AC run exceeds block".into());
+                                }
                             } else {
                                 k += usize::from(run);
                                 if k >= 64 {
@@ -896,7 +924,12 @@ fn decode_scan(
                             for xx in 0..8 {
                                 let px = (block_x * 8 + xx) * step_x;
                                 let py = (block_y * 8 + yy) * step_y;
-                                let value = (block[yy * 8 + xx] + offset).clamp(0, max) as u16;
+                                // Widen before the bias: a crafted Pq=1 table can
+                                // saturate a dequantized coefficient near i32::MAX,
+                                // and `block + offset` would then overflow.
+                                let value = (i64::from(block[yy * 8 + xx]) + i64::from(offset))
+                                    .clamp(0, i64::from(max))
+                                    as u16;
                                 for dy in 0..step_y {
                                     let y = (py + dy).min(height - 1);
                                     for dx in 0..step_x {
@@ -1053,7 +1086,7 @@ fn dht_payload(extended: bool) -> Vec<u8> {
     }
     p
 }
-fn parse_sof(p: &[u8], marker: Marker) -> Result<FrameHeader, String> {
+fn parse_sof(p: &[u8], marker: Marker, baseline: bool) -> Result<FrameHeader, String> {
     if p.len() < 6 {
         return Err("truncated SOF".into());
     }
@@ -1066,6 +1099,30 @@ fn parse_sof(p: &[u8], marker: Marker) -> Result<FrameHeader, String> {
     }
     if !matches!(p[0], 8 | 12) {
         return Err(format!("unsupported JPEG frame precision {}", p[0]));
+    }
+    // The transfer syntax owns the process: Process 1 (`.50`) is baseline SOF0
+    // with 8-bit samples. Process 2/4 (`.51`) is SOF1 for 8/12-bit, but
+    // fo-dicom/libjpeg emit 8-bit extended streams with the baseline SOF0 marker,
+    // so SOF0 is also accepted at 8-bit (never at 12-bit).
+    if baseline {
+        if marker != Marker::Sof0 {
+            return Err("baseline JPEG requires a SOF0 marker".into());
+        }
+        if p[0] != 8 {
+            return Err(format!(
+                "baseline JPEG requires 8-bit precision, got {}",
+                p[0]
+            ));
+        }
+    } else if marker == Marker::Sof0 {
+        if p[0] != 8 {
+            return Err(format!(
+                "extended sequential JPEG with a SOF0 marker requires 8-bit precision, got {}",
+                p[0]
+            ));
+        }
+    } else if marker != Marker::Sof1 {
+        return Err("extended sequential JPEG requires a SOF0 or SOF1 marker".into());
     }
     let mut qids = [0u8; 3];
     let mut component_ids = [0u8; 3];
@@ -1147,16 +1204,20 @@ fn parse_sos(p: &[u8], component_ids: &[u8]) -> Result<Vec<(u8, u8, u8)>, String
     }
     Ok(selectors)
 }
-fn parse_dqt(p: &[u8], q: &mut [[u16; 64]; 4]) -> Result<(), String> {
+fn parse_dqt(p: &[u8], q: &mut [[u16; 64]; 4], baseline: bool) -> Result<(), String> {
     let mut i = 0;
     while i < p.len() {
         let info = p[i];
         i += 1;
         let precision = info >> 4;
         // Pq=1 (16-bit entries) is what libjpeg writes once a value exceeds
-        // 255 and what fo-dicom emits for low-quality 12-bit encodes.
+        // 255 and what fo-dicom emits for low-quality 12-bit encodes. Baseline
+        // (Process 1) keeps the 8-bit Pq=0 form.
         if precision > 1 || info & 15 > 3 {
             return Err("unsupported DQT".into());
+        }
+        if baseline && precision != 0 {
+            return Err("baseline JPEG requires 8-bit (Pq=0) quantization tables".into());
         }
         let entry_bytes = 1 + usize::from(precision);
         if i + 64 * entry_bytes > p.len() {
@@ -1375,9 +1436,16 @@ mod tests {
     fn crafted_dc_stream(sof: Marker, precision: u8, category: u8, quant: u16) -> Vec<u8> {
         let mut out = MarkerWriter::default();
         out.write_marker(Marker::Soi).unwrap();
-        let mut dqt = vec![0x10];
+        // Baseline (SOF0) streams require Pq=0 (8-bit) tables, so only widen the
+        // table to Pq=1 when the value does not fit a byte (the extended case).
+        let wide = quant > 255;
+        let mut dqt = vec![u8::from(wide) << 4];
         for _ in 0..64 {
-            dqt.extend(quant.to_be_bytes());
+            if wide {
+                dqt.extend(quant.to_be_bytes());
+            } else {
+                dqt.push(quant as u8);
+            }
         }
         out.write_segment(Marker::Dqt, &dqt).unwrap();
         let sof_payload = vec![precision, 0, 8, 0, 16, 1, 1, 0x11, 0];
@@ -1575,29 +1643,29 @@ mod tests {
         // T.81 allows any 1..=4 factors; 4:2:0 is 2x2 on the luma component.
         let mut payload = vec![8, 0, 8, 0, 8, 3, 1, 0x22, 0, 2, 0x11, 0, 3, 0x11, 0];
         assert_eq!(
-            parse_sof(&payload, Marker::Sof0).unwrap().sampling,
+            parse_sof(&payload, Marker::Sof0, true).unwrap().sampling,
             [(2, 2), (1, 1), (1, 1)]
         );
         // Mixed factors stay legal as long as they divide the frame maximum.
         payload = vec![8, 0, 8, 0, 8, 3, 1, 0x21, 0, 2, 0x22, 0, 3, 0x11, 0];
         assert_eq!(
-            parse_sof(&payload, Marker::Sof0).unwrap().sampling,
+            parse_sof(&payload, Marker::Sof0, true).unwrap().sampling,
             [(2, 1), (2, 2), (1, 1)]
         );
         // Zero and out-of-range factors are rejected.
         payload = vec![8, 0, 8, 0, 8, 3, 1, 0x01, 0, 2, 0x11, 0, 3, 0x11, 0];
-        let error = parse_sof(&payload, Marker::Sof0).unwrap_err();
+        let error = parse_sof(&payload, Marker::Sof0, true).unwrap_err();
         assert!(error.contains("sampling factor"), "{error}");
         payload = vec![8, 0, 8, 0, 8, 3, 1, 0x51, 0, 2, 0x11, 0, 3, 0x11, 0];
-        let error = parse_sof(&payload, Marker::Sof0).unwrap_err();
+        let error = parse_sof(&payload, Marker::Sof0, true).unwrap_err();
         assert!(error.contains("sampling factor 5x1"), "{error}");
         // A factor that does not divide the maximum cannot be upsampled.
         payload = vec![8, 0, 8, 0, 8, 3, 1, 0x31, 0, 2, 0x21, 0, 3, 0x11, 0];
-        let error = parse_sof(&payload, Marker::Sof0).unwrap_err();
+        let error = parse_sof(&payload, Marker::Sof0, true).unwrap_err();
         assert!(error.contains("does not divide"), "{error}");
         // Two components remain unsupported.
         payload = vec![8, 0, 8, 0, 8, 2, 1, 0x11, 0, 2, 0x11, 0];
-        assert!(parse_sof(&payload, Marker::Sof0).is_err());
+        assert!(parse_sof(&payload, Marker::Sof0, true).is_err());
     }
 
     #[test]
@@ -1858,7 +1926,7 @@ mod tests {
         for id in 1..=4 {
             payload.extend([id, 0x11, 0]);
         }
-        assert!(parse_sof(&payload, Marker::Sof0).is_err());
+        assert!(parse_sof(&payload, Marker::Sof0, true).is_err());
     }
 
     #[test]
@@ -2154,5 +2222,54 @@ mod tests {
             .encode_with_smoothing(90, false, true, 101, None)
             .unwrap_err();
         assert!(error.contains("0..=100"), "{error}");
+    }
+
+    #[test]
+    fn baseline_rejects_twelve_bit_precision_and_sixteen_bit_tables() {
+        // SOF0 with 12-bit precision is not the baseline process.
+        let payload = vec![12u8, 0, 8, 0, 8, 1, 1, 0x11, 0];
+        let error = parse_sof(&payload, Marker::Sof0, true).unwrap_err();
+        assert!(error.contains("8-bit"), "{error}");
+        // A Pq=1 (16-bit) quantization table is not baseline.
+        let mut dqt = vec![0x10u8];
+        dqt.extend([1u8; 128]);
+        let mut q = [[0u16; 64]; 4];
+        let error = parse_dqt(&dqt, &mut q, true).unwrap_err();
+        assert!(error.contains("Pq=0"), "{error}");
+    }
+
+    #[test]
+    fn accepts_at_most_one_trailing_pad_byte() {
+        let frame = SequentialFrame::new(8, 8, 8, 1, (0..64).map(|v| v as u16).collect()).unwrap();
+        let encoded = frame
+            .encode_with_smoothing(90, false, false, 0, None)
+            .unwrap();
+        assert!(encoded.ends_with(&[0xffu8, 0xd9]), "stream must end in EOI");
+
+        // One 0x00 is the DICOM even-length pad and is accepted; adding it must
+        // not change the reconstructed samples (baseline is lossy, so compare
+        // against the unpadded decode, not the source).
+        let mut padded = encoded.clone();
+        padded.push(0x00);
+        assert_eq!(
+            SequentialFrame::decode(&padded).unwrap().samples,
+            SequentialFrame::decode(&encoded).unwrap().samples
+        );
+
+        // Two trailing bytes (even zeros) is a spliced/over-padded stream.
+        let mut two = encoded.clone();
+        two.extend([0x00, 0x00]);
+        let error = SequentialFrame::decode(&two).unwrap_err();
+        assert!(error.contains("trailing"), "{error}");
+
+        // A single non-zero byte after EOI is garbage.
+        let mut garbage = encoded.clone();
+        garbage.push(0x01);
+        assert!(SequentialFrame::decode(&garbage).is_err());
+
+        // Zero then non-zero is also rejected.
+        let mut mixed = encoded.clone();
+        mixed.extend([0x00, 0x01]);
+        assert!(SequentialFrame::decode(&mixed).is_err());
     }
 }

@@ -484,19 +484,18 @@ fn operate_ht(
             "PCRL and CPRL progression orders are not implemented by the HTJ2K codec",
         ));
     }
-    let levels = i32::try_from(p.decompositions).map_err(|_| {
-        error(
-            codec,
-            if decode { "decode" } else { "encode" },
-            "invalid decomposition count",
-        )
-    })?;
-    if !(0..=32).contains(&levels) {
-        return Err(error(
-            codec,
-            if decode { "decode" } else { "encode" },
-            "invalid decomposition count",
-        ));
+    // Decoding does not use the encoder's decomposition/quality/progression
+    // settings (the codestream header is authoritative), so only encode parses
+    // and validates them; a caller-supplied encode-only value must not make a
+    // decodable stream fail.
+    let levels = if decode {
+        0
+    } else {
+        i32::try_from(p.decompositions)
+            .map_err(|_| error(codec, "encode", "invalid decomposition count"))?
+    };
+    if !decode && !(0..=32).contains(&levels) {
+        return Err(error(codec, "encode", "invalid decomposition count"));
     }
     let rpcl = syntax.uid() == syntaxes::HTJ2K_LOSSLESS_RPCL.uid();
     let expected_progression = if rpcl { Some(2) } else { None };
@@ -513,9 +512,9 @@ fn operate_ht(
         quality: p.quality,
         insert_tlm: p.insert_tlm_markers,
     };
-    options
-        .validate()
-        .map_err(|m| error(codec, if decode { "decode" } else { "encode" }, m))?;
+    if !decode {
+        options.validate().map_err(|m| error(codec, "encode", m))?;
+    }
     if decode {
         if src.transfer_syntax().uid() != syntax.uid() {
             return Err(error(
@@ -1019,6 +1018,54 @@ mod facade_tests {
         let decoded =
             decode_with(&codec, &encoded, &ht_params(true, ProgressionOrder::Lrcp)).unwrap();
         assert_eq!(samples(&decoded), raw);
+    }
+
+    #[test]
+    fn ht_decode_ignores_encode_only_parameters() {
+        let raw: Vec<u8> = (0..16 * 16).map(|i| (i * 11 + 7) as u8).collect();
+        let mut source = ds(16, 16, 8, 1, 0, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let codec = HtJpeg2000LosslessCodec;
+        let encoded = encode_with(&codec, &mut source, &codec.default_params()).unwrap();
+        // These fields only affect encoding; decoding must use the codestream
+        // header and still succeed.
+        let params = CodecParams::HtJpeg2000(HtJ2kParams {
+            irreversible: true,
+            quality: 95,
+            decompositions: 40,
+            progression_order: ProgressionOrder::Pcrl,
+            employ_color_transform: false,
+            ..Default::default()
+        });
+        let decoded = decode_with(&codec, &encoded, &params).unwrap();
+        assert_eq!(samples(&decoded), raw);
+    }
+
+    #[test]
+    fn lossy_decode_ignores_rate_parameters() {
+        let raw: Vec<u8> = (0..16 * 16).map(|i| (i * 13 + 3) as u8).collect();
+        let mut source = ds(16, 16, 8, 1, 0, "MONOCHROME2");
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let encoded = encode_with(
+            &Jpeg2000LossyCodec,
+            &mut source,
+            &Jpeg2000LossyCodec.default_params(),
+        )
+        .unwrap();
+        let params = CodecParams::Jpeg2000(J2kParams {
+            irreversible: true,
+            rate: 50,
+            rate_levels: vec![10],
+            ..Default::default()
+        });
+        let decoded = decode_with(&Jpeg2000LossyCodec, &encoded, &params).unwrap();
+        assert_eq!(samples(&decoded).len(), raw.len());
     }
 
     #[test]

@@ -112,6 +112,16 @@ impl RleLayout {
         if samples == 0 {
             return Err("SamplesPerPixel must be at least 1".to_owned());
         }
+        // RLE Lossless stores one byte per plane per pixel and cannot represent
+        // chroma-subsampled data. Accepting e.g. YBR_FULL_422 here would make
+        // the decoded frame longer than `uncompressed_frame_size`, silently
+        // truncating it on read.
+        if samples > 1 && input.photometric.is_some_and(|pi| pi.is_subsampled()) {
+            return Err(
+                "subsampled PhotometricInterpretation is not representable by RLE Lossless"
+                    .to_owned(),
+            );
+        }
         if bit_packed {
             if input.bits_stored != 1 {
                 return Err(format!(

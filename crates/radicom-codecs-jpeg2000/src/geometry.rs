@@ -23,6 +23,13 @@ pub(crate) fn floor_div_pow2(value: i32, power: i32) -> i32 {
     value >> power
 }
 
+/// i64 variant of [`ceil_div_pow2`] for callers whose numerator is a
+/// difference against `2^level`; a legal codestream may declare up to 32
+/// decomposition levels, which overflows `i32` before the shift.
+fn ceil_div_pow2_i64(value: i64, power: i32) -> i32 {
+    ((value + (1i64 << power) - 1) >> power) as i32
+}
+
 pub(crate) fn split_length(length: i32, even: bool) -> i32 {
     if even {
         (length + 1) / 2
@@ -170,10 +177,25 @@ fn high_subband(
         offset_y,
         width: width.max(0),
         height: height.max(0),
-        band_x0: ceil_div_pow2(tile_x0 - (x0b << level_no), level_no + 1),
-        band_y0: ceil_div_pow2(tile_y0 - (y0b << level_no), level_no + 1),
-        band_x1: ceil_div_pow2(tile_x0 + tile_width - (x0b << level_no), level_no + 1),
-        band_y1: ceil_div_pow2(tile_y0 + tile_height - (y0b << level_no), level_no + 1),
+        // Compute the level offset in i64: with the codestream-legal 32 levels,
+        // `x0b << level_no` reaches 2^31 and the subsequent `i32` subtraction
+        // overflows for a small tile.
+        band_x0: ceil_div_pow2_i64(
+            i64::from(tile_x0) - (i64::from(x0b) << level_no),
+            level_no + 1,
+        ),
+        band_y0: ceil_div_pow2_i64(
+            i64::from(tile_y0) - (i64::from(y0b) << level_no),
+            level_no + 1,
+        ),
+        band_x1: ceil_div_pow2_i64(
+            i64::from(tile_x0) + i64::from(tile_width) - (i64::from(x0b) << level_no),
+            level_no + 1,
+        ),
+        band_y1: ceil_div_pow2_i64(
+            i64::from(tile_y0) + i64::from(tile_height) - (i64::from(y0b) << level_no),
+            level_no + 1,
+        ),
     }
 }
 
@@ -214,6 +236,15 @@ pub(crate) struct PrecinctBand {
 /// Upper bound for the number of samples of one image (all components
 /// together), checked before any per-component allocation.
 pub(crate) const MAX_SAMPLES: u64 = 1 << 28;
+
+/// Upper bound on the number of precincts whose state is materialised for one
+/// tile. A hostile SIZ/COD pair (tiny precinct exponent over a large image) can
+/// otherwise turn a few dozen bytes into millions of `BTreeMap` entries before
+/// any packet is validated. Realistic DICOM streams use the default 15/15
+/// precincts (one precinct per resolution) or modest multi-precinct grids that
+/// stay far below this; the bound keeps worst-case precinct state around a few
+/// hundred MB instead of gigabytes.
+pub(crate) const MAX_PRECINCTS: u64 = 1 << 22;
 
 /// Validates an image area and returns it as a sample count.
 pub(crate) fn checked_area(width: u64, height: u64) -> Result<u64, String> {
@@ -365,6 +396,7 @@ impl Component {
             return Err("code-block size is not a power of two".into());
         }
         let mut global_index = 0usize;
+        let mut total_precincts = 0u64;
         for resolution in 0..=self.levels {
             let subbands = subband_geometries(
                 self.width,
@@ -387,6 +419,17 @@ impl Component {
                 .unwrap_or((15, 15));
             let precinct_info =
                 PrecinctInfo::new(resolution_geom, i32::from(px_exp), i32::from(py_exp))?;
+            // Bound the precinct state before allocating the BTreeMap: a
+            // malformed codestream must not be able to amplify a tiny header
+            // into hundreds of megabytes of empty precinct entries.
+            let precincts =
+                u64::from(precinct_info.count_x as u32) * u64::from(precinct_info.count_y as u32);
+            total_precincts = total_precincts
+                .checked_add(precincts)
+                .ok_or_else(|| "precinct count overflow".to_string())?;
+            if total_precincts > MAX_PRECINCTS {
+                return Err("precinct count exceeds the supported limit".into());
+            }
             let mut precinct_map: BTreeMap<i32, Vec<PrecinctBand>> = BTreeMap::new();
             for y in 0..precinct_info.count_y {
                 for x in 0..precinct_info.count_x {
@@ -507,6 +550,9 @@ impl PrecinctInfo {
             (ceil_div_pow2(x1, width_exp) - floor_div_pow2(resolution.x0, width_exp)).max(1);
         let count_y =
             (ceil_div_pow2(y1, height_exp) - floor_div_pow2(resolution.y0, height_exp)).max(1);
+        if u64::from(count_x as u32) * u64::from(count_y as u32) > MAX_PRECINCTS {
+            return Err("precinct count exceeds the supported limit".into());
+        }
         let left = floor_div_pow2(resolution.x0, width_exp) << width_exp;
         let top = floor_div_pow2(resolution.y0, height_exp) << height_exp;
         Ok(Self {
@@ -609,5 +655,32 @@ mod tests {
     fn precinct_exponent_beyond_the_standard_is_rejected() {
         let mut c = Component::new(0, 0, 0, 32, 32, 0, 8, false).unwrap();
         assert!(c.build_code_blocks(64, 64, Some(&[(16, 5)])).is_err());
+    }
+
+    /// A codestream may legally declare 32 decomposition levels; computing the
+    /// highest-resolution subband geometry must not overflow `i32` (regression
+    /// for a decode panic on a 1x1 SIZ with `decompositions = 32`).
+    #[test]
+    fn extreme_decomposition_levels_do_not_overflow() {
+        let bands = subband_geometries(8, 8, 0, 0, 32, 1);
+        assert_eq!(bands.len(), 3);
+        for band in bands {
+            assert!(band.band_x0 <= band.band_x1);
+            assert!(band.band_y0 <= band.band_y1);
+        }
+    }
+
+    #[test]
+    fn oversized_precinct_count_is_rejected_before_allocation() {
+        // 4096x4096 with precinct exponent 0 is ~16.7M precincts; this must be
+        // rejected by the geometry check before the BTreeMap is populated.
+        let geometry = ResolutionGeometry {
+            width: 4096,
+            height: 4096,
+            x0: 0,
+            y0: 0,
+        };
+        let error = PrecinctInfo::new(geometry, 0, 0).unwrap_err();
+        assert!(error.contains("precinct count"), "{error}");
     }
 }

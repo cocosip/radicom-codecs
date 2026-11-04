@@ -8,6 +8,14 @@ use crate::geometry::{CodeBlockSegment, Component};
 
 const TAG_TREE_UNKNOWN: i32 = 999;
 
+/// Upper bound on the number of packets enumerated for one tile. Packet count is
+/// `layers * sum(component precincts over resolutions)`; without this a hostile
+/// COD (many quality layers) combined with a large precinct grid would build a
+/// huge `Vec<PacketKey>` before any packet is parsed. The bound matches the
+/// precinct cap so a legal one-layer multi-precinct stream is never rejected
+/// merely by packet enumeration.
+pub(crate) const MAX_PACKETS: u64 = 1 << 22;
+
 #[derive(Debug, Clone)]
 pub(crate) struct TagTree {
     width: usize,
@@ -182,7 +190,7 @@ pub(crate) fn packet_order(
     components: &[Component],
     layer_count: u16,
     progression: u8,
-) -> Vec<PacketKey> {
+) -> Result<Vec<PacketKey>, String> {
     let max_res = max_resolutions(components);
     let max_precincts = (0..max_res)
         .map(|r| {
@@ -194,6 +202,23 @@ pub(crate) fn packet_order(
         })
         .max()
         .unwrap_or(0);
+    // Total packets is `layers * sum_{resolution,component} precincts` for every
+    // supported progression order (the loops only reorder the same key set), so
+    // the count can be checked analytically before any Vec is allocated.
+    let mut packets_per_layer = 0u64;
+    for resolution in 0..max_res {
+        for component in components {
+            packets_per_layer = packets_per_layer
+                .checked_add(precinct_count(component, resolution) as u64)
+                .ok_or_else(|| "packet count overflow".to_string())?;
+        }
+    }
+    let total_packets = packets_per_layer
+        .checked_mul(u64::from(layer_count))
+        .ok_or_else(|| "packet count overflow".to_string())?;
+    if total_packets > MAX_PACKETS {
+        return Err("packet count exceeds the supported limit".into());
+    }
     let mut packets = Vec::new();
     match progression {
         0 => {
@@ -287,7 +312,7 @@ pub(crate) fn packet_order(
         }
         _ => {}
     }
-    packets
+    Ok(packets)
 }
 
 fn floor_log2(value: u32) -> u32 {
@@ -364,7 +389,7 @@ pub(crate) fn encode_packets(
     if layer_count != 1 {
         return Err("the encoder currently emits a single quality layer".into());
     }
-    let order = packet_order(components, layer_count, progression);
+    let order = packet_order(components, layer_count, progression)?;
     let mut output = Vec::new();
     for key in order {
         let component = &mut components[key.component];
@@ -504,7 +529,7 @@ pub(crate) fn decode_packets(
     progression: u8,
     code_block_styles: &[u8],
 ) -> Result<(), String> {
-    let order = packet_order(components, layer_count, progression);
+    let order = packet_order(components, layer_count, progression)?;
     let mut states: Vec<HashMap<(i32, i32), PrecinctState>> =
         (0..components.len()).map(|_| HashMap::new()).collect();
     let mut offset = 0usize;
@@ -671,5 +696,19 @@ mod tests {
             let mut reader = BitReader::new_stuffed(&bytes);
             assert_eq!(decode_pass_count(&mut reader).unwrap(), count);
         }
+    }
+
+    #[test]
+    fn packet_count_over_cap_is_rejected_before_allocation() {
+        // 100 components x 6 resolutions = 600 packets per layer; 65535 layers
+        // is ~39M packets, far above the cap, so the Vec must not be built.
+        let planes: Vec<Vec<i32>> = (0..100).map(|_| vec![0i32; 4]).collect();
+        let mut components =
+            crate::codestream::build_components(&planes, 2, 2, 8, false, 5).unwrap();
+        for component in &mut components {
+            component.build_code_blocks(64, 64, None).unwrap();
+        }
+        let error = packet_order(&components, 65535, 0).unwrap_err();
+        assert!(error.contains("packet count"), "{error}");
     }
 }

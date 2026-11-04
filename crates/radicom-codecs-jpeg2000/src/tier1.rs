@@ -100,6 +100,14 @@ pub(crate) fn decode_code_block(
     if max_bit_plane < 0 {
         return Ok(vec![0; width * height]);
     }
+    // A crafted QCD exponent/guard pair can push the derived bit-plane depth
+    // past 30; `1i32 << bit_plane` would then overflow. Valid DICOM precision
+    // (<=16 bits) never approaches this, so reject as malformed instead.
+    if max_bit_plane >= 31 {
+        return Err(format!(
+            "code-block bit-plane depth {max_bit_plane} exceeds the supported 30-bit limit"
+        ));
+    }
     let mut decoder = Tier1Decoder::new(width, height, orientation, style);
     decoder.run(segments, max_bit_plane)?;
     Ok(decoder.finish())

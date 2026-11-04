@@ -407,20 +407,23 @@ pub(crate) fn encode_ht(
 /// codestreams refuse values that do not fit the stored precision; lossy
 /// reconstruction overshoot is clamped instead, because ringing is expected.
 fn align_precision(components: &mut [Component], layout: &Layout) -> Result<(), String> {
-    let precision = components[0].precision;
-    if precision == layout.bits_stored {
-        return Ok(());
-    }
     let lossy = components
         .iter()
         .any(|component| component.float_samples.is_some());
     let limit = 1i32 << (i32::from(layout.bits_stored) - 1);
     let clamp = |value: i32| value.clamp(-limit, limit - 1);
-    if layout.signed {
-        // Signed codestream samples are not level shifted, so a wider
-        // codestream precision is only a container width: no re-centring is
-        // needed, just a range check.
-        for component in components.iter_mut() {
+    // Each component may carry its own precision (SIZ stores per-component
+    // precision), so realign every plane against its own precision instead of
+    // assuming the first component's value applies to all.
+    for component in components.iter_mut() {
+        let precision = component.precision;
+        if precision == layout.bits_stored {
+            continue;
+        }
+        if layout.signed {
+            // Signed codestream samples are not level shifted, so a wider
+            // codestream precision is only a container width: no re-centring
+            // needed, just a range check.
             for sample in &mut component.samples {
                 if *sample < -limit || *sample >= limit {
                     if lossy {
@@ -432,21 +435,40 @@ fn align_precision(components: &mut [Component], layout: &Layout) -> Result<(), 
                     }
                 }
             }
-        }
-        return Ok(());
-    }
-    let shift = (1i32 << (i32::from(precision) - 1)) - limit;
-    for component in components.iter_mut() {
-        for sample in &mut component.samples {
-            let value = *sample + shift;
-            if value < -limit || value >= limit {
-                if lossy {
-                    *sample = clamp(value);
-                    continue;
+        } else {
+            let shift = (1i32 << (i32::from(precision) - 1)) - limit;
+            for sample in &mut component.samples {
+                let value = *sample + shift;
+                if value < -limit || value >= limit {
+                    if lossy {
+                        *sample = clamp(value);
+                        continue;
+                    }
+                    return Err("codestream samples do not fit the destination Bits Stored".into());
                 }
-                return Err("codestream samples do not fit the destination Bits Stored".into());
+                *sample = value;
             }
-            *sample = value;
+        }
+    }
+    Ok(())
+}
+
+/// Validates that the decoded component set matches the destination layout.
+/// Every component (not just the first) must agree, because SIZ carries
+/// per-component precision/signedness and a mismatch would otherwise decode
+/// into corrupted or clamped samples.
+fn validate_components(components: &[Component], layout: &Layout) -> Result<(), String> {
+    if components.len() != layout.components as usize {
+        return Err("codestream component count does not match destination".into());
+    }
+    for component in components {
+        if component.width as usize != layout.width
+            || component.height as usize != layout.height
+            || component.precision < layout.bits_stored
+            || u16::from(component.precision) > layout.bits_allocated
+            || component.signed != layout.signed
+        {
+            return Err("codestream layout does not match destination".into());
         }
     }
     Ok(())
@@ -458,18 +480,7 @@ pub(crate) fn decode_ht(
     expected_progression: Option<u8>,
 ) -> Result<Vec<u8>, String> {
     let mut components = ht_codestream::decode(data, expected_progression)?;
-    if components.len() != layout.components as usize {
-        return Err("codestream component count does not match destination".into());
-    }
-    let precision = components[0].precision;
-    if components[0].width as usize != layout.width
-        || components[0].height as usize != layout.height
-        || precision < layout.bits_stored
-        || u16::from(precision) > layout.bits_allocated
-        || components[0].signed != layout.signed
-    {
-        return Err("codestream layout does not match destination".into());
-    }
+    validate_components(&components, layout)?;
     align_precision(&mut components, layout)?;
     let planes: Vec<Vec<i32>> = components
         .iter()
@@ -479,18 +490,7 @@ pub(crate) fn decode_ht(
 }
 pub(crate) fn decode(layout: &Layout, data: &[u8]) -> Result<Vec<u8>, String> {
     let mut components = codestream::decode(data)?;
-    if components.len() != layout.components as usize {
-        return Err("codestream component count does not match destination".into());
-    }
-    let precision = components[0].precision;
-    if components[0].width as usize != layout.width
-        || components[0].height as usize != layout.height
-        || precision < layout.bits_stored
-        || u16::from(precision) > layout.bits_allocated
-        || components[0].signed != layout.signed
-    {
-        return Err("codestream layout does not match destination".into());
-    }
+    validate_components(&components, layout)?;
     align_precision(&mut components, layout)?;
     let planes: Vec<Vec<i32>> = components
         .iter()
@@ -709,5 +709,42 @@ mod tests {
         components[0].float_samples = None;
         components[0].samples = vec![40000, -40000];
         assert!(align_precision(&mut components, &layout).is_err());
+    }
+
+    #[test]
+    fn every_component_layout_is_validated() {
+        let mut layout = narrow_layout();
+        layout.components = 2;
+        let good = vec![
+            Component::new(0, 0, 0, 32, 8, 0, 12, false).unwrap(),
+            Component::new(1, 0, 0, 32, 8, 0, 12, false).unwrap(),
+        ];
+        assert!(validate_components(&good, &layout).is_ok());
+
+        let mut signed_mismatch = good.clone();
+        signed_mismatch[1].signed = true;
+        assert!(validate_components(&signed_mismatch, &layout).is_err());
+
+        let mut low_precision = good.clone();
+        low_precision[1].precision = 8; // below BitsStored (12)
+        assert!(validate_components(&low_precision, &layout).is_err());
+    }
+
+    #[test]
+    fn align_precision_uses_each_component_precision() {
+        let mut layout = narrow_layout();
+        layout.components = 2;
+        layout.width = 2;
+        layout.height = 1;
+        layout.frame_len = 4;
+        let mut components = vec![
+            Component::new(0, 0, 0, 2, 1, 0, 12, false).unwrap(), // == BitsStored
+            Component::new(1, 0, 0, 2, 1, 0, 16, false).unwrap(), // wider container
+        ];
+        components[0].samples = vec![0, 100];
+        components[1].samples = vec![-30720, -30719];
+        align_precision(&mut components, &layout).unwrap();
+        assert_eq!(components[0].samples, vec![0, 100]);
+        assert_eq!(components[1].samples, vec![0, 1]);
     }
 }

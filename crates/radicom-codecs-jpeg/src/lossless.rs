@@ -2,7 +2,7 @@
 
 use super::bit::{BitReader, BitWriter};
 use super::huffman::HuffmanTable;
-use super::marker::{Marker, MarkerReader, MarkerWriter};
+use super::marker::{check_trailing, Marker, MarkerReader, MarkerWriter};
 use super::sequential::FrameExpectation;
 
 const HUFFMAN_COUNTS: [u8; 16] = [0, 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -292,6 +292,7 @@ impl LosslessFrame {
                 other => return Err(format!("unexpected JPEG marker {other:?}")),
             }
         }
+        check_trailing(data, reader.position())?;
         let Some((width, height, precision, components, _)) = header else {
             return Err("missing JPEG SOF3".to_owned());
         };
@@ -376,6 +377,11 @@ fn decode_scan(
                 y == interval_start_row,
             );
             let category = huffman.decode(&mut bits)?;
+            // A P-bit lossless prediction difference can need category P+1 (e.g.
+            // an 8-bit sample predicted from a 510-valued neighborhood leaves a
+            // -510 difference), so the bound is the effective precision plus one;
+            // category 16 is the 16-bit special case reachable only at precision
+            // 16. Tightening this to `effective_precision` rejects valid streams.
             if category > effective_precision + 1 {
                 return Err(format!(
                     "JPEG lossless category {category} exceeds effective precision {effective_precision}"
@@ -1013,5 +1019,33 @@ mod tests {
             encoded[sos + offset] = id;
         }
         assert_eq!(decode_any(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn accepts_at_most_one_trailing_pad_byte() {
+        let frame = sample_frame(8, 1);
+        let encoded = frame.encode(1, 0, None).unwrap();
+        assert!(encoded.ends_with(&[0xffu8, 0xd9]), "stream must end in EOI");
+
+        // One 0x00 is the DICOM even-length pad and is accepted.
+        let mut padded = encoded.clone();
+        padded.push(0x00);
+        assert_eq!(decode_any(&padded).unwrap(), frame);
+
+        // Two trailing bytes (even zeros) is a spliced/over-padded stream.
+        let mut two = encoded.clone();
+        two.extend([0x00, 0x00]);
+        let error = decode_any(&two).unwrap_err();
+        assert!(error.contains("trailing"), "{error}");
+
+        // A single non-zero byte after EOI is garbage.
+        let mut garbage = encoded.clone();
+        garbage.push(0x01);
+        assert!(decode_any(&garbage).is_err());
+
+        // Zero then non-zero is also rejected.
+        let mut mixed = encoded.clone();
+        mixed.extend([0x00, 0x01]);
+        assert!(decode_any(&mixed).is_err());
     }
 }

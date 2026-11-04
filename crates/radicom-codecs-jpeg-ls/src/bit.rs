@@ -104,10 +104,12 @@ impl<'a> BitReader<'a> {
             }
         }
         if self.pos < self.data.len() {
-            // Writers may pad an entropy segment with zero bytes before the
-            // next marker (fo-dicom pads a fragment to an even length) and
-            // CharLS accepts a trailing 0x00 as well.
-            if self.data[self.pos..].iter().any(|byte| *byte != 0) {
+            // Writers may pad an entropy segment with a single zero byte before
+            // the next marker (fo-dicom pads a fragment to an even length) and
+            // CharLS accepts one trailing 0x00 as well. Anything longer, or a
+            // non-zero byte, is trailing entropy/data.
+            let trailing = &self.data[self.pos..];
+            if trailing.len() > 1 || trailing[0] != 0 {
                 return Err("trailing JPEG-LS entropy data".into());
             }
         }
@@ -170,6 +172,25 @@ mod tests {
     fn rejects_nonzero_padding_in_a_partially_consumed_ff_byte() {
         let mut reader = BitReader::new(&[255, 0]);
         assert!(reader.read_bit().unwrap());
+        assert!(reader.finish().is_err());
+    }
+
+    #[test]
+    fn permits_at_most_one_trailing_zero_byte() {
+        // A single 0x00 between entropy and the next marker is T.87 padding.
+        let mut writer = BitWriter::new();
+        writer.write_bits(0b1010_1010, 8).unwrap();
+        let mut one = writer.finish();
+        one.push(0);
+        let mut reader = BitReader::new(&one);
+        assert_eq!(reader.read_bits(8).unwrap(), 0b1010_1010);
+        reader.finish().unwrap();
+
+        // Two zero bytes are trailing data, not padding.
+        let mut two = one.clone();
+        two.push(0);
+        let mut reader = BitReader::new(&two);
+        let _ = reader.read_bits(8).unwrap();
         assert!(reader.finish().is_err());
     }
 }

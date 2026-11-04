@@ -15,8 +15,11 @@ impl RegularContext {
         }
     }
     pub(crate) fn k(&self) -> u8 {
+        // CharLS caps the Golomb parameter at 16 (constants.h). Evaluate the
+        // comparison in i64 so a crafted LSE/RESET stream cannot overflow
+        // `n << k` before the cap is reached.
         let mut k = 0;
-        while k < 31 && (self.n << k) < self.a {
+        while k < 16 && (i64::from(self.n) << k) < i64::from(self.a) {
             k += 1;
         }
         k
@@ -29,15 +32,17 @@ impl RegularContext {
         }
     }
     pub(crate) fn update(&mut self, e: i32, near: i32, reset: i32) {
-        self.a += e.abs();
-        self.b += e * (2 * near + 1);
+        // Saturating accumulation keeps a crafted stream from overflowing the
+        // i32 accumulators; valid streams stay far below these magnitudes.
+        self.a = self.a.saturating_add(e.abs());
+        self.b = self.b.saturating_add(e.saturating_mul(2 * near + 1));
         if self.n == reset {
             self.a >>= 1;
             self.b >>= 1;
             self.n >>= 1;
         }
-        self.n += 1;
-        if self.b + self.n <= 0 {
+        self.n = self.n.saturating_add(1);
+        if self.b.saturating_add(self.n) <= 0 {
             self.b += self.n;
             if self.b <= -self.n {
                 self.b = -self.n + 1
@@ -59,6 +64,32 @@ impl RegularContext {
         self.c
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A crafted LSE/RESET stream can inflate the adaptive statistics; the
+    /// Golomb parameter derivation must saturate/clamp instead of overflowing.
+    #[test]
+    fn extreme_statistics_do_not_overflow() {
+        let mut regular = RegularContext::new(65535);
+        regular.a = i32::MAX - 1;
+        regular.b = i32::MAX;
+        regular.n = 1_500_000_000;
+        assert!(regular.k() < 16);
+        regular.update(30000, 0, i32::MAX);
+        assert!(regular.k() < 16);
+
+        let mut run = RunContext::new(1, 65535);
+        run.a = i32::MAX - 1;
+        run.n = i32::MAX / 4;
+        run.nn = i32::MAX / 4;
+        assert!(run.k() < 16);
+        run.update(30000, i32::MAX - 1, i32::MAX);
+        assert!(run.k() < 16);
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RunContext {
     typ: i32,
@@ -76,10 +107,12 @@ impl RunContext {
         }
     }
     pub(crate) fn k(&self) -> u8 {
-        let temp = self.a + (self.n >> 1) * self.typ;
-        let mut nt = self.n;
+        // i64 with a CharLS-compatible k cap of 16: a crafted run context must
+        // not drive `nt <<= 1` into an i32 overflow or an unbounded loop.
+        let temp = i64::from(self.a) + i64::from(self.n >> 1) * i64::from(self.typ);
+        let mut nt = i64::from(self.n);
         let mut k = 0;
-        while nt < temp {
+        while k < 16 && nt < temp {
             nt <<= 1;
             k += 1;
         }
@@ -110,12 +143,14 @@ impl RunContext {
         if e < 0 {
             self.nn += 1
         }
-        self.a += (m + 1 - self.typ) >> 1;
+        self.a = self
+            .a
+            .saturating_add(m.saturating_add(1).saturating_sub(self.typ) >> 1);
         if self.n == reset {
             self.a >>= 1;
             self.n >>= 1;
             self.nn >>= 1
         }
-        self.n += 1
+        self.n = self.n.saturating_add(1)
     }
 }

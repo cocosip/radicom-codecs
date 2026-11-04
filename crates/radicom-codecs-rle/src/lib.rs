@@ -65,7 +65,10 @@ impl Codec for RleLosslessCodec {
         }
         let layout = RleLayout::from_pixel_data(src)
             .map_err(|message| operation_error("encode", None, message))?;
+        ensure_plausible_frame_count(src, &layout)
+            .map_err(|message| operation_error("encode", None, message))?;
         let mut encoded_frames = Vec::new();
+        let mut accumulated_bytes = 0usize;
         for frame_index in 0..src.number_of_frames() {
             let buffer = src
                 .get_frame(frame_index)
@@ -73,11 +76,27 @@ impl Codec for RleLosslessCodec {
             let bytes = buffer
                 .data()
                 .map_err(|error| operation_error("encode", Some(frame_index), error.to_string()))?;
-            encoded_frames.push((
-                frame_index,
-                encode_frame(&layout, bytes.as_ref())
-                    .map_err(|message| operation_error("encode", Some(frame_index), message))?,
-            ));
+            let encoded = encode_frame(&layout, bytes.as_ref())
+                .map_err(|message| operation_error("encode", Some(frame_index), message))?;
+            accumulated_bytes = accumulated_bytes
+                .checked_add(encoded.len())
+                .ok_or_else(|| {
+                    operation_error(
+                        "encode",
+                        Some(frame_index),
+                        "accumulated encoded output overflows usize",
+                    )
+                })?;
+            if accumulated_bytes > MAX_DECODED_BYTES {
+                return Err(operation_error(
+                    "encode",
+                    Some(frame_index),
+                    format!(
+                        "accumulated encoded output exceeds the {MAX_DECODED_BYTES}-byte limit"
+                    ),
+                ));
+            }
+            encoded_frames.push((frame_index, encoded));
         }
         for (frame_index, frame) in encoded_frames {
             dst.add_frame(frame)
@@ -132,7 +151,6 @@ impl Codec for RleLosslessCodec {
             dst.add_frame(frame)
                 .map_err(|error| operation_error("decode", Some(frame_index), error.to_string()))?;
         }
-        set_encapsulated_pixel_data_vr_to_ob(dst);
         Ok(())
     }
 }
@@ -166,6 +184,35 @@ fn ensure_params(params: &CodecParams, operation: &str) -> Result<(), Error> {
             "RLE Lossless accepts only CodecParams::None",
         ))
     }
+}
+
+/// Rejects a declared frame count the native source pixel data cannot hold,
+/// before the encode preflight trusts it. `NumberOfFrames` is untrusted
+/// metadata: a tiny pixel buffer declaring a huge count would otherwise make the
+/// encoder iterate one (>=64-byte) encoded frame per pixel byte and accumulate
+/// gigabytes. Returns `Ok(())` when the source buffer length is unknown, leaving
+/// the accumulated-size guard in `encode` as the bound.
+fn ensure_plausible_frame_count(src: &PixelDataRef<'_>, layout: &RleLayout) -> Result<(), String> {
+    let Some(DicomItem::Element(element)) = src.dataset().item(&Tag::PIXEL_DATA) else {
+        return Ok(());
+    };
+    let Some(buffer) = element.value().as_buffer() else {
+        return Ok(());
+    };
+    let max_frames = if layout.bit_packed {
+        // Single-bit frames share bytes, so the frame count is bounded by the
+        // total bit capacity divided by the bits in one frame (`pixel_count`).
+        buffer.size().saturating_mul(8) / (layout.pixel_count as u64)
+    } else {
+        buffer.size() / (layout.frame_length as u64)
+    };
+    let declared = u64::from(src.number_of_frames());
+    if declared > max_frames {
+        return Err(format!(
+            "declared NumberOfFrames {declared} exceeds the {max_frames} frames the native pixel data can hold"
+        ));
+    }
+    Ok(())
 }
 
 fn operation_error(operation: &str, frame: Option<u32>, message: impl Into<String>) -> Error {
@@ -421,6 +468,35 @@ mod tests {
         let result = RleLosslessCodec.decode(&source, &mut target, &CodecParams::None);
         assert!(result.is_err());
         assert!(!decoded.contains(&Tag::PIXEL_DATA));
+    }
+
+    #[test]
+    fn rejects_an_untrusted_frame_count_before_encoding() {
+        // A tiny native source must not let a huge `NumberOfFrames` drive the
+        // encode preflight into iterating/accumulating an encoded frame per
+        // pixel byte.
+        let mut raw = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            1,
+            1,
+            8,
+            1,
+            None,
+            1,
+        );
+        PixelData::create_new(&mut raw)
+            .unwrap()
+            .add_frame([7])
+            .unwrap();
+        raw.insert_str(Tag::NUMBER_OF_FRAMES, Vr::Is, u32::MAX.to_string());
+        let source = PixelDataRef::from_dataset(&raw).unwrap();
+        let mut compressed = dataset(syntaxes::RLE_LOSSLESS.clone(), 1, 1, 8, 1, None, 1);
+        let mut target = PixelData::create_new(&mut compressed).unwrap();
+        let error = RleLosslessCodec
+            .encode(&source, &mut target, &CodecParams::None)
+            .unwrap_err();
+        assert!(error.to_string().contains("NumberOfFrames"), "{error}");
+        assert!(!compressed.contains(&Tag::PIXEL_DATA));
     }
 
     #[test]
