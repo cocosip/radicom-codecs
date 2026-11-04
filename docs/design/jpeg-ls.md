@@ -174,18 +174,18 @@ The first release accepts the following source and destination layouts:
 
 `BitsAllocated` must be 8 or 16, `BitsStored <= BitsAllocated`, dimensions must
 be non-zero, `SamplesPerPixel` must be 1 or 3, and `PixelRepresentation` must
-be 0 or 1. PS3.5 Table 8.2.3-1 requires `PixelRepresentation` 0 for RGB,
-YBR_FULL and PALETTE COLOR, so signed samples are accepted only for
-MONOCHROME1/2. Samples are read in the native DICOM byte order already guaranteed by
+be 0 or 1. Signed samples are accepted for MONOCHROME1/2 and RGB. Samples are
+read in the native DICOM byte order already guaranteed by
 `PixelDataRef`. Signed samples preserve their `BitsStored` two's-complement
-bit patterns in the JPEG-LS stream, matching fo-dicom. No sample-value offset is
-applied. On decode the adapter sign-extends to `BitsAllocated`.
-For signed near-lossless encoding, each source value `s` must satisfy
-`-2^(b-1)+NEAR <= s <= 2^(b-1)-1-NEAR`, where `b = BitsStored`.
-Values outside that range are rejected before any frame is appended, because
-the unsigned JPEG-LS NEAR bound can otherwise cross the signed discontinuity.
-Error is measured in the signed sample domain, including transitions through
-zero.
+bit patterns in the JPEG-LS stream, matching fo-dicom/CharLS. No sample-value
+offset is applied. On decode the adapter sign-extends to `BitsAllocated`.
+Signed `YBR_FULL` and signed `PALETTE COLOR` stay rejected: the YBR chroma math
+is unsigned and a signed LUT index has no meaning.
+Near-lossless coding of signed samples happens in the unsigned wire domain:
+`NEAR` bounds the error of the bit patterns in `[0, MAXVAL]`, exactly like
+CharLS and fo-dicom.Codecs. A source value within `NEAR` of the signed limit can
+therefore cross the signed discontinuity; the codestream itself never leaves the
+container.
 
 On encode the adapter accepts `YBR_FULL` by converting each frame to full-range
 RGB before JPEG-LS coding, matching fo-dicom's `YbrFullToRgb` path. The
@@ -209,12 +209,13 @@ sample `p*factor/factor_max`). The Photometric Interpretation is unchanged, so a
 encoder always writes `0x11` factors because DICOM Pixel Data has no
 per-component sampling.
 
-`PALETTE COLOR` is accepted for one-sample index images of JPEG-LS Lossless
-only (Table 8.2.3-1, 8/16 `BitsAllocated`): the `.81` near-lossless syntax
-rejects it because NEAR would quantize the LUT indices. It is passed through
-exactly, with no colour conversion and no Photometric Interpretation rewrite;
-palette colour lookup tables and `PALETTE COLOR` with three samples are outside
-the codec. `YBR_FULL_422` remains
+`PALETTE COLOR` is accepted for one-sample index images on both JPEG-LS
+syntaxes and for 8/16 `BitsAllocated`. The index plane is coded like any
+one-sample image, with no colour conversion and no Photometric Interpretation
+rewrite, matching `fo-dicom.Codecs`/CharLS. `.81` may quantize the indices by up
+to `NEAR`; that is the caller's choice, and `NEAR = 0` stays exact. Palette
+colour lookup tables and `PALETTE COLOR` with three samples are outside the
+codec. `YBR_FULL_422` remains
 rejected because its subsampled native layout needs a separate unpacking
 contract. `YBR_PARTIAL_*`, YBR_ICT, YBR_RCT, CMYK, and unknown photometric values
 are rejected.
@@ -239,11 +240,10 @@ visible in DICOM metadata:
 - Planar RGB is normalized to interleaved bytes for the core and repacked only
   after a successful decode when the destination explicitly requires planar
   storage.
-- Signed MONOCHROME samples preserve the two's-complement bit pattern above.
-  Signed RGB, YBR_FULL and PALETTE COLOR are rejected on both paths because
-  Table 8.2.3-1 requires Pixel Representation 0 for those photometric
-  interpretations; the DICOM YBR-to-RGB conversion is also defined for unsigned
-  samples.
+- Signed MONOCHROME and RGB samples preserve the two's-complement bit pattern
+  above. Signed YBR_FULL and PALETTE COLOR stay rejected: the DICOM YBR-to-RGB
+  conversion is defined for unsigned samples and a signed LUT index has no
+  meaning.
 - The codestream's component count and sample precision must match the DICOM
   metadata before the output frame is appended.
 
@@ -570,8 +570,12 @@ Each stage ends with its own focused tests and keeps earlier stages passing.
 - One and three components, interleaved and planar RGB, 8/16 `BitsAllocated`,
   non-byte-aligned `BitsStored`, signed bit preservation/sign extension, and multi-frame order.
 - PALETTE COLOR index images with 8- and 16-bit allocation and `BitsStored` in
-  `2..=16` round-trip exactly with an unchanged Photometric Interpretation;
+  `2..=16` round-trip exactly with an unchanged Photometric Interpretation on
+  both syntaxes, including `.81` with `NEAR = 0` and with `NEAR > 0`;
   three-sample PALETTE COLOR is rejected on encode and decode.
+- Signed RGB preserves its bit patterns through a lossless round trip and keeps
+  `PixelRepresentation = 1`; signed near-lossless samples encode without an
+  extra headroom check.
 - A `YBR_FULL`-labelled stream decodes to converted RGB samples labelled `RGB`,
   and an `RGB`-labelled stream decodes without conversion.
 - A sub-sampled codestream decodes to a full-resolution frame with three samples
@@ -679,7 +683,8 @@ successfully decodes Rust output in both directions for the supported layouts.
 - Fragments with 64 non-zero bytes after EOI decode to the original samples,
   while the same stream truncated before EOI still fails. `PALETTE COLOR`
   index images round-trip exactly for 8-bit and for 16-bit allocation with
-  `BitsStored` 2/8/12/16 with an unchanged Photometric Interpretation, and
+  `BitsStored` 2/8/12/16 with an unchanged Photometric Interpretation on `.80`
+  and on `.81`, and
   `PALETTE COLOR` with three samples is rejected on both paths. A
   `YBR_FULL`-labelled stream decodes to the same converted RGB samples as the
   encode path, and an `RGB`-labelled stream is not converted.

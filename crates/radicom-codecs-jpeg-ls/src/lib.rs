@@ -184,17 +184,6 @@ fn operate(
             ));
         }
         let layout = Layout::destination(dst).map_err(|m| error(codec, "decode", m))?;
-        // jpeg-ls.md §5: the near-lossless syntax rejects PALETTE COLOR even when
-        // NEAR is 0, because NEAR would quantize the LUT indices.
-        if syntax.uid() == syntaxes::JPEG_LS_NEAR_LOSSLESS.uid()
-            && layout.pi == PhotometricInterpretation::PaletteColor
-        {
-            return Err(error(
-                codec,
-                "decode",
-                "PALETTE COLOR requires lossless JPEG-LS (.80)",
-            ));
-        }
         // The compressed dataset's PI describes its samples. A YBR_FULL stream is
         // converted to RGB exactly like the encode path converts YBR input, so the
         // output samples and the rewritten PI agree (PS3.5 Table 8.2.3-1 note 3).
@@ -259,17 +248,6 @@ fn operate(
                 codec,
                 "encode",
                 "source and destination pixel layouts differ",
-            ));
-        }
-        // jpeg-ls.md §5: the near-lossless syntax rejects PALETTE COLOR even when
-        // NEAR is 0, because NEAR would quantize the LUT indices.
-        if syntax.uid() == syntaxes::JPEG_LS_NEAR_LOSSLESS.uid()
-            && layout.pi == PhotometricInterpretation::PaletteColor
-        {
-            return Err(error(
-                codec,
-                "encode",
-                "PALETTE COLOR requires lossless JPEG-LS (.80)",
             ));
         }
         let mut frames = Vec::new();
@@ -959,7 +937,38 @@ mod facade_tests {
     }
 
     #[test]
-    fn near_lossless_palette_color_is_rejected_but_lossless_palette_works() {
+    fn signed_rgb_lossless_round_trips() {
+        // Signed RGB travels as its wire bit patterns; the samples and the PI
+        // come back unchanged.
+        let raw: Vec<u8> = (0..4 * 3 * 3).map(|i| (i * 37 + 129) as u8).collect();
+        let mut source = ds(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            4,
+            3,
+            8,
+            3,
+            1,
+            "RGB",
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&raw)
+            .unwrap();
+        let compressed = encode_stream(&source);
+        let decoded = decode_stream(&compressed);
+        assert_eq!(frame_bytes(&decoded), raw);
+        assert_eq!(
+            decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "RGB"
+        );
+        assert_eq!(
+            decoded.get_at::<u16>(Tag::PIXEL_REPRESENTATION, 0).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn near_lossless_palette_color_round_trips_on_both_paths() {
         const PAL: &[u8] = &[0, 1, 2, 3];
         let mut source = ds(
             syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
@@ -988,8 +997,8 @@ mod facade_tests {
             "lossless (.80) palette still round-trips"
         );
 
-        // `.81` must reject PALETTE COLOR even when NEAR is zero: the syntax is
-        // near-lossless, so LUT indices may not be quantized (jpeg-ls.md §5).
+        // `.81` accepts PALETTE COLOR like fo-dicom.Codecs: the index plane is
+        // coded as a one-sample image. NEAR=0 stays exact.
         let params = CodecParams::JpegLs(JpegLsParams {
             near_lossless: 0,
             ..Default::default()
@@ -997,32 +1006,37 @@ mod facade_tests {
         let mut target = source.clone();
         target.set_transfer_syntax(syntaxes::JPEG_LS_NEAR_LOSSLESS.clone());
         target.remove(Tag::PIXEL_DATA);
-        let error = JpegLsNearLosslessCodec
+        JpegLsNearLosslessCodec
             .encode(
                 &PixelDataRef::from_dataset(&source).unwrap(),
                 &mut PixelData::create_new(&mut target).unwrap(),
                 &params,
             )
-            .unwrap_err();
-        assert!(error.to_string().contains("PALETTE COLOR"), "{error}");
-        assert!(!target.contains(&Tag::PIXEL_DATA));
+            .unwrap();
+        assert_eq!(
+            target.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "PALETTE COLOR"
+        );
 
-        // The decode side enforces the same rule: a `.81`-labelled palette
-        // stream is rejected before any frame is appended.
-        let mut relabeled = compressed.clone();
+        // The decode side follows the same rule: a `.81`-labelled palette stream
+        // decodes into a palette destination.
+        let mut relabeled = target.clone();
         relabeled.set_transfer_syntax(syntaxes::JPEG_LS_NEAR_LOSSLESS.clone());
         let mut decoded = relabeled.clone();
         decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
         decoded.remove(Tag::PIXEL_DATA);
-        let error = JpegLsNearLosslessCodec
+        JpegLsNearLosslessCodec
             .decode(
                 &PixelDataRef::from_dataset(&relabeled).unwrap(),
                 &mut PixelData::create_new(&mut decoded).unwrap(),
                 &JpegLsNearLosslessCodec.default_params(),
             )
-            .unwrap_err();
-        assert!(error.to_string().contains("PALETTE COLOR"), "{error}");
-        assert!(!decoded.contains(&Tag::PIXEL_DATA));
+            .unwrap();
+        assert_eq!(frame_bytes(&decoded), PAL.to_vec());
+        assert_eq!(
+            decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "PALETTE COLOR"
+        );
     }
 
     #[test]

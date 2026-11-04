@@ -88,14 +88,12 @@ impl Layout {
         if rep == 1
             && matches!(
                 pi,
-                PhotometricInterpretation::YbrFull
-                    | PhotometricInterpretation::Rgb
-                    | PhotometricInterpretation::PaletteColor
+                PhotometricInterpretation::YbrFull | PhotometricInterpretation::PaletteColor
             )
         {
-            // PS3.5 Table 8.2.3-1 requires Pixel Representation 0 for the
-            // colour PIs, so their samples are never sign extended.
-            return Err("signed RGB, YBR_FULL and PALETTE COLOR samples are unsupported".into());
+            // YBR chroma math is unsigned, and a signed LUT index has no meaning.
+            // Signed RGB/MONOCHROME samples travel as their wire bit patterns.
+            return Err("signed YBR_FULL and PALETTE COLOR samples are unsupported".into());
         }
         if components == 1 && planar != 0 {
             return Err("monochrome cannot be planar".into());
@@ -195,22 +193,10 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
     if near > layout.maxval() / 2 {
         return Err("NEAR exceeds precision".into());
     }
-    if layout.signed && near > 0 {
-        let sign = 1i32 << (layout.bits_stored - 1);
-        let lower = -sign + i32::from(near);
-        let upper = sign - 1 - i32::from(near);
-        if samples.iter().any(|&value| {
-            let signed = (i32::from(value) ^ sign) - sign;
-            signed < lower || signed > upper
-        }) {
-            return Err("signed samples must remain NEAR away from the signed limits".into());
-        }
-    }
-    if near > 0 && layout.pi == PhotometricInterpretation::PaletteColor {
-        // PS3.5 Table 8.2.3-1 permits PALETTE COLOR only for JPEG-LS Lossless;
-        // NEAR>0 would quantize the LUT indices.
-        return Err("PALETTE COLOR requires lossless JPEG-LS (NEAR=0)".into());
-    }
+    // Near-lossless on signed samples needs no extra guard: the codec works on
+    // the unsigned wire patterns in [0, MAXVAL], so the reconstruction never
+    // leaves the container. The signed *interpretation* of a value within NEAR
+    // of the signed limit can jump, exactly like CharLS and fo-dicom.Codecs.
     let ilv = resolve_interleave(layout, p.interleave_mode)?;
     let color_transformation =
         u8::try_from(p.color_transformation).map_err(|_| "unknown JPEG-LS color transformation")?;
@@ -664,38 +650,33 @@ mod tests {
     }
 
     #[test]
-    fn signed_near_lossless_checks_signed_extrema_before_encoding() {
+    fn signed_near_lossless_encodes_extreme_samples() {
+        // Signed data travels as unsigned wire patterns, so NEAR quantizes in
+        // [0, MAXVAL] and no sample needs headroom around the signed limits.
         let mut layout = mono8();
         layout.signed = true;
         let params = JpegLsParams {
             near_lossless: 3,
             ..Default::default()
         };
-        for raw in [128, 129, 130, 125, 126, 127] {
-            assert!(encode(&layout, &[raw], &params).is_err(), "sample={raw}");
-        }
-        for raw in [131, 255, 0, 124] {
+        for raw in [0u8, 1, 124, 125, 126, 127, 128, 129, 130, 131, 255] {
             assert!(encode(&layout, &[raw], &params).is_ok(), "sample={raw}");
         }
     }
 
     #[test]
-    fn near_lossless_rejects_palette_color() {
-        // PS3.5 Table 8.2.3-1 allows PALETTE COLOR only for JPEG-LS Lossless
-        // (.80); a NEAR>0 codestream would quantize LUT indices.
+    fn near_lossless_palette_color_round_trips() {
+        // The LUT index plane is coded like any one-sample image. NEAR can
+        // quantize the indices, which matches fo-dicom.Codecs/CharLS.
         let mut layout = mono8();
         layout.pi = PhotometricInterpretation::PaletteColor;
-        let error = encode(
-            &layout,
-            &[7],
-            &JpegLsParams {
-                near_lossless: 3,
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(error.contains("PALETTE COLOR"), "{error}");
-        // Lossless palette coding is the only conforming combination.
+        let params = JpegLsParams {
+            near_lossless: 3,
+            ..Default::default()
+        };
+        let codestream = encode(&layout, &[7], &params).unwrap();
+        let decoded = decode(&layout, &codestream, &params, None, false).unwrap();
+        assert!(decoded[0].abs_diff(7) <= 3, "decoded {}", decoded[0]);
         assert_eq!(
             decode(
                 &layout,
@@ -743,16 +724,21 @@ mod tests {
     }
 
     #[test]
-    fn signed_rgb_and_palette_color_are_rejected_at_layout_validation() {
-        // PS3.5 Table 8.2.3-1 requires Pixel Representation 0 for RGB and
-        // PALETTE COLOR, like YBR_FULL.
+    fn signed_rgb_is_accepted_but_signed_palette_and_ybr_are_rejected() {
+        // Signed RGB travels as its two's-complement bit patterns, like the
+        // native reference codec. A signed LUT index and signed YBR chroma math
+        // have no meaning, so those stay rejected.
+        assert!(Layout::values(1, 1, 8, 8, 3, 0, 1, Some(PhotometricInterpretation::Rgb)).is_ok());
         for (pi, components) in [
-            (PhotometricInterpretation::Rgb, 3u16),
-            (PhotometricInterpretation::PaletteColor, 1),
+            (PhotometricInterpretation::PaletteColor, 1u16),
+            (PhotometricInterpretation::YbrFull, 3),
         ] {
             let error = Layout::values(1, 1, 8, 8, components, 0, 1, Some(pi)).unwrap_err();
             assert!(error.contains("signed"), "{pi:?}: {error}");
-            assert!(Layout::values(1, 1, 8, 8, components, 0, 0, Some(pi)).is_ok());
+            assert!(
+                Layout::values(1, 1, 8, 8, components, 0, 0, Some(pi)).is_ok(),
+                "{pi:?}"
+            );
         }
     }
 
