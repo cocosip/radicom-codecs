@@ -112,7 +112,12 @@ pub(crate) fn encode(
     }
 
     let (steps, encoded_steps, quant_style) = if reversible {
-        let step_bytes = reversible_steps(precision, levels as u8);
+        // OpenJPH's default lossless table (and the CAP `Ccap` magnitude bound)
+        // reserves two extra bit-planes on top of the component precision: one
+        // for the reversible colour transform's U/V and one for 5/3 gain.
+        // Without the headroom the cleanup pass drops the high bits of any
+        // coefficient that exceeds the nominal range.
+        let step_bytes = reversible_steps(precision.saturating_add(2), levels as u8);
         let steps: Vec<QStep> = step_bytes
             .iter()
             .map(|&byte| QStep {

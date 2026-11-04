@@ -86,14 +86,15 @@ lossless), 0x000A (16-bit lossless) and 0x002A (16-bit lossy) values.
 
 `decompositions` selects the DWT level count (0..=32, default 5).
 `employ_color_transform` applies RCT for reversible RGB and ICT for irreversible
-RGB when there are exactly three components. The codec `default_params()`
-enables it for fo-dicom/OpenJPH parity. `HtJ2kParams::default()` in radicom
-0.1.0 still has it false; the accompanying core fix changes that default to
-true, and until that release callers should use `default_params()` (or set the
-flag explicitly) when MCT is required. With it enabled, the encoded dataset is
-labelled `YBR_RCT` (`.201`/`.202`) or `YBR_ICT` (`.203`), as PS3.5 requires for
-a codestream whose MCT flag is set; decoding converts back and labels the
-native dataset `RGB`. `.202` forces
+RGB when there are exactly three components. The codec `default_params()` enables
+it, matching the native fo-dicom.Codecs (OpenJPH) encoder, which turns the colour
+transform on whenever there is more than one component. With it enabled the
+encoded dataset is labelled `YBR_RCT` (`.201`/`.202`) or `YBR_ICT` (`.203`), as
+PS3.5 requires for a codestream whose MCT flag is set; decoding converts back and
+labels the native dataset `RGB`. The reversible path writes its step table with
+two reserved bit-planes (`precision + 2`, the same magnitude bound the CAP marker
+advertises), which covers the extra range the RCT and the 5/3 gain introduce.
+`.202` forces
 RPCL and validates it on decode; `.201` and `.203` honour the requested
 progression order when it is LRCP/RLCP/RPCL, with LRCP as the default, and
 reject PCRL/CPRL. `.203` uses OpenJPH's default scalar-expounded steps

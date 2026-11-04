@@ -46,11 +46,12 @@ pub(crate) fn subband_count(levels: u8) -> usize {
 }
 
 /// Default irreversible step sizes: one per subband, `1 / norm`, multiplied by
-/// `2^shift`. `shift == 0` is the near-lossless default; larger shifts trade
+/// `scale`. `scale == 1` is the near-lossless default; larger scales trade
 /// bit-planes for size, which is how the classic encoder implements `rate`.
-pub(crate) fn irreversible_steps(levels: u8, shift: u8) -> Vec<f64> {
+/// The scale is continuous because the QCD carries an 11-bit mantissa.
+pub(crate) fn irreversible_steps(levels: u8, scale: f64) -> Vec<f64> {
     let count = subband_count(levels);
-    let scale = 2f64.powi(i32::from(shift));
+    let scale = scale.max(f64::MIN_POSITIVE);
     let mut steps = Vec::with_capacity(count);
     for index in 0..count {
         let resolution = if index == 0 {

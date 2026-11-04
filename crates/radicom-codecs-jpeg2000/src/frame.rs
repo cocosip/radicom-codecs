@@ -312,7 +312,9 @@ fn is_supported(pi: PhotometricInterpretation, components: u8) -> bool {
     match components {
         1 => matches!(
             pi,
-            PhotometricInterpretation::Monochrome1 | PhotometricInterpretation::Monochrome2
+            PhotometricInterpretation::Monochrome1
+                | PhotometricInterpretation::Monochrome2
+                | PhotometricInterpretation::PaletteColor
         ),
         3 => matches!(
             pi,
@@ -359,7 +361,7 @@ pub(crate) fn encode(
     raw: &[u8],
     reversible: bool,
     mct: bool,
-    quant_shift: u8,
+    quant_scale: f64,
 ) -> Result<Vec<u8>, String> {
     if matches!(
         layout.pi,
@@ -376,7 +378,7 @@ pub(crate) fn encode(
         layout.signed,
         codestream::DEFAULT_LEVELS,
     )?;
-    codestream::encode_with_mct_scaled(&mut components, reversible, mct, quant_shift)
+    codestream::encode_with_mct_scaled(&mut components, reversible, mct, quant_scale)
 }
 
 pub(crate) fn encode_ht(

@@ -137,8 +137,9 @@ fn progression_code(order: ProgressionOrder) -> u8 {
 }
 
 fn ht_params(irreversible: bool, progression_order: ProgressionOrder) -> CodecParams {
-    // The codec default enables MCT so RGB output matches fo-dicom/OpenJPH.
-    // `HtJ2kParams::default()` keeps it false; see docs/design/htj2k.md.
+    // fo-dicom.Codecs (OpenJPH) enables the colour transform whenever there is
+    // more than one component, so the same default keeps the sizes and the
+    // reconstructed samples aligned with the native reference.
     CodecParams::HtJpeg2000(HtJ2kParams {
         irreversible,
         employ_color_transform: true,
@@ -417,42 +418,63 @@ fn operate(
             let bytes = b
                 .data()
                 .map_err(|e| error(codec, "encode", format!("frame {i}: {e}")))?;
-            // `rate` is the target compression ratio for the irreversible path.
-            // The encoder reaches it by widening the quantization step, which
-            // drops bit-planes; the codestream stays a single standard layer.
+            // `rate` is the target compression ratio for the irreversible path:
+            // the payload may occupy `1 / rate` of the stored pixel data. The
+            // baseline files land 10% over that budget because OpenJPEG's rate
+            // allocator works in whole truncation points.
             let target = if encode_reversible || p.rate == 0 {
                 None
             } else {
-                Some((bytes.as_ref().len() as u64 / u64::from(p.rate)).max(1))
+                Some((bytes.as_ref().len() as f64 / f64::from(p.rate)).max(1.0))
             };
-            let mut quant_shift = 0u8;
-            let mut encoded = frame::encode(
-                &layout,
-                bytes.as_ref(),
-                encode_reversible,
-                apply_mct,
-                quant_shift,
-            )
-            .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?;
-            if let Some(target) = target {
-                // Each extra step halves the retained bit-planes, so estimate
-                // the jump from the observed overshoot and correct at most
-                // twice more: quantization is not exactly logarithmic.
-                for _ in 0..3 {
-                    if encoded.len() as u64 <= target || quant_shift >= 24 {
-                        break;
-                    }
-                    let overshoot = (encoded.len() as f64 / target as f64).max(1.0);
-                    let jump = overshoot.log2().ceil().clamp(1.0, 8.0) as u8;
-                    quant_shift = (quant_shift + jump).min(24);
-                    encoded = frame::encode(
-                        &layout,
-                        bytes.as_ref(),
-                        encode_reversible,
-                        apply_mct,
-                        quant_shift,
-                    )
+            let mut encoded =
+                frame::encode(&layout, bytes.as_ref(), encode_reversible, apply_mct, 1.0)
                     .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?;
+            if let Some(target) = target {
+                if encoded.len() as f64 > target {
+                    // The quantization step is continuous (`QCD` carries an
+                    // 11-bit mantissa), so bisect on log2(scale) instead of
+                    // dropping whole bit-planes: dropping a bit-plane halves the
+                    // payload and overshoots the requested ratio by up to 2x.
+                    let mut floor = 0.0f64;
+                    let mut ceiling: Option<f64> = None;
+                    let mut log = (encoded.len() as f64 / target).log2().max(0.5);
+                    let mut best: Option<Vec<u8>> = None;
+                    let mut smallest = Vec::new();
+                    for _ in 0..14 {
+                        let data = frame::encode(
+                            &layout,
+                            bytes.as_ref(),
+                            encode_reversible,
+                            apply_mct,
+                            2f64.powf(log),
+                        )
+                        .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?;
+                        let size = data.len() as f64;
+                        if size <= target {
+                            let close = size >= target * 0.98;
+                            best = Some(data);
+                            ceiling = Some(log);
+                            if close {
+                                break;
+                            }
+                        } else {
+                            floor = log;
+                            smallest = data;
+                        }
+                        log = match ceiling {
+                            Some(ceiling) => (floor + ceiling) / 2.0,
+                            None => floor + (size / target).log2().max(0.5),
+                        };
+                    }
+                    // When the target is below the codestream floor (tiny frames)
+                    // no scale fits, so keep the coarsest attempt instead of the
+                    // unquantized one.
+                    if let Some(best) = best {
+                        encoded = best;
+                    } else if !smallest.is_empty() {
+                        encoded = smallest;
+                    }
                 }
             }
             frames.push(encoded);
@@ -738,6 +760,32 @@ mod facade_tests {
             .data()
             .unwrap()
             .to_vec()
+    }
+
+    #[test]
+    fn palette_color_lossless_round_trips_indices() {
+        // The LUT index plane is a plain one-component image: no colour
+        // transform, and the destination keeps PALETTE COLOR.
+        let raw: Vec<u8> = (0..48).map(|i| ((i * 7) % 251) as u8).collect();
+        let mut source = ds(8, 6, 8, 1, 0, "PALETTE COLOR");
+        let decoded = round_trip(&Jpeg2000LosslessCodec, &mut source, &raw);
+        assert_eq!(samples(&decoded), raw);
+        assert_eq!(
+            decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "PALETTE COLOR"
+        );
+    }
+
+    #[test]
+    fn palette_color_htj2k_lossless_round_trips_indices() {
+        let raw: Vec<u8> = (0..48).map(|i| ((i * 11) % 251) as u8).collect();
+        let mut source = ds(8, 6, 8, 1, 0, "PALETTE COLOR");
+        let decoded = round_trip(&HtJpeg2000LosslessCodec, &mut source, &raw);
+        assert_eq!(samples(&decoded), raw);
+        assert_eq!(
+            decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "PALETTE COLOR"
+        );
     }
 
     #[test]
@@ -1127,6 +1175,22 @@ mod facade_tests {
                 _ => panic!("wrong default parameter family"),
             }
         }
+    }
+
+    #[test]
+    fn ht_rgb_lossless_round_trips_high_chroma_exactly() {
+        // Chroma extremes push the reversible transform's U/V past the nominal
+        // component range, which is what the two reserved bit-planes cover.
+        let raw: Vec<u8> = (0..64 * 48 * 3)
+            .map(|index| match index % 3 {
+                0 => (index * 37 % 256) as u8,
+                1 => (index * 91 % 256) as u8,
+                _ => (index * 131 % 256) as u8,
+            })
+            .collect();
+        let mut source = ds(64, 48, 8, 3, 0, "RGB");
+        let decoded = round_trip(&HtJpeg2000LosslessCodec, &mut source, &raw);
+        assert_eq!(samples(&decoded), raw);
     }
 
     #[test]

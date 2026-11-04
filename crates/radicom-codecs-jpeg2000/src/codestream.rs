@@ -48,18 +48,18 @@ pub(crate) fn encode_with_mct(
     reversible: bool,
     mct: bool,
 ) -> Result<Vec<u8>, String> {
-    encode_with_precincts(components, reversible, None, mct, 0)
+    encode_with_precincts(components, reversible, None, mct, 1.0)
 }
 
 /// Encodes one tile with the irreversible quantization steps scaled by
-/// `2^quant_shift`, which is how `rate` reaches a smaller codestream.
+/// `quant_scale`, which is how `rate` reaches a smaller codestream.
 pub(crate) fn encode_with_mct_scaled(
     components: &mut [Component],
     reversible: bool,
     mct: bool,
-    quant_shift: u8,
+    quant_scale: f64,
 ) -> Result<Vec<u8>, String> {
-    encode_with_precincts(components, reversible, None, mct, quant_shift)
+    encode_with_precincts(components, reversible, None, mct, quant_scale)
 }
 
 /// Encodes one tile, optionally with explicit precinct exponents per resolution.
@@ -68,7 +68,7 @@ pub(crate) fn encode_with_precincts(
     reversible: bool,
     precincts: Option<&[(u8, u8)]>,
     mct: bool,
-    quant_shift: u8,
+    quant_scale: f64,
 ) -> Result<Vec<u8>, String> {
     if components.is_empty() {
         return Err("no components to encode".into());
@@ -144,7 +144,7 @@ pub(crate) fn encode_with_precincts(
                 .collect(),
         }
     } else {
-        let steps = irreversible_steps(levels as u8, quant_shift);
+        let steps = irreversible_steps(levels as u8, quant_scale);
         Quantization {
             guard_bits: GUARD_BITS,
             style: 2,
@@ -705,7 +705,7 @@ mod tests {
         let mut components =
             build_components(&samples, width as i32, height as i32, 8, false, 5).unwrap();
         let codestream =
-            encode_with_precincts(&mut components, true, Some(&precincts), false, 0).unwrap();
+            encode_with_precincts(&mut components, true, Some(&precincts), false, 1.0).unwrap();
         let decoded = decode(&codestream).unwrap();
         assert_eq!(decoded[0].samples, samples[0]);
         let (header, _) = MainHeader::parse(&codestream).unwrap();
