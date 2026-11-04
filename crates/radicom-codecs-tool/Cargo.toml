@@ -7,6 +7,8 @@ rust-version.workspace = true
 license-file.workspace = true
 readme = "README.md"
 repository.workspace = true
+# Internal debugging/utility CLI; distributed via `cargo install --path`, never crates.io.
+publish = false
 
 [[bin]]
 name = "radicom-compress"

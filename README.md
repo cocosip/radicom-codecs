@@ -87,10 +87,11 @@ Rust 1.89 or newer. No C/C++ toolchain, CMake or native codec library is require
 ## CLI
 
 `radicom-compress` writes compressed DICOM copies for any subset of the twelve
-transfer syntaxes:
+transfer syntaxes. It is an internal debugging/utility CLI and is not published
+to crates.io; install it from the repository:
 
 ```powershell
-cargo install radicom-codecs-tool
+cargo install --path crates/radicom-codecs-tool
 radicom-compress study.dcm --output-dir out --format j2k_lossless
 ```
 

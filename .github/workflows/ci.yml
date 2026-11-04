@@ -85,7 +85,7 @@ jobs:
       # `cargo package` cannot resolve our own unpublished path deps.
       - name: Check publishable metadata
         run: |
-          for pkg in radicom-codecs-rle radicom-codecs-jpeg radicom-codecs-jpeg-ls radicom-codecs-jpeg2000 radicom-codecs radicom-codecs-tool; do
+          for pkg in radicom-codecs-rle radicom-codecs-jpeg radicom-codecs-jpeg-ls radicom-codecs-jpeg2000 radicom-codecs; do
             echo "::group::$pkg"
             cargo package -p "$pkg" --list
             echo "::endgroup::"
@@ -94,7 +94,7 @@ jobs:
       # The LICENSE and README must travel with every published crate.
       - name: Every crate ships LICENSE and README
         run: |
-          for pkg in radicom-codecs-rle radicom-codecs-jpeg radicom-codecs-jpeg-ls radicom-codecs-jpeg2000 radicom-codecs radicom-codecs-tool; do
+          for pkg in radicom-codecs-rle radicom-codecs-jpeg radicom-codecs-jpeg-ls radicom-codecs-jpeg2000 radicom-codecs; do
             files=$(cargo package -p "$pkg" --list | tr -d '\r')
             for f in LICENSE README.md; do
               if ! printf '%s\n' "$files" | grep -qx "$f"; then

@@ -5,7 +5,7 @@ Publishing is **tag-driven**. Pushing a `v<version>` tag is the only trigger;
 and `.github/workflows/release.yml`).
 
 The workspace carries **one version** in `[workspace.package]` (`Cargo.toml`) and
-repeats it as literal pins under `[workspace.dependencies]`. The six published
+repeats it as literal pins under `[workspace.dependencies]`. The five published
 crates are:
 
 | Order | Crate | Notes |
@@ -15,7 +15,11 @@ crates are:
 | 3 | `radicom-codecs-jpeg-ls` | depends only on `radicom` |
 | 4 | `radicom-codecs-jpeg2000` | depends only on `radicom` |
 | 5 | `radicom-codecs` | facade; depends on the four families |
-| 6 | `radicom-codecs-tool` | ships the `radicom-compress` binary; depends on the facade |
+
+`radicom-codecs-tool` (the `radicom-compress` CLI) is an internal debugging
+utility and is `publish = false`: it is installed from the repository
+(`cargo install --path crates/radicom-codecs-tool`) and is never a crates.io
+release artifact.
 
 The first release is **`0.1.0`**, matching the published `radicom = "0.1.0"` core
 crate it depends on. `radicom-codecs` is not yet on crates.io, so `0.1.0` is the
@@ -25,7 +29,7 @@ initial version.
 
 - Push access to `cocosip/radicom-codecs`.
 - Repository secret **`CARGO_REGISTRY_TOKEN`**: a crates.io API token allowed to
-  publish. On the very first release the six crate *names* do not exist yet; the
+  publish. On the very first release the five crate *names* do not exist yet; the
   token owner creates them on first publish.
 - The `radicom` core version the workspace depends on is already on crates.io
   (`cargo search radicom`). The release build resolves it from the registry, not
@@ -57,7 +61,7 @@ cargo test --workspace --all-features
 # `--list` is used because before the first release a crate's own path deps are
 # not on crates.io yet, so a full `cargo package` cannot resolve them.
 foreach ($pkg in 'radicom-codecs-rle','radicom-codecs-jpeg','radicom-codecs-jpeg-ls',
-                 'radicom-codecs-jpeg2000','radicom-codecs','radicom-codecs-tool') {
+                 'radicom-codecs-jpeg2000','radicom-codecs') {
     cargo package -p $pkg --list
 }
 ```
@@ -72,11 +76,11 @@ git push origin v0.1.0
 What `.github/workflows/release.yml` then does:
 
 1. **verify-tag** — the tag must equal every publishable crate's version and the
-   publishable set must be exactly the six crates above, so a newly added crate
+   publishable set must be exactly the five crates above, so a newly added crate
    can never be left unpublished.
 2. **test / msrv** — re-runs fmt, clippy (default + all features), tests (default
    + all features), docs, the packaged-files check, and the MSRV build.
-3. **publish** — publishes the six crates in dependency order. It is idempotent:
+3. **publish** — publishes the five crates in dependency order. It is idempotent:
    any version already on crates.io is skipped, and a fresh crate is retried for
    index propagation, so a partially failed run is fixed by re-running the same
    tag. Publishing is serialized (`concurrency: release`, no cancel).
@@ -96,7 +100,6 @@ input — publishing is skipped and only the notes/release are rewritten.
   affected crate), then release a fixed `X.Y.(Z+1)`. Yanking is reversible with
   `cargo yank --undo`.
 
-`radicom-codecs-tool` publishes the `radicom-compress` binary but is not required
-for library consumers; if only the libraries are needed, the tool crate can be
-omitted from the ordering in `release.yml` (update both the loop and the
-`verify-tag` expected set together).
+Only the five library crates are published. `radicom-codecs-tool` is
+`publish = false` and therefore never enters `cargo publish`, the `verify-tag`
+expected set, or the release loop.

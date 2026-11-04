@@ -49,7 +49,6 @@ jobs:
               "radicom-codecs-jpeg-ls",
               "radicom-codecs-jpeg2000",
               "radicom-codecs-rle",
-              "radicom-codecs-tool",
           }
 
           problems = []
@@ -111,7 +110,7 @@ jobs:
       # metadata and the shipped file set.
       - name: Publishable metadata and shipped files
         run: |
-          for pkg in radicom-codecs-rle radicom-codecs-jpeg radicom-codecs-jpeg-ls radicom-codecs-jpeg2000 radicom-codecs radicom-codecs-tool; do
+          for pkg in radicom-codecs-rle radicom-codecs-jpeg radicom-codecs-jpeg-ls radicom-codecs-jpeg2000 radicom-codecs; do
             echo "::group::$pkg"
             files=$(cargo package -p "$pkg" --list | tr -d '\r')
             printf '%s\n' "$files"
@@ -199,7 +198,7 @@ jobs:
             return 1
           }
 
-          for pkg in radicom-codecs-rle radicom-codecs-jpeg radicom-codecs-jpeg-ls radicom-codecs-jpeg2000 radicom-codecs radicom-codecs-tool; do
+          for pkg in radicom-codecs-rle radicom-codecs-jpeg radicom-codecs-jpeg-ls radicom-codecs-jpeg2000 radicom-codecs; do
             if published "$pkg" "$version"; then
               echo "$pkg $version is already on crates.io, skipping"
             else
@@ -230,7 +229,7 @@ jobs:
               git log "${tag}" --pretty=tformat:"- %s" --no-merges
             fi
             echo ""
-            echo "**Crates published**: \`radicom-codecs-rle\`, \`radicom-codecs-jpeg\`, \`radicom-codecs-jpeg-ls\`, \`radicom-codecs-jpeg2000\`, \`radicom-codecs\`, \`radicom-codecs-tool\` at \`${tag#v}\`."
+            echo "**Crates published**: \`radicom-codecs-rle\`, \`radicom-codecs-jpeg\`, \`radicom-codecs-jpeg-ls\`, \`radicom-codecs-jpeg2000\`, \`radicom-codecs\` at \`${tag#v}\`."
             if [ -n "$prev" ]; then
               echo ""
               echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${prev}...${tag}"
