@@ -9,6 +9,9 @@ on:
     branches: [master, main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -16,9 +19,6 @@ env:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
-
-permissions:
-  contents: read
 
 jobs:
   test:
@@ -29,7 +29,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -61,7 +61,7 @@ jobs:
     name: msrv (1.89)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@1.89.0
 
@@ -74,7 +74,7 @@ jobs:
     name: package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -91,14 +91,16 @@ jobs:
             echo "::endgroup::"
           done
 
-      # Every published crate must ship the README that crates.io renders.
-      - name: Every crate ships its README
+      # The LICENSE and README must travel with every published crate.
+      - name: Every crate ships LICENSE and README
         run: |
           for pkg in radicom-codecs-rle radicom-codecs-jpeg radicom-codecs-jpeg-ls radicom-codecs-jpeg2000 radicom-codecs radicom-codecs-tool; do
             files=$(cargo package -p "$pkg" --list | tr -d '\r')
-            if ! printf '%s\n' "$files" | grep -qx "README.md"; then
-              echo "::error::$pkg does not package README.md"
-              exit 1
-            fi
-            echo "$pkg ships README.md"
+            for f in LICENSE README.md; do
+              if ! printf '%s\n' "$files" | grep -qx "$f"; then
+                echo "::error::$pkg does not package $f"
+                exit 1
+              fi
+            done
+            echo "$pkg ships LICENSE and README.md"
           done

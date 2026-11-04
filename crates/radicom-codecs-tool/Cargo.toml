@@ -4,7 +4,7 @@ description = "Command-line DICOM image compression tool built on radicom-codecs
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 readme = "README.md"
 repository.workspace = true
 

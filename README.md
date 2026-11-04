@@ -109,7 +109,9 @@ CI runs these gates on `master`/`main` for pushes and pull requests, plus a
 `cargo package` metadata check and an MSRV build. Pushing a `v<version>` tag runs
 the release workflow: it verifies the tag against every crate version, re-runs the
 gates, publishes the crates to crates.io in dependency order, and creates a GitHub
-release whose notes compare the previous and current version.
+release whose notes compare the previous and current version. The version-bump,
+tagging, and recovery steps are in
+[docs/development/releasing.md](docs/development/releasing.md).
 
 ## License
 

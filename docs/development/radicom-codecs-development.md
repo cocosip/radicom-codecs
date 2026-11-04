@@ -14,7 +14,8 @@ integrated through the existing `radicom` codec trait and registry.
 
 The `radicom` dependency is the released crate from crates.io. CI builds and
 validates `master`/`main`, and the tag-driven release workflow publishes the
-workspace to crates.io.
+workspace to crates.io. See [the release runbook](releasing.md) for version-bump,
+tagging, and recovery steps.
 
 ## Files and responsibilities
 

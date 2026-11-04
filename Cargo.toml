@@ -17,9 +17,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
-# MIT is a standard SPDX license, so crates.io reads this field; the repository
-# root still carries the license text (see LICENSE).
-license = "MIT"
+license-file = "LICENSE"
 readme = "README.md"
 repository = "https://github.com/cocosip/radicom-codecs"
 
