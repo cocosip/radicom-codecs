@@ -447,7 +447,6 @@ fn operate(
             dst.add_frame(frame)
                 .map_err(|e| error(codec, "encode", e.to_string()))?;
         }
-        frame::use_ob_vr_for_16_bit(dst);
         let mct_label = if apply_mct {
             Some(if encode_reversible {
                 "YBR_RCT"
@@ -629,7 +628,6 @@ fn operate_ht(
             dst.add_frame(frame)
                 .map_err(|e| error(codec, "encode", e.to_string()))?;
         }
-        frame::use_ob_vr_for_16_bit(dst);
         // A multiple component transform requires the matching label; fo-dicom's
         // JPEG 2000 codec writes YBR_RCT/YBR_ICT for the same reason.
         let mct_label = if options.mct && layout.components == 3 {

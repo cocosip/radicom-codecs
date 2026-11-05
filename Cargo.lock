@@ -273,9 +273,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radicom"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "389de773aa66f7965d11669187af696ef682a9d9ff7afd0b852b6cbbb03a7e12"
+checksum = "1e5ebebe01ab7306c557fe1b3d786e5d80b1493d86a3e8a88508f3256c433fbd"
 dependencies = [
  "bytes",
  "chrono",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "radicom-codecs"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "radicom",
  "radicom-codecs-jpeg",
@@ -302,35 +302,35 @@ dependencies = [
 
 [[package]]
 name = "radicom-codecs-jpeg"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "radicom",
 ]
 
 [[package]]
 name = "radicom-codecs-jpeg-ls"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "radicom",
 ]
 
 [[package]]
 name = "radicom-codecs-jpeg2000"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "radicom",
 ]
 
 [[package]]
 name = "radicom-codecs-rle"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "radicom",
 ]
 
 [[package]]
 name = "radicom-codecs-tool"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "radicom",
  "radicom-codecs",
@@ -338,9 +338,9 @@ dependencies = [
 
 [[package]]
 name = "radicom-dict"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34d1d0deb63ef7a528497ede2911feb14a07fee8be37d6a5560081c04804ca73"
+checksum = "91796d6214cc4ce3bef641fcf2da9f5b9bf8e1dc49682f10569bc40f4301c0db"
 
 [[package]]
 name = "rustversion"

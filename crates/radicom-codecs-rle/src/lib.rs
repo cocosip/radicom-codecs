@@ -8,10 +8,9 @@ mod segment;
 use frame::{decode_frame, encode_frame};
 use layout::RleLayout;
 use radicom::error::{CodecError, Error};
-use radicom::model::item::{DicomFragmentSequence, DicomItem};
+use radicom::model::item::DicomItem;
 use radicom::model::tag::Tag;
 use radicom::model::transfer_syntax::{syntaxes, TransferSyntax};
-use radicom::model::vr::Vr;
 use radicom::pixel::codec::{Codec, CodecParams};
 use radicom::pixel::{PixelData, PixelDataRef};
 
@@ -102,7 +101,6 @@ impl Codec for RleLosslessCodec {
             dst.add_frame(frame)
                 .map_err(|error| operation_error("encode", Some(frame_index), error.to_string()))?;
         }
-        set_encapsulated_pixel_data_vr_to_ob(dst);
         Ok(())
     }
 
@@ -153,25 +151,6 @@ impl Codec for RleLosslessCodec {
         }
         Ok(())
     }
-}
-
-/// PS3.5 8.2.2 requires OB for encapsulated Pixel Data. The core picks OW from
-/// `BitsAllocated` when it first appends a 16-bit frame; rebuild the fragment
-/// sequence with the correct VR while preserving the offset table and buffers.
-fn set_encapsulated_pixel_data_vr_to_ob(dst: &mut PixelData<'_>) {
-    let Some(DicomItem::Fragments(fragments)) = dst.dataset().item(&Tag::PIXEL_DATA) else {
-        return;
-    };
-    if fragments.vr() == Vr::Ob {
-        return;
-    }
-    let mut corrected = DicomFragmentSequence::new(Tag::PIXEL_DATA, Vr::Ob);
-    for fragment in fragments.fragments() {
-        corrected.push_fragment_raw(fragment.clone());
-    }
-    corrected.set_offset_table(fragments.offset_table().to_vec());
-    dst.dataset_mut()
-        .insert_or_update(DicomItem::Fragments(corrected));
 }
 
 fn ensure_params(params: &CodecParams, operation: &str) -> Result<(), Error> {

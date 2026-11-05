@@ -4,7 +4,6 @@ use super::color::{rgb_to_ycc, JpegColorSpace};
 use super::lossless::{LosslessFrame, Selection};
 use super::sequential::{fancy_upsample, FrameExpectation, SequentialFrame};
 use radicom::error::{CodecError, Error};
-use radicom::model::item::{DicomFragmentSequence, DicomItem};
 use radicom::model::tag::Tag;
 use radicom::model::vr::Vr;
 use radicom::pixel::photometric::PhotometricInterpretation;
@@ -419,7 +418,6 @@ pub(crate) fn encode_sequential(
         dst.dataset_mut()
             .insert_value(Tag::PLANAR_CONFIGURATION, 0u16);
     }
-    encapsulated_ob_vr(dst, codec)?;
     Ok(())
 }
 
@@ -597,7 +595,6 @@ pub(crate) fn encode_lossless(
         dst.add_frame(frame)
             .map_err(|error| operation_error(codec, &error.to_string()))?;
     }
-    encapsulated_ob_vr(dst, codec)?;
     Ok(())
 }
 
@@ -657,34 +654,6 @@ pub(crate) fn decode_lossless(
         dst.add_frame(frame)
             .map_err(|error| operation_error(codec, &error.to_string()))?;
     }
-    Ok(())
-}
-
-/// PS3.5 A.4: encapsulated Pixel Data has VR OB even for 12/16-bit
-/// codestreams whose BitsAllocated is 16. `PixelData::add_frame` selects OW
-/// from BitsAllocated, so rewrite the fragment sequence with OB after the
-/// frames are appended. Fragment buffers are shared (Arc), so this only
-/// rebuilds the small offset table and the element.
-fn encapsulated_ob_vr(dst: &mut PixelData<'_>, codec: &str) -> Result<(), Error> {
-    let bits = dst
-        .bits_allocated()
-        .map_err(|error| operation_error(codec, &error.to_string()))?;
-    if bits <= 8 {
-        return Ok(());
-    }
-    let Some(DicomItem::Fragments(fragments)) = dst.dataset().item(&Tag::PIXEL_DATA) else {
-        return Ok(());
-    };
-    if fragments.vr() == Vr::Ob {
-        return Ok(());
-    }
-    let mut rebuilt = DicomFragmentSequence::new(Tag::PIXEL_DATA, Vr::Ob);
-    for fragment in fragments.fragments() {
-        rebuilt.push_fragment(fragment.clone());
-    }
-    rebuilt.set_offset_table(fragments.offset_table().to_vec());
-    dst.dataset_mut()
-        .insert_or_update(DicomItem::Fragments(rebuilt));
     Ok(())
 }
 

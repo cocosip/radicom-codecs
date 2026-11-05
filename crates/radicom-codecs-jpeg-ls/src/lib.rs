@@ -11,10 +11,7 @@ mod scan;
 
 use frame::Layout;
 use radicom::error::{CodecError, Error};
-use radicom::model::item::{DicomFragmentSequence, DicomItem};
-use radicom::model::tag::Tag;
 use radicom::model::transfer_syntax::{syntaxes, TransferSyntax};
-use radicom::model::vr::Vr;
 use radicom::pixel::codec::{Codec, CodecParams, JpegLsParams};
 use radicom::pixel::photometric::PhotometricInterpretation;
 use radicom::pixel::{PixelData, PixelDataRef};
@@ -113,23 +110,6 @@ pub(crate) fn checked_sample_count(
         ));
     }
     Ok(count)
-}
-
-/// PS3.5 Table 7.1-1: encapsulated Pixel Data uses VR `OB` regardless of
-/// `BitsAllocated`. `PixelData::add_frame` creates an `OW` element for 16-bit
-/// samples, so rewrite the fragment sequence after the codec appended frames.
-fn ensure_encapsulated_pixel_data_is_ob(dst: &mut PixelData<'_>) {
-    let fragments = match dst.dataset().item(&Tag::PIXEL_DATA) {
-        Some(DicomItem::Fragments(fragments)) if fragments.vr() != Vr::Ob => fragments.clone(),
-        _ => return,
-    };
-    let mut rebuilt = DicomFragmentSequence::new(Tag::PIXEL_DATA, Vr::Ob);
-    for fragment in fragments.fragments() {
-        rebuilt.push_fragment_raw(fragment.clone());
-    }
-    rebuilt.set_offset_table(fragments.offset_table().to_vec());
-    dst.dataset_mut()
-        .insert_or_update(DicomItem::Fragments(rebuilt));
 }
 
 fn operate(
@@ -268,7 +248,6 @@ fn operate(
                 .map_err(|e| error(codec, "encode", e.to_string()))?;
         }
         frame::update_color_metadata(dst, &layout);
-        ensure_encapsulated_pixel_data_is_ob(dst);
         Ok(())
     }
 }
@@ -299,7 +278,7 @@ mod tests {
 mod facade_tests {
     use super::*;
     use radicom::{
-        model::{dataset::Dataset, tag::Tag, transfer_syntax::syntaxes, vr::Vr},
+        model::{dataset::Dataset, item::DicomItem, tag::Tag, transfer_syntax::syntaxes, vr::Vr},
         pixel::{PixelData, PixelDataRef},
     };
     fn ds(

@@ -542,29 +542,6 @@ pub(crate) fn update_color_metadata(
         .insert_value(Tag::PLANAR_CONFIGURATION, 0u16);
 }
 
-/// Encapsulated 16-bit Pixel Data must carry OB, not OW. The dataset stores
-/// encapsulated pixel data as a fragment sequence, so the sequence is rebuilt
-/// with the same fragments and the other VR.
-pub(crate) fn use_ob_vr_for_16_bit(dst: &mut PixelData<'_>) {
-    use radicom::model::item::DicomItem;
-
-    if !matches!(dst.bits_allocated(), Ok(16)) {
-        return;
-    }
-    let fragments = match dst.dataset().item(&Tag::PIXEL_DATA) {
-        Some(DicomItem::Fragments(sequence)) if sequence.vr() == Vr::Ow => {
-            sequence.fragments().to_vec()
-        }
-        _ => return,
-    };
-    let mut replacement = radicom::model::item::DicomFragmentSequence::new(Tag::PIXEL_DATA, Vr::Ob);
-    for fragment in fragments {
-        replacement.push_fragment(fragment);
-    }
-    dst.dataset_mut()
-        .insert_or_update(DicomItem::Fragments(replacement));
-}
-
 pub(crate) fn update_decoded_color_metadata(dst: &mut PixelData<'_>, layout: &Layout) {
     if layout.components == 3 {
         let photometric = if layout.ybr422 { "YBR_FULL_422" } else { "RGB" };
