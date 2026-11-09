@@ -1,6 +1,6 @@
 # radicom-codecs development plan and status
 
-**Date:** 2026-11-02
+**Date:** 2026-11-09
 **Current milestone:** All twelve DICOM codecs implemented and registered
 **Status:** RLE, classic JPEG, JPEG-LS, classic JPEG 2000, and HTJ2K are
 integrated through the `radicom` codec trait and registry.
@@ -12,7 +12,10 @@ the four classic JPEG transfer syntaxes, both JPEG-LS transfer syntaxes, both
 classic JPEG 2000 transfer syntaxes, and the three HTJ2K transfer syntaxes are
 integrated through the existing `radicom` codec trait and registry.
 
-The `radicom` dependency is the released crate from crates.io. CI builds and
+The `radicom` dependency is the released `0.2.0` crate from crates.io, with
+`radicom-dict 0.2.0` in the lockfile. Rust 1.89 remains the MSRV. The workspace
+package version is still `0.1.2`; a new release version is required before
+publishing the upgrade. CI builds and
 validates `master`/`main`, and the tag-driven release workflow publishes the
 workspace to crates.io. See [the release runbook](releasing.md) for version-bump,
 tagging, and recovery steps.
@@ -147,11 +150,12 @@ syntaxes and agrees: `.90` is exact in both directions at 8 and 12 bits, a
 fo-dicom `.91` decodes within `max 1`, and fo-dicom decodes a Rust `.91` within
 `max 2`.
 
-The classic encoder emits one quality layer; non-default `rate` or `rate_levels`
-values are rejected until multi-layer rate control exists. `allow_mct` selects
-RCT/ICT with the matching `YBR_RCT`/`YBR_ICT` label, and
-`update_photometric_interpretation` controls whether the emitted dataset's
-photometric interpretation is rewritten. YBR_FULL/YBR_FULL_422 input is
+The classic encoder implements multi-layer rate control through `rate` and
+`rate_levels`; an empty ladder selects the reference rate levels, and the
+default lossless encode writes eight layers including a final lossless layer.
+`allow_mct` together with `update_photometric_interpretation` selects RCT/ICT
+with the matching `YBR_RCT`/`YBR_ICT` label. The default leaves RGB without MCT.
+YBR_FULL/YBR_FULL_422 input is
 normalized to RGB. See
 [the JPEG 2000 implementation contract](../design/jpeg2000.md).
 
@@ -183,8 +187,9 @@ and `.91` (8 and 12) within two.
 
 ## Next implementation stages
 
-1. **Broader JPEG 2000/HTJ2K coverage:** optional rate control/quality layers,
-   classic encoder MCT, and fuzz/property tests for malformed codestreams.
+1. **Broader JPEG 2000/HTJ2K coverage:** HTJ2K refinement passes/quality layers
+   and fuzz/property tests for malformed codestreams. Classic encoder rate
+   control, quality layers, and MCT are already implemented.
 2. **Interop re-verification:** both matrices are done — OpenJPEG 2.5.4 for
    `.90`/`.91` and fo-dicom.Codecs 5.16.7 for every syntax. Re-run them after any
    wavelet, quantization, or COC/QCC change. RGB and profile-matrix coverage for
@@ -192,9 +197,13 @@ and `.91` (8 and 12) within two.
 
 Each stage must pass its focused tests and the previous stages before the next stage starts.
 
-## Known integration issue
+## Core integration and upgrade validation
 
-The sibling `radicom` checkout now uses its generated UID dictionary for HTJ2K, and
-its values match fo-dicom and DICOM `.201`, `.202`, and `.203`. The compatibility
-issue is resolved; codec work only needs a read-only boundary assertion.
+The released `radicom 0.2.0` uses its generated UID dictionary for HTJ2K, with
+the DICOM `.201`, `.202`, and `.203` assignments checked by codec tests.
+
+The dependency upgrade passes workspace formatting, Clippy, all 416 tests,
+documentation generation, and the Rust 1.89 all-features check on Windows.
+No codec API adaptation was needed. The external interop results above describe
+earlier runs; native reference matrices have not been re-run for this upgrade.
 

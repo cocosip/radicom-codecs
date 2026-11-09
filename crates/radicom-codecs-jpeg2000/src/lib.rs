@@ -2,7 +2,8 @@
 //!
 //! The classic reversible (`.90`) and irreversible (`.91`) transfer syntaxes
 //! are implemented from the standard; HTJ2K (`.201`/`.202`/`.203`) is a
-//! separate follow-up.
+//! separate Part 15 block coder in this crate, sharing the container and frame
+//! layers.
 
 mod bit;
 mod codestream;

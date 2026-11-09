@@ -24,7 +24,7 @@ repository = "https://github.com/cocosip/radicom-codecs"
 [workspace.dependencies]
 # Upstream core library: the released crate from crates.io. Do not point this at
 # a local radicom checkout, so CI and consumers build exactly what users get.
-radicom = "0.1.2"
+radicom = "0.2.0"
 
 # Internal crates: one path + version pair for the whole graph. Cargo rejects a
 # mismatch between these pins and the members' versions, so a stale bump fails

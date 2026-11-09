@@ -13,16 +13,16 @@ transfer syntaxes.
 
 ## Registrations
 
-| Type | UID | Coding mode | Status target |
+| Type | UID | Coding mode | Status |
 | --- | --- | --- | --- |
 | `HtJpeg2000LosslessCodec` | `1.2.840.10008.1.2.4.201` | HT blocks, lossless | encode/decode |
 | `HtJpeg2000LosslessRpclCodec` | `1.2.840.10008.1.2.4.202` | HT blocks, lossless, RPCL | encode/decode |
 | `HtJpeg2000LossyCodec` | `1.2.840.10008.1.2.4.203` | HT blocks, lossy | encode/decode |
 
-The sibling `radicom` transfer-syntax table now resolves HTJ2K through its
+The released `radicom 0.2.0` transfer-syntax table resolves HTJ2K through its
 generated UID dictionary. The dictionary, fo-dicom, and DICOM use `.201/.202/.203`;
 `.108` and `.110` remain other transfer syntaxes. The codec implementation
-performs a read-only assertion before registration.
+checks these assignments in unit and facade integration tests.
 
 All three types implement the existing `Codec` trait and accept only
 `CodecParams::HtJpeg2000(HtJ2kParams)`. `.201/.202` force reversible 5/3,
@@ -94,6 +94,9 @@ PS3.5 requires for a codestream whose MCT flag is set; decoding converts back an
 labels the native dataset `RGB`. The reversible path writes its step table with
 two reserved bit-planes (`precision + 2`, the same magnitude bound the CAP marker
 advertises), which covers the extra range the RCT and the 5/3 gain introduce.
+The bare `radicom 0.2.0` `HtJ2kParams::default()` differs: colour transform and
+TLM markers are disabled, and progression is LRCP. Use the codec's
+`default_params()` for the reference defaults.
 All three HT codecs default to RPCL and to writing a TLM, matching
 `fo-dicom.Codecs`: `.201` and `.203` pass `PROG_UNKNOWN` to OpenJPH, whose
 default is RPCL, and `.202` explicitly requests RPCL. `.203` uses OpenJPH's
@@ -149,7 +152,11 @@ a mean-absolute-error tolerance and require a decodable codestream.
    corrections. RGB and profile-matrix coverage remains a follow-up.
 
 The public registry keeps one JPEG 2000 family entry point. The classic and
-HTJ2K codec types remain inside the same crate. The sibling `radicom` boundary
+HTJ2K codec types remain inside the same crate. The released `radicom` boundary
 is aligned with the generated dictionary and the DICOM `.201/.202/.203`
 assignments.
+
+The native matrix results above predate the `radicom 0.2.0` upgrade. This upgrade
+re-runs the portable workspace tests, including HTJ2K boundary checks, without
+claiming a new native-reference matrix run.
 

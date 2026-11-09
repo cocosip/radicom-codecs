@@ -28,6 +28,21 @@ radicom = "0.1"
 radicom-codecs = "0.1"
 ```
 
+This checkout targets `radicom 0.2.0` (Rust 1.89 or newer). The published
+`radicom-codecs 0.1.2` release uses `radicom 0.1`; the installation example above
+applies to that release. When using this checkout, also depend on `radicom = "0.2"`
+so codec types and the global registry come from the same core version.
+
+```toml
+[dependencies]
+radicom = "0.2"
+radicom-codecs = { path = "path/to/radicom-codecs/crates/radicom-codecs" }
+```
+
+Replace the path with your checkout's facade crate directory. The workspace
+package version remains `0.1.2` until the next release bump; this dependency
+upgrade has not been published as that existing version.
+
 The facade crate re-exports every codec type and owns registration. Depend on a
 family crate directly only when you want its codec types without the facade.
 
@@ -104,6 +119,8 @@ behavior notes.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+cargo doc --workspace --all-features --no-deps
+cargo +1.89.0 check --workspace --all-features
 ```
 
 CI runs these gates on `master`/`main` for pushes and pull requests, plus a

@@ -273,9 +273,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radicom"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e5ebebe01ab7306c557fe1b3d786e5d80b1493d86a3e8a88508f3256c433fbd"
+checksum = "01edb31d39843676c41d45b1ad060d2fed91d4a385c36bf88510badb6120789f"
 dependencies = [
  "bytes",
  "chrono",
@@ -338,9 +338,9 @@ dependencies = [
 
 [[package]]
 name = "radicom-dict"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91796d6214cc4ce3bef641fcf2da9f5b9bf8e1dc49682f10569bc40f4301c0db"
+checksum = "b65920e535a9f942647df817f421ac2ccdc2857c166e3c352147eb649d2c14d7"
 
 [[package]]
 name = "rustversion"

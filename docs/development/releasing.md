@@ -21,21 +21,23 @@ utility and is `publish = false`: it is installed from the repository
 (`cargo install --path crates/radicom-codecs-tool`) and is never a crates.io
 release artifact.
 
-The first release is **`0.1.0`**, matching the published `radicom = "0.1.0"` core
-crate it depends on. `radicom-codecs` is not yet on crates.io, so `0.1.0` is the
-initial version.
+The published `0.1.2` release uses `radicom 0.1`. This checkout upgrades the core
+dependency to `radicom 0.2.0`, while the workspace package version still reads
+`0.1.2`. Before publishing this change, bump all workspace versions and internal
+pins to a new release (use `0.2.0` for the incompatible core-type change).
+Existing `0.1.2` artifacts on crates.io cannot be overwritten, and the publish
+job skips versions that already exist.
 
 ## Prerequisites
 
 - Push access to `cocosip/radicom-codecs`.
 - Repository secret **`CARGO_REGISTRY_TOKEN`**: a crates.io API token allowed to
-  publish. On the very first release the five crate *names* do not exist yet; the
-  token owner creates them on first publish.
+  publish the five library crates.
 - The `radicom` core version the workspace depends on is already on crates.io
   (`cargo search radicom`). The release build resolves it from the registry, not
   from a local checkout.
 
-## Bumping the version (future releases)
+## Bumping the version
 
 A release bump edits the literals in the root `Cargo.toml` together — leaving any
 one stale makes `cargo build` fail before publish:
@@ -46,8 +48,9 @@ one stale makes `cargo build` fail before publish:
 3. Refresh the tracked lockfile: `cargo build --workspace --all-features` (or
    `cargo update -p radicom-codecs --precise X.Y.Z` per crate), then commit
    `Cargo.lock` with the bump.
-4. Docs reference the version in a few places (`README.md`, `docs/design/*`); a
-   grep for the old version catches stragglers.
+4. Update installation examples and compatibility notes in `README.md` and the
+   design/development docs. Consumers must use the same core version as the
+   codecs because codec types and the global registry belong to that version.
 
 ## Local pre-flight
 
@@ -55,11 +58,15 @@ Run the same gates the tag workflow re-runs:
 
 ```powershell
 cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
 cargo test --workspace --all-features
+$env:RUSTDOCFLAGS = '-D warnings'
+cargo doc --workspace --all-features --no-deps
+cargo +1.89.0 check --workspace --all-features
 # Every published crate must ship LICENSE and README.md with valid metadata.
-# `--list` is used because before the first release a crate's own path deps are
-# not on crates.io yet, so a full `cargo package` cannot resolve them.
+# `--list` also works before new internal dependency versions are published.
 foreach ($pkg in 'radicom-codecs-rle','radicom-codecs-jpeg','radicom-codecs-jpeg-ls',
                  'radicom-codecs-jpeg2000','radicom-codecs') {
     cargo package -p $pkg --list
@@ -69,8 +76,10 @@ foreach ($pkg in 'radicom-codecs-rle','radicom-codecs-jpeg','radicom-codecs-jpeg
 ## Cutting the release
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+# After updating Cargo.toml and Cargo.lock to the chosen new version:
+$releaseVersion = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages[0].version
+git tag "v$releaseVersion"
+git push origin "v$releaseVersion"
 ```
 
 What `.github/workflows/release.yml` then does:
@@ -83,9 +92,10 @@ What `.github/workflows/release.yml` then does:
 3. **publish** — publishes the five crates in dependency order. It is idempotent:
    any version already on crates.io is skipped, and a fresh crate is retried for
    index propagation, so a partially failed run is fixed by re-running the same
-   tag. Publishing is serialized (`concurrency: release`, no cancel).
-4. **github-release** — creates a GitHub Release whose notes compare the previous
-   tag with this one (or mark "initial release" when there is no earlier tag).
+   tag.
+4. **Release notes** (in the `publish` job) — creates a GitHub Release whose notes
+   compare the previous tag with this one (or mark "initial release" when there
+   is no earlier tag).
 
 The publish and release-note work run in one job; the workflows mirror the core
 `radicom` repository. To **regenerate the release notes** for an already-published

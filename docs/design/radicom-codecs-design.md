@@ -46,7 +46,7 @@ The implementation depends on the published `radicom` crate from crates.io:
 
 ```toml
 [dependencies]
-radicom = "0.1.0"
+radicom = "0.2.0"
 ```
 
 It must not use a local path dependency, so CI and consumers build exactly the
@@ -112,7 +112,7 @@ the following standard transfer syntax constants used by codec registration:
 - `HTJ2K_LOSSLESS_RPCL`
 - `HTJ2K_LOSSY`
 
-The sibling `radicom` transfer-syntax table is already reconciled with its
+The released `radicom 0.2.0` transfer-syntax table is reconciled with its
 generated UID dictionary, the DICOM transfer syntax definitions, and fo-dicom:
 HTJ2K uses `.201`, `.202`, and `.203`. The codec project must assert those values
 and must not silently register under a different UID.
@@ -168,7 +168,7 @@ individually.
 
 ## 7. Supported codec registrations
 
-The first release covers the twelve registrations below. The transfer syntax
+The implementation covers the twelve registrations below. The transfer syntax
 constants and UIDs must match `radicom` and the DICOM standard before a row is
 marked complete.
 
@@ -289,10 +289,11 @@ boundary.
 A parameter must never be silently ignored. If a field is exposed but the
 implementation cannot honor a non-default value, the codec returns `Error::Codec`
 naming the codec, the operation, the field, and the value. Default values keep
-the documented default behavior. Examples: `J2kParams::rate` and `rate_levels`
-default to `20` and an empty list (the single-layer default); a non-default rate
-is an explicit "not implemented" error until multi-layer rate control exists.
-`encode_signed_as_unsigned = true` is rejected explicitly. Layout and colour
+the documented default behavior. `J2kParams::rate` defaults to `20`; an empty
+`rate_levels` selects the reference rate ladder. Both fields drive implemented
+multi-layer rate control, with a final lossless layer for `.90` at positive
+rates. HTJ2K supports one quality layer and rejects multi-layer codestreams.
+`encode_signed_as_unsigned = true` is rejected explicitly on encode. Layout and colour
 fields (`allow_mct`, `update_photometric_interpretation`,
 `employ_color_transform`) must change the codestream and metadata, or be
 rejected; they are never accepted and ignored.
@@ -314,6 +315,11 @@ Reference interoperability tests call the public `fo-dicom.Codecs` API. They do
 not link the local C# source, replace assemblies, inspect package identity, or
 call native libraries directly.
 
+For the `radicom 0.2.0` dependency upgrade, the Windows workspace suite passes
+416 tests, along with fmt, Clippy, rustdoc, and the Rust 1.89 all-features check.
+External reference matrices quoted in the family documents are historical
+evidence and have not been re-run for this upgrade.
+
 Acceptance rules are:
 
 - lossless codecs: exact decoded sample/byte equality;
@@ -326,7 +332,7 @@ Acceptance rules are:
 ### 10.1 Interop harnesses (development-only, git-ignored)
 
 The C# oracles and the Rust harness live under `.interop/` and are not part of
-the published crates. The harness pins the same `radicom = "0.1.0"` registry
+the published crates. Any harness must pin the same `radicom = "0.2.0"` registry
 version as the workspace; pointing it at a local `radicom` checkout gives the
 dependency graph two incompatible `radicom` versions and breaks the `Codec`
 trait impls.
@@ -367,7 +373,8 @@ The development document records the checklist and current status for these
 stages. A stage is complete only when its family tests, registry tests, and
 reference interoperability tests pass without weakening an earlier stage.
 
-The JPEG 2000 and HTJ2K rows remain design targets until the single Rust crate,
-its marker/profile matrix, and the complete compatibility matrix are implemented
-and verified. Publishing is not a substitute for those gates.
+JPEG 2000 and HTJ2K encode/decode are implemented in the shared Rust crate, with
+unit, integration, and historical interop coverage. Unsupported profiles and
+remaining coverage gaps are listed in the family documents and development
+status. Publishing is not a substitute for verification of those boundaries.
 

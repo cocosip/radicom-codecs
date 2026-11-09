@@ -154,9 +154,9 @@ Plane interleaving (one scan per component) is produced only when `1` is
 requested explicitly; the decoder reads it either way, and the encoder never
 emits it by default.
 
-The `.interop/REPORT.md` decision to bump `radicom`/`radicom-codecs*` from
-0.1.0 to 0.2.0 for `restart_interval` is obsolete: the released `radicom`
-0.1.0 already carries the field, so no version bump is needed.
+The workspace uses the released `radicom 0.2.0` parameter types, including
+`restart_interval`. A nonzero restart interval remains explicitly unsupported
+by this codec; upgrading the core dependency does not add restart-marker support.
 
 ## 5. Supported DICOM pixel layouts
 
