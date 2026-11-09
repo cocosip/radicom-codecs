@@ -14,7 +14,7 @@ members = [
 # internal pins under [workspace.dependencies] repeat it because a packaged path
 # dependency must carry a literal version. A release bump edits those literals
 # together in this file; cargo fails the build when they disagree.
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 license-file = "LICENSE"
@@ -29,8 +29,8 @@ radicom = "0.2.0"
 # Internal crates: one path + version pair for the whole graph. Cargo rejects a
 # mismatch between these pins and the members' versions, so a stale bump fails
 # every build instead of failing halfway through a publish.
-radicom-codecs = { path = "crates/radicom-codecs", version = "0.1.2" }
-radicom-codecs-jpeg = { path = "crates/radicom-codecs-jpeg", version = "0.1.2" }
-radicom-codecs-jpeg-ls = { path = "crates/radicom-codecs-jpeg-ls", version = "0.1.2" }
-radicom-codecs-jpeg2000 = { path = "crates/radicom-codecs-jpeg2000", version = "0.1.2" }
-radicom-codecs-rle = { path = "crates/radicom-codecs-rle", version = "0.1.2" }
+radicom-codecs = { path = "crates/radicom-codecs", version = "0.2.0" }
+radicom-codecs-jpeg = { path = "crates/radicom-codecs-jpeg", version = "0.2.0" }
+radicom-codecs-jpeg-ls = { path = "crates/radicom-codecs-jpeg-ls", version = "0.2.0" }
+radicom-codecs-jpeg2000 = { path = "crates/radicom-codecs-jpeg2000", version = "0.2.0" }
+radicom-codecs-rle = { path = "crates/radicom-codecs-rle", version = "0.2.0" }

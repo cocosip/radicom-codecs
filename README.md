@@ -24,24 +24,13 @@ transfer syntaxes. It mirrors the split between the C# `fo-dicom` and
 
 ```toml
 [dependencies]
-radicom = "0.1"
-radicom-codecs = "0.1"
-```
-
-This checkout targets `radicom 0.2.0` (Rust 1.89 or newer). The published
-`radicom-codecs 0.1.2` release uses `radicom 0.1`; the installation example above
-applies to that release. When using this checkout, also depend on `radicom = "0.2"`
-so codec types and the global registry come from the same core version.
-
-```toml
-[dependencies]
 radicom = "0.2"
-radicom-codecs = { path = "path/to/radicom-codecs/crates/radicom-codecs" }
+radicom-codecs = "0.2"
 ```
 
-Replace the path with your checkout's facade crate directory. The workspace
-package version remains `0.1.2` until the next release bump; this dependency
-upgrade has not been published as that existing version.
+Version `0.2.0` targets `radicom 0.2` and requires Rust 1.89 or newer. When
+upgrading from `radicom-codecs 0.1`, update your direct `radicom` dependency to
+`0.2` as well: codec types and the global registry belong to that core version.
 
 The facade crate re-exports every codec type and owns registration. Depend on a
 family crate directly only when you want its codec types without the facade.

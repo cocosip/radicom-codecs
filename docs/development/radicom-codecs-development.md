@@ -14,9 +14,9 @@ integrated through the existing `radicom` codec trait and registry.
 
 The `radicom` dependency is the released `0.2.0` crate from crates.io, with
 `radicom-dict 0.2.0` in the lockfile. Rust 1.89 remains the MSRV. The workspace
-package version is still `0.1.2`; a new release version is required before
-publishing the upgrade. CI builds and
-validates `master`/`main`, and the tag-driven release workflow publishes the
+package version and all internal dependency pins are `0.2.0`, ready for the
+`v0.2.0` release workflow. CI builds and validates `master`/`main`, and the
+tag-driven release workflow publishes the
 workspace to crates.io. See [the release runbook](releasing.md) for version-bump,
 tagging, and recovery steps.
 
