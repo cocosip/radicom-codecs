@@ -917,11 +917,13 @@ mod tests {
     fn process1_422_conversion_normalizes_a_ybr422_destination() {
         use radicom::model::tag::Tag;
         use radicom::model::vr::Vr;
-        let source_bytes: Vec<u8> = (0..17 * 9 * 3).map(|v| ((v * 29) % 256) as u8).collect();
+        // A native 4:2:2 frame is `Rows * Columns * 2` bytes, so an odd column
+        // count cannot be packed as Y1/Y2/Cb/Cr groups; `rejects_...` covers it.
+        let source_bytes: Vec<u8> = (0..18 * 9 * 3).map(|v| ((v * 29) % 256) as u8).collect();
         let mut source = dataset(
             syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
             9,
-            17,
+            18,
             8,
             3,
             Some(0),
@@ -930,7 +932,7 @@ mod tests {
             .unwrap()
             .add_frame(&source_bytes)
             .unwrap();
-        let mut compressed = dataset(syntaxes::JPEG_PROCESS_1.clone(), 9, 17, 8, 3, Some(0));
+        let mut compressed = dataset(syntaxes::JPEG_PROCESS_1.clone(), 9, 18, 8, 3, Some(0));
         let params = JpegParams {
             sample_factor: radicom::pixel::codec::SampleFactor::Half,
             ..Default::default()
@@ -951,7 +953,7 @@ mod tests {
         let mut packed = dataset(
             syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
             9,
-            17,
+            18,
             8,
             3,
             Some(0),
@@ -980,7 +982,7 @@ mod tests {
         let mut converted = dataset(
             syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
             9,
-            17,
+            18,
             8,
             3,
             Some(0),
@@ -1007,7 +1009,7 @@ mod tests {
             .data()
             .unwrap()
             .to_vec();
-        assert_eq!(actual.len(), 17 * 9 * 3);
+        assert_eq!(actual.len(), 18 * 9 * 3);
         let max = actual
             .iter()
             .zip(source_bytes.iter())
@@ -1015,6 +1017,60 @@ mod tests {
             .max()
             .unwrap();
         assert!(max < 180, "max={max}");
+    }
+
+    #[test]
+    fn native_ybr422_destination_rejects_an_odd_column_count() {
+        use radicom::model::tag::Tag;
+        use radicom::model::vr::Vr;
+        let source_bytes: Vec<u8> = (0..17 * 9 * 3).map(|v| ((v * 13) % 256) as u8).collect();
+        let mut source = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            9,
+            17,
+            8,
+            3,
+            Some(0),
+        );
+        PixelData::create_new(&mut source)
+            .unwrap()
+            .add_frame(&source_bytes)
+            .unwrap();
+        let mut compressed = dataset(syntaxes::JPEG_PROCESS_1.clone(), 9, 17, 8, 3, Some(0));
+        JpegProcess1Codec
+            .encode(
+                &PixelDataRef::from_dataset(&source).unwrap(),
+                &mut PixelData::create_new(&mut compressed).unwrap(),
+                &CodecParams::Jpeg(JpegParams {
+                    sample_factor: radicom::pixel::codec::SampleFactor::Half,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        // A native 4:2:2 frame is `Rows * Columns * 2` bytes, so an odd column
+        // count would leave the last luma sample without a Cb/Cr pair.
+        let mut packed = dataset(
+            syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone(),
+            9,
+            17,
+            8,
+            3,
+            Some(0),
+        );
+        packed.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "YBR_FULL_422");
+        let error = JpegProcess1Codec
+            .decode(
+                &PixelDataRef::from_dataset(&compressed).unwrap(),
+                &mut PixelData::create_new(&mut packed).unwrap(),
+                &CodecParams::Jpeg(JpegParams::default()),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("YBR_FULL_422 requires an even number of columns"),
+            "{error}"
+        );
     }
 
     #[test]

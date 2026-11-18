@@ -21,11 +21,11 @@ utility and is `publish = false`: it is installed from the repository
 (`cargo install --path crates/radicom-codecs-tool`) and is never a crates.io
 release artifact.
 
-The workspace release version is `0.2.0`, including every internal dependency
-pin. It targets `radicom 0.2.0`; the previous `0.1.2` release used `radicom 0.1`.
+The workspace release version is `0.3.0`, including every internal dependency
+pin. It targets `radicom 0.3.0`; the previous `0.2.0` release used `radicom 0.2`.
 Consumers upgrading to this release must also update their direct `radicom`
-dependency to `0.2` because core types and the global registry are incompatible
-across these versions. Publish this release with the `v0.2.0` tag after the
+dependency to `0.3` because core types and the global registry are incompatible
+across these versions. Publish this release with the `v0.3.0` tag after the
 checks below pass. Existing crate versions cannot be overwritten, and the
 publish job skips versions that already exist.
 
@@ -47,8 +47,11 @@ one stale makes `cargo build` fail before publish:
 2. The five `version = "X.Y.Z"` literals under `[workspace.dependencies]`
    (`radicom-codecs*`). Keep `radicom = "..."` at the published core version.
 3. Refresh the tracked lockfile: `cargo build --workspace --all-features` (or
-   `cargo update -p radicom-codecs --precise X.Y.Z` per crate), then commit
-   `Cargo.lock` with the bump.
+   `cargo update -p radicom --precise X.Y.Z` plus
+   `cargo update -p radicom-codecs --precise X.Y.Z` for each internal crate),
+   then commit `Cargo.lock` with the bump. Keep every base package shared with
+   `radicom` on the version the core release itself resolves (`radicom-dict`
+   follows the core version; the rest are transitive and resolve together).
 4. Update installation examples and compatibility notes in `README.md` and the
    design/development docs. Consumers must use the same core version as the
    codecs because codec types and the global registry belong to that version.

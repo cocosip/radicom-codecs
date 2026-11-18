@@ -117,10 +117,12 @@ impl Layout {
             if components != 3 || planar != 0 || bits_allocated != 1 {
                 return Err("YBR_FULL_422 requires interleaved 8-bit samples".to_owned());
             }
+            // PS3.3 C.7.6.3.1.2 Note 2: a 4:2:2 frame is `Rows * Columns * 2`
+            // bytes, with no column rounding. `ybr422_row_bytes` rejects the
+            // odd column count that this formula cannot express as Y1/Y2/Cb/Cr
+            // groups.
             width
-                .div_ceil(2)
-                .checked_mul(2)
-                .and_then(|even_width| even_width.checked_mul(height))
+                .checked_mul(height)
                 .and_then(|pixels| pixels.checked_mul(2))
                 .ok_or_else(|| "JPEG YBR_FULL_422 frame size overflows usize".to_owned())?
         } else {
@@ -217,23 +219,31 @@ impl Layout {
             .ok_or_else(|| "JPEG native sample offset overflows usize".to_owned())
     }
 
+    /// Bytes in one native 4:2:2 row (`Columns * 2`). The frame-size formula
+    /// has no column rounding, so an odd column count leaves a dangling luma
+    /// sample that no Y1/Y2/Cb/Cr group can hold (PS3.3 C.7.6.3.1.2 Note 2).
+    fn ybr422_row_bytes(&self) -> Result<usize, String> {
+        if !self.width.is_multiple_of(2) {
+            return Err("YBR_FULL_422 requires an even number of columns".to_owned());
+        }
+        Ok(self.width * 2)
+    }
+
     fn read_ybr422(&self, bytes: &[u8]) -> Result<Vec<u16>, String> {
+        let row_bytes = self.ybr422_row_bytes()?;
         if bytes.len() < self.frame_length {
             return Err("native YBR_FULL_422 frame is truncated".to_owned());
         }
         let mut samples = Vec::with_capacity(self.width * self.height * 3);
-        let row_bytes = self.width.div_ceil(2) * 4;
         for y in 0..self.height {
-            for pair in 0..self.width.div_ceil(2) {
+            for pair in 0..self.width / 2 {
                 let offset = y * row_bytes + pair * 4;
                 let y0 = bytes[offset];
                 let y1 = bytes[offset + 1];
                 let cb = bytes[offset + 2];
                 let cr = bytes[offset + 3];
                 samples.extend([u16::from(y0), u16::from(cb), u16::from(cr)]);
-                if pair * 2 + 1 < self.width {
-                    samples.extend([u16::from(y1), u16::from(cb), u16::from(cr)]);
-                }
+                samples.extend([u16::from(y1), u16::from(cb), u16::from(cr)]);
             }
         }
         Ok(samples)
@@ -247,13 +257,13 @@ impl Layout {
                 samples.len()
             ));
         }
+        let row_bytes = self.ybr422_row_bytes()?;
         let mut bytes = vec![0u8; self.frame_length];
-        let row_bytes = self.width.div_ceil(2) * 4;
         for y in 0..self.height {
-            for pair in 0..self.width.div_ceil(2) {
+            for pair in 0..self.width / 2 {
                 let x = pair * 2;
                 let first = (y * self.width + x) * 3;
-                let second = (y * self.width + (x + 1).min(self.width - 1)) * 3;
+                let second = first + 3;
                 let offset = y * row_bytes + pair * 4;
                 bytes[offset] = samples[first].min(255) as u8;
                 bytes[offset + 1] = samples[second].min(255) as u8;

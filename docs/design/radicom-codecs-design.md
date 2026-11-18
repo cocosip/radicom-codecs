@@ -46,7 +46,7 @@ The implementation depends on the published `radicom` crate from crates.io:
 
 ```toml
 [dependencies]
-radicom = "0.2.0"
+radicom = "0.3.0"
 ```
 
 It must not use a local path dependency, so CI and consumers build exactly the
@@ -112,7 +112,7 @@ the following standard transfer syntax constants used by codec registration:
 - `HTJ2K_LOSSLESS_RPCL`
 - `HTJ2K_LOSSY`
 
-The released `radicom 0.2.0` transfer-syntax table is reconciled with its
+The released `radicom 0.3.0` transfer-syntax table is reconciled with its
 generated UID dictionary, the DICOM transfer syntax definitions, and fo-dicom:
 HTJ2K uses `.201`, `.202`, and `.203`. The codec project must assert those values
 and must not silently register under a different UID.
@@ -315,10 +315,13 @@ Reference interoperability tests call the public `fo-dicom.Codecs` API. They do
 not link the local C# source, replace assemblies, inspect package identity, or
 call native libraries directly.
 
-For the `radicom 0.2.0` dependency upgrade, the Windows workspace suite passes
-416 tests, along with fmt, Clippy, rustdoc, and the Rust 1.89 all-features check.
-External reference matrices quoted in the family documents are historical
-evidence and have not been re-run for this upgrade.
+For the `radicom 0.3.0` dependency upgrade, the Windows workspace suite passes
+417 tests, along with fmt, Clippy, rustdoc, and the Rust 1.89 all-features check.
+The only codec change required is the native `YBR_FULL_422` frame size: it now
+follows the core's `Rows * Columns * 2` formula (PS3.3 C.7.6.3.1.2 Note 2), so an
+odd column count is rejected with a managed error instead of being written with
+padded rows. External reference matrices quoted in the family documents are
+historical evidence and have not been re-run for this upgrade.
 
 Acceptance rules are:
 
@@ -332,7 +335,7 @@ Acceptance rules are:
 ### 10.1 Interop harnesses (development-only, git-ignored)
 
 The C# oracles and the Rust harness live under `.interop/` and are not part of
-the published crates. Any harness must pin the same `radicom = "0.2.0"` registry
+the published crates. Any harness must pin the same `radicom = "0.3.0"` registry
 version as the workspace; pointing it at a local `radicom` checkout gives the
 dependency graph two incompatible `radicom` versions and breaks the `Codec`
 trait impls.

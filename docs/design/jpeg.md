@@ -104,6 +104,11 @@ The adapter uses the same byte representation as `PixelData`:
 - `SamplesPerPixel = 1` is monochrome. Three-component RGB/YBR input is handled
   by the color policy below. Other component counts are rejected in the first
   release.
+- A native `YBR_FULL_422` frame is `Rows * Columns * 2` bytes (PS3.3
+  C.7.6.3.1.2 Note 2) with no column rounding. An odd `Columns` value cannot be
+  packed as whole `Y1, Y2, Cb, Cr` groups, so a native 4:2:2 source or
+  destination with an odd width is rejected with a managed error; compressed
+  4:2:2 codestreams may still carry an odd width.
 
 The adapter must not use a lossy color conversion on a Process 14 frame. For
 signed samples, color conversion to RGB is rejected because the reference
