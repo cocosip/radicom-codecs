@@ -83,8 +83,8 @@ impl TagTree {
         let mut indices = Vec::with_capacity(self.levels);
         let mut px = x;
         let mut py = y;
-        for level in 0..self.levels {
-            indices.push(py * self.level_widths[level] + px);
+        for &level_width in self.level_widths.iter().take(self.levels) {
+            indices.push(py * level_width + px);
             px /= 2;
             py /= 2;
         }
