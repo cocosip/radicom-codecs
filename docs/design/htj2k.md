@@ -19,7 +19,7 @@ transfer syntaxes.
 | `HtJpeg2000LosslessRpclCodec` | `1.2.840.10008.1.2.4.202` | HT blocks, lossless, RPCL | encode/decode |
 | `HtJpeg2000LossyCodec` | `1.2.840.10008.1.2.4.203` | HT blocks, lossy | encode/decode |
 
-The released `radicom 0.3.0` transfer-syntax table resolves HTJ2K through its
+The released `radicom 0.3.1` transfer-syntax table resolves HTJ2K through its
 generated UID dictionary. The dictionary, fo-dicom, and DICOM use `.201/.202/.203`;
 `.108` and `.110` remain other transfer syntaxes. The codec implementation
 checks these assignments in unit and facade integration tests.
@@ -94,7 +94,7 @@ PS3.5 requires for a codestream whose MCT flag is set; decoding converts back an
 labels the native dataset `RGB`. The reversible path writes its step table with
 two reserved bit-planes (`precision + 2`, the same magnitude bound the CAP marker
 advertises), which covers the extra range the RCT and the 5/3 gain introduce.
-The bare `radicom 0.3.0` `HtJ2kParams::default()` differs: colour transform and
+The bare `radicom 0.3.1` `HtJ2kParams::default()` differs: colour transform and
 TLM markers are disabled, and progression is LRCP. Use the codec's
 `default_params()` for the reference defaults.
 All three HT codecs default to RPCL and to writing a TLM, matching
@@ -156,7 +156,7 @@ HTJ2K codec types remain inside the same crate. The released `radicom` boundary
 is aligned with the generated dictionary and the DICOM `.201/.202/.203`
 assignments.
 
-The native matrix results above predate the `radicom 0.3.0` upgrade. This upgrade
-re-runs the portable workspace tests, including HTJ2K boundary checks, without
+The native matrix results above predate the `radicom 0.3` upgrades. These upgrades
+re-run the portable workspace tests, including HTJ2K boundary checks, without
 claiming a new native-reference matrix run.
 

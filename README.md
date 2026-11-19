@@ -24,13 +24,13 @@ transfer syntaxes. It mirrors the split between the C# `fo-dicom` and
 
 ```toml
 [dependencies]
-radicom = "0.3"
-radicom-codecs = "0.3"
+radicom = "0.3.1"
+radicom-codecs = "0.3.1"
 ```
 
-Version `0.3.0` targets `radicom 0.3` and requires Rust 1.89 or newer. When
+Version `0.3.1` targets `radicom 0.3.1` and requires Rust 1.89 or newer. When
 upgrading from `radicom-codecs 0.2`, update your direct `radicom` dependency to
-`0.3` as well: codec types and the global registry belong to that core version.
+`0.3.1` as well: codec types and the global registry belong to that core version.
 
 The facade crate re-exports every codec type and owns registration. Depend on a
 family crate directly only when you want its codec types without the facade.

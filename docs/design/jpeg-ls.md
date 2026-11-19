@@ -154,7 +154,7 @@ Plane interleaving (one scan per component) is produced only when `1` is
 requested explicitly; the decoder reads it either way, and the encoder never
 emits it by default.
 
-The workspace uses the released `radicom 0.3.0` parameter types, including
+The workspace uses the released `radicom 0.3.1` parameter types, including
 `restart_interval`. A nonzero restart interval remains explicitly unsupported
 by this codec; upgrading the core dependency does not add restart-marker support.
 

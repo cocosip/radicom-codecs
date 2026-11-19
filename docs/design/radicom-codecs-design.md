@@ -46,7 +46,7 @@ The implementation depends on the published `radicom` crate from crates.io:
 
 ```toml
 [dependencies]
-radicom = "0.3.0"
+radicom = "0.3.1"
 ```
 
 It must not use a local path dependency, so CI and consumers build exactly the
@@ -112,7 +112,7 @@ the following standard transfer syntax constants used by codec registration:
 - `HTJ2K_LOSSLESS_RPCL`
 - `HTJ2K_LOSSY`
 
-The released `radicom 0.3.0` transfer-syntax table is reconciled with its
+The released `radicom 0.3.1` transfer-syntax table is reconciled with its
 generated UID dictionary, the DICOM transfer syntax definitions, and fo-dicom:
 HTJ2K uses `.201`, `.202`, and `.203`. The codec project must assert those values
 and must not silently register under a different UID.
@@ -335,7 +335,7 @@ Acceptance rules are:
 ### 10.1 Interop harnesses (development-only, git-ignored)
 
 The C# oracles and the Rust harness live under `.interop/` and are not part of
-the published crates. Any harness must pin the same `radicom = "0.3.0"` registry
+the published crates. Any harness must pin the same `radicom = "0.3.1"` registry
 version as the workspace; pointing it at a local `radicom` checkout gives the
 dependency graph two incompatible `radicom` versions and breaks the `Codec`
 trait impls.

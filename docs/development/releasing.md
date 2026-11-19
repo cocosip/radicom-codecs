@@ -21,11 +21,11 @@ utility and is `publish = false`: it is installed from the repository
 (`cargo install --path crates/radicom-codecs-tool`) and is never a crates.io
 release artifact.
 
-The workspace release version is `0.3.0`, including every internal dependency
-pin. It targets `radicom 0.3.0`; the previous `0.2.0` release used `radicom 0.2`.
-Consumers upgrading to this release must also update their direct `radicom`
-dependency to `0.3` because core types and the global registry are incompatible
-across these versions. Publish this release with the `v0.3.0` tag after the
+The workspace release version is `0.3.1`, including every internal dependency
+pin. It targets `radicom 0.3.1`; the previous `0.3.0` release used `radicom 0.3.0`.
+Consumers upgrading from `0.2` must also update their direct `radicom` dependency
+to `0.3.1` (or a newer `0.3` release) because core types and the global registry
+are versioned together. Publish this release with the `v0.3.1` tag after the
 checks below pass. Existing crate versions cannot be overwritten, and the
 publish job skips versions that already exist.
 

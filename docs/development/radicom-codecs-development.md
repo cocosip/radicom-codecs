@@ -1,6 +1,6 @@
 # radicom-codecs development plan and status
 
-**Date:** 2026-11-18
+**Date:** 2026-11-19
 **Current milestone:** All twelve DICOM codecs implemented and registered
 **Status:** RLE, classic JPEG, JPEG-LS, classic JPEG 2000, and HTJ2K are
 integrated through the `radicom` codec trait and registry.
@@ -12,11 +12,11 @@ the four classic JPEG transfer syntaxes, both JPEG-LS transfer syntaxes, both
 classic JPEG 2000 transfer syntaxes, and the three HTJ2K transfer syntaxes are
 integrated through the existing `radicom` codec trait and registry.
 
-The `radicom` dependency is the released `0.3.0` crate from crates.io, with
-`radicom-dict 0.3.0` in the lockfile. Rust 1.89 remains the MSRV. The workspace
-package version and all internal dependency pins are `0.3.0`, ready for the
-`v0.3.0` release workflow. The lockfile resolves every base package shared with
-`radicom 0.3.0` to the same version the core release resolves. CI builds and
+The `radicom` dependency is the released `0.3.1` crate from crates.io, with
+`radicom-dict 0.3.1` in the lockfile. Rust 1.89 remains the MSRV. The workspace
+package version and all internal dependency pins are `0.3.1`, ready for the
+`v0.3.1` release workflow. The lockfile resolves every base package shared with
+`radicom 0.3.1` to the same version the core release resolves. CI builds and
 validates `master`/`main`, and the tag-driven release workflow publishes the
 workspace to crates.io. See [the release runbook](releasing.md) for version-bump,
 tagging, and recovery steps.
@@ -200,15 +200,16 @@ Each stage must pass its focused tests and the previous stages before the next s
 
 ## Core integration and upgrade validation
 
-The released `radicom 0.3.0` uses its generated UID dictionary for HTJ2K, with
+The released `radicom 0.3.1` uses its generated UID dictionary for HTJ2K, with
 the DICOM `.201`, `.202`, and `.203` assignments checked by codec tests.
 
-The dependency upgrade passes workspace formatting, Clippy, all 417 tests,
-documentation generation, and the Rust 1.89 all-features check on Windows.
-The only codec adaptation is the native `YBR_FULL_422` frame size: `radicom 0.3.0`
-computes it as `Rows * Columns * 2` without rounding the column count, so the
-JPEG frame adapter now uses that formula and rejects an odd `Columns` value
-instead of writing padded rows. Compressed 4:2:2 codestreams with an odd width
-still encode and decode. The external interop results above describe earlier
-runs; native reference matrices have not been re-run for this upgrade.
+The `0.3.1` dependency upgrade is a patch release: it brings the core's
+refreshed base packages (`quick-xml 0.42` plus updated transitive crates) into
+the lockfile, and every base package shared with `radicom 0.3.1` resolves to the
+same version the core release resolves. The workspace passes formatting, Clippy,
+all 417 tests, documentation generation, and the Rust 1.89 all-features check on
+Windows. No codec code change was needed. The native `YBR_FULL_422` frame-size
+adaptation from the `0.3.0` upgrade is unchanged. The external interop results
+above describe earlier runs; native reference matrices have not been re-run for
+this upgrade.
 
