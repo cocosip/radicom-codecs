@@ -1,5 +1,7 @@
 # Compression-speed benchmark
 
+For the real-DICOM comparison against fo-dicom.Codecs and the current optimization checkpoint, see [DICOM 编解码器性能测试与续跑记录](codec-performance-handoff.md).
+
 `radicom-bench` reports how fast each transfer syntax encodes and decodes. It is
 a development tool shipped in the internal `radicom-codecs-tool` crate; it is not
 part of CI and never runs under `cargo test`.
