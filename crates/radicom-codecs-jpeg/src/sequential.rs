@@ -7,10 +7,10 @@
 use super::bit::{BitReader, BitWriter};
 use super::color::JpegColorSpace;
 use super::dct::{
-    inverse, inverse_dc, islow_forward, scaled_table, ForwardQuantizer, CHROMA_Q, LUMA_Q,
-    MAX_QUANTIZATION, ZIGZAG,
+    inverse, inverse_dc, islow_forward, scaled_table, BlockOutput, DecodedSample, ForwardQuantizer,
+    CHROMA_Q, LUMA_Q, MAX_QUANTIZATION, ZIGZAG,
 };
-use super::huffman::HuffmanTable;
+use super::huffman::{HuffmanEncoder, HuffmanTable};
 use super::marker::{check_trailing, Marker, MarkerReader, MarkerWriter};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,15 +26,61 @@ pub(crate) struct SequentialFrame {
     pub(crate) sampling: [(u8, u8); 3],
 }
 
+// JPEG T.81 Annex K default Huffman tables, ordered by component then DC/AC.
+const ANNEX_K_HUFFMAN: [(&[u8; 16], &[u8]); 4] = [
+    (
+        &[0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    ),
+    (
+        &[0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d],
+        &[
+            0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51,
+            0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1,
+            0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18,
+            0x19, 0x1a, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+            0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57,
+            0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75,
+            0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92,
+            0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+            0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3,
+            0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8,
+            0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2,
+            0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
+        ],
+    ),
+    (
+        &[0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    ),
+    (
+        &[0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77],
+        &[
+            0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07,
+            0x61, 0x71, 0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09,
+            0x23, 0x33, 0x52, 0xf0, 0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25,
+            0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38,
+            0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56,
+            0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74,
+            0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+            0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5,
+            0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba,
+            0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6,
+            0xd7, 0xd8, 0xd9, 0xda, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2,
+            0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
+        ],
+    ),
+];
+
 struct Spec {
     counts: Vec<u8>,
     values: Vec<u8>,
-    table: HuffmanTable,
+    table: HuffmanEncoder,
 }
 
 impl Spec {
     fn new(counts: Vec<u8>, values: Vec<u8>) -> Result<Self, String> {
-        let table = HuffmanTable::new(&counts, &values)?;
+        let table = HuffmanEncoder::new(&counts, &values)?;
         Ok(Self {
             counts,
             values,
@@ -47,32 +93,6 @@ impl Spec {
     fn optimal(frequencies: &[u32; 256]) -> Result<Self, String> {
         let (counts, values) = HuffmanTable::optimal(frequencies);
         Self::new(counts, values)
-    }
-}
-
-struct Tables {
-    dc: [Spec; 2],
-    ac: [Spec; 2],
-    q: [[u16; 64]; 2],
-}
-
-impl Tables {
-    fn new(
-        q: [[u16; 64]; 2],
-        dc_frequencies: &[[u32; 256]; 2],
-        ac_frequencies: &[[u32; 256]; 2],
-    ) -> Result<Self, String> {
-        Ok(Self {
-            dc: [
-                Spec::optimal(&dc_frequencies[0])?,
-                Spec::optimal(&dc_frequencies[1])?,
-            ],
-            ac: [
-                Spec::optimal(&ac_frequencies[0])?,
-                Spec::optimal(&ac_frequencies[1])?,
-            ],
-            q,
-        })
     }
 }
 
@@ -96,6 +116,15 @@ enum ScanStep<'a> {
     Restart(u8),
 }
 
+// One optimized-Huffman statistics pass yields all the information needed to
+// write the scan after its code lengths are known.
+#[derive(Clone, Copy)]
+struct EntropyToken {
+    suffix: u16,
+    symbol: u8,
+    table: u8, // DC/AC pairs for luma and chroma, or restart marker 4.
+}
+
 /// How one component of a scan is pooled into block samples: the source step in
 /// each direction, the component itself, and libjpeg's input smoothing factor.
 #[derive(Clone, Copy)]
@@ -106,6 +135,22 @@ struct Pooling {
     smoothing: u32,
 }
 impl SequentialFrame {
+    pub(crate) fn convert_to_rgb(&mut self) {
+        if self.sampling == [(2, 1), (1, 1), (1, 1)] && self.width.div_ceil(2) > 2 {
+            super::color::ybr422_to_rgb(&mut self.samples, self.width, self.precision);
+        } else {
+            fancy_upsample(
+                &mut self.samples,
+                self.width,
+                self.height,
+                self.precision,
+                self.components,
+                &self.sampling,
+            );
+            super::color::ybr_to_rgb(&mut self.samples, self.precision);
+        }
+    }
+
     pub(crate) fn new(
         width: usize,
         height: usize,
@@ -139,6 +184,7 @@ impl SequentialFrame {
 
     /// Encode with libjpeg's input smoothing_factor (`0..=100`). It only shapes
     /// the encoder input; DICOM has no decode-side field for it.
+    #[cfg(test)]
     pub(crate) fn encode_with_colorspace(
         &self,
         quality: u32,
@@ -147,6 +193,28 @@ impl SequentialFrame {
         smoothing: u32,
         restart_interval: Option<u16>,
         colorspace: JpegColorSpace,
+    ) -> Result<Vec<u8>, String> {
+        self.encode_frame(
+            quality,
+            extended,
+            sampling_half,
+            smoothing,
+            restart_interval,
+            colorspace,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_frame(
+        &self,
+        quality: u32,
+        extended: bool,
+        sampling_half: bool,
+        smoothing: u32,
+        restart_interval: Option<u16>,
+        colorspace: JpegColorSpace,
+        optimize_huffman: bool,
     ) -> Result<Vec<u8>, String> {
         let components = (0..self.components).collect::<Vec<_>>();
         self.encode_scans_colors(
@@ -157,6 +225,7 @@ impl SequentialFrame {
             restart_interval,
             std::slice::from_ref(&components),
             colorspace,
+            optimize_huffman,
         )
     }
 
@@ -202,6 +271,7 @@ impl SequentialFrame {
             restart_interval,
             scans,
             test_colorspace(self.components),
+            true,
         )
     }
 
@@ -215,6 +285,7 @@ impl SequentialFrame {
         restart_interval: Option<u16>,
         scans: &[Vec<u8>],
         colorspace: JpegColorSpace,
+        optimize_huffman: bool,
     ) -> Result<Vec<u8>, String> {
         if sampling_half && self.components != 3 {
             return Err("JPEG 4:2:2 sampling requires three components".into());
@@ -241,6 +312,7 @@ impl SequentialFrame {
             restart_interval,
             scans,
             colorspace,
+            optimize_huffman,
         )
     }
 
@@ -265,6 +337,7 @@ impl SequentialFrame {
             restart_interval,
             scans,
             test_colorspace(self.components),
+            true,
         )
     }
 
@@ -278,6 +351,7 @@ impl SequentialFrame {
         restart_interval: Option<u16>,
         scans: &[Vec<u8>],
         colorspace: JpegColorSpace,
+        optimize_huffman: bool,
     ) -> Result<Vec<u8>, String> {
         if quality > 100 {
             return Err("JPEG quality must be 0..=100".into());
@@ -317,10 +391,10 @@ impl SequentialFrame {
             }
         }
         let q = quant_tables(quality.max(1), extended);
-        let quantizers = [
-            ForwardQuantizer::new(&q[0], self.precision),
-            ForwardQuantizer::new(&q[1], self.precision),
-        ];
+        let table_count = usize::from(colorspace.table_id(usize::from(self.components) - 1)) + 1;
+        let luma = ForwardQuantizer::new(&q[0], self.precision);
+        let chroma = (table_count == 2).then(|| ForwardQuantizer::new(&q[1], self.precision));
+        let quantizers = [&luma, chroma.as_ref().unwrap_or(&luma)];
         let mut dc_frequencies = [[0u32; 256]; 2];
         let mut ac_frequencies = [[0u32; 256]; 2];
         // Each component can end with up to four blocks of MCU padding.
@@ -328,10 +402,13 @@ impl SequentialFrame {
         let cache_capacity = (self.width.div_ceil(8) + 4)
             * (self.height.div_ceil(8) + 4)
             * usize::from(self.components);
-        let mut block_cache = Vec::new();
-        let cache_blocks = cache_capacity <= (64 << 20) / size_of::<[i32; 64]>()
-            && block_cache.try_reserve_exact(cache_capacity).is_ok();
-        for scan in scans {
+        let mut tokens = Vec::new();
+        let mut scan_ends = Vec::new();
+        // Each block emits at most 64 symbols and one restart marker.
+        let cache_tokens = optimize_huffman
+            && cache_capacity <= (64 << 20) / (65 * size_of::<EntropyToken>())
+            && tokens.try_reserve_exact(cache_capacity * 65).is_ok();
+        for scan in scans.iter().filter(|_| optimize_huffman) {
             self.walk_scan(
                 &quantizers,
                 sampling,
@@ -339,23 +416,53 @@ impl SequentialFrame {
                 scan,
                 restart_interval,
                 colorspace,
-                None,
                 |step| {
-                    if let ScanStep::Block { slot, diff, block } = step {
-                        if cache_blocks {
-                            block_cache.push(*block);
+                    match step {
+                        ScanStep::Block { slot, diff, block } => {
+                            let size = category(diff);
+                            dc_frequencies[slot][usize::from(size)] += 1;
+                            if cache_tokens {
+                                tokens.push(EntropyToken {
+                                    suffix: amplitude(diff, size) as u16,
+                                    symbol: size,
+                                    table: 2 * slot as u8,
+                                });
+                            }
+                            for_each_ac(block, |symbol, suffix, _| {
+                                ac_frequencies[slot][usize::from(symbol)] += 1;
+                                if cache_tokens {
+                                    tokens.push(EntropyToken {
+                                        suffix: suffix as u16,
+                                        symbol,
+                                        table: 2 * slot as u8 + 1,
+                                    });
+                                }
+                                Ok(())
+                            })?;
                         }
-                        dc_frequencies[slot][usize::from(category(diff))] += 1;
-                        for_each_ac(block, |symbol, _, _| {
-                            ac_frequencies[slot][usize::from(symbol)] += 1;
-                            Ok(())
-                        })?;
+                        ScanStep::Restart(index) if cache_tokens => tokens.push(EntropyToken {
+                            suffix: 0,
+                            symbol: index,
+                            table: 4,
+                        }),
+                        ScanStep::Restart(_) => {}
                     }
                     Ok(())
                 },
             )?;
+            scan_ends.push(tokens.len());
         }
-        let tables = Tables::new(q, &dc_frequencies, &ac_frequencies)?;
+        let mut tables = Vec::with_capacity(2 * table_count);
+        if optimize_huffman {
+            for slot in 0..table_count {
+                tables.push(Spec::optimal(&dc_frequencies[slot])?);
+                tables.push(Spec::optimal(&ac_frequencies[slot])?);
+            }
+        } else {
+            for &(counts, values) in &ANNEX_K_HUFFMAN[..2 * table_count] {
+                tables.push(Spec::new(counts.to_vec(), values.to_vec())?);
+            }
+        }
         let mut out = MarkerWriter::default();
         colorspace.write_file_header(&mut out)?;
         // jcmarker.c `write_frame_header`: one DQT per quantization table
@@ -364,7 +471,7 @@ impl SequentialFrame {
         for component in 0..usize::from(self.components) {
             let id = usize::from(colorspace.table_id(component));
             if !written_quant[id] {
-                out.write_segment(Marker::Dqt, &dqt_payload(id as u8, &tables.q[id]))?;
+                out.write_segment(Marker::Dqt, &dqt_payload(id as u8, &q[id]))?;
                 written_quant[id] = true;
             }
         }
@@ -381,16 +488,20 @@ impl SequentialFrame {
         let mut sent_dc = [false; 2];
         let mut sent_ac = [false; 2];
         let mut last_restart_interval = 0u16;
-        let mut cached_blocks = block_cache.iter();
-        for scan in scans {
+        let mut scan_start = 0;
+        for (index, scan) in scans.iter().enumerate() {
+            let scan_end = scan_ends.get(index).copied().unwrap_or(0);
             for &component in scan {
                 let id = usize::from(colorspace.table_id(usize::from(component)));
                 if !sent_dc[id] {
-                    out.write_segment(Marker::Dht, &dht_payload(id as u8, false, &tables.dc[id]))?;
+                    out.write_segment(Marker::Dht, &dht_payload(id as u8, false, &tables[2 * id]))?;
                     sent_dc[id] = true;
                 }
                 if !sent_ac[id] {
-                    out.write_segment(Marker::Dht, &dht_payload(id as u8, true, &tables.ac[id]))?;
+                    out.write_segment(
+                        Marker::Dht,
+                        &dht_payload(id as u8, true, &tables[2 * id + 1]),
+                    )?;
                     sent_ac[id] = true;
                 }
             }
@@ -401,17 +512,41 @@ impl SequentialFrame {
                 }
             }
             out.write_segment(Marker::Sos, &sos_payload(scan, colorspace))?;
-            self.write_scan(
-                &mut out,
-                &tables,
-                sampling,
-                smoothing,
-                scan,
-                restart_interval,
-                &quantizers,
-                colorspace,
-                cache_blocks.then_some(&mut cached_blocks),
-            )?;
+            if cache_tokens {
+                let mut bits = BitWriter::default();
+                for token in &tokens[scan_start..scan_end] {
+                    if token.table == 4 {
+                        bits.flush_to_byte();
+                        out.write_raw(&bits.take_bytes());
+                        out.write_marker(Marker::Restart(token.symbol))?;
+                    } else {
+                        let size = if token.table & 1 == 0 {
+                            token.symbol
+                        } else {
+                            token.symbol & 15
+                        };
+                        tables[usize::from(token.table)].table.encode_with_suffix(
+                            token.symbol,
+                            u32::from(token.suffix),
+                            size,
+                            &mut bits,
+                        )?;
+                    }
+                }
+                out.write_raw(&bits.finish()?);
+            } else {
+                self.write_scan(
+                    &mut out,
+                    &tables,
+                    sampling,
+                    smoothing,
+                    scan,
+                    restart_interval,
+                    &quantizers,
+                    colorspace,
+                )?;
+            }
+            scan_start = scan_end;
         }
         out.write_marker(Marker::Eoi)?;
         Ok(out.into_bytes())
@@ -423,13 +558,12 @@ impl SequentialFrame {
     #[allow(clippy::too_many_arguments)]
     fn walk_scan(
         &self,
-        quantizers: &[ForwardQuantizer; 2],
+        quantizers: &[&ForwardQuantizer; 2],
         sampling: &[(u8, u8); 3],
         smoothing: u32,
         components: &[u8],
         restart_interval: Option<u16>,
         colorspace: JpegColorSpace,
-        mut cached_blocks: Option<&mut std::slice::Iter<'_, [i32; 64]>>,
         mut visit: impl FnMut(ScanStep<'_>) -> Result<(), String>,
     ) -> Result<(), String> {
         let interleaved = components.len() > 1;
@@ -441,6 +575,33 @@ impl SequentialFrame {
             interleaved,
             sampling[usize::from(components[0])],
         );
+        let empty = Pooling {
+            step_x: 0,
+            step_y: 0,
+            component: 0,
+            smoothing: 0,
+        };
+        let mut geometry = [(0, 0, empty, 0, 0, 0); 3];
+        let geometry = &mut geometry[..components.len()];
+        for (entry, &component) in geometry.iter_mut().zip(components) {
+            let component = usize::from(component);
+            let (h, v) = sampling[component];
+            let (blocks_x, blocks_y) = if interleaved {
+                (usize::from(h), usize::from(v))
+            } else {
+                (1, 1)
+            };
+            let pooling = Pooling {
+                step_x: usize::from(hmax / h),
+                step_y: usize::from(vmax / v),
+                component,
+                smoothing,
+            };
+            let table = usize::from(colorspace.table_id(component));
+            let visible_x = self.width.div_ceil(8 * pooling.step_x);
+            let visible_y = self.height.div_ceil(8 * pooling.step_y);
+            *entry = (blocks_x, blocks_y, pooling, table, visible_x, visible_y);
+        }
         let mut previous_dc = [0i32; 3];
         let mut mcu = 0usize;
         let mut restart_index = 0u8;
@@ -454,44 +615,31 @@ impl SequentialFrame {
                     }
                 }
                 mcu += 1;
-                for &component in components {
-                    let c = usize::from(component);
-                    let table = usize::from(colorspace.table_id(c));
-                    let (h, v) = sampling[c];
-                    let (blocks_x, blocks_y) = if interleaved {
-                        (usize::from(h), usize::from(v))
-                    } else {
-                        (1, 1)
-                    };
-                    let (step_x, step_y) = upsampling(sampling, self.components, c);
-                    let pooling = Pooling {
-                        step_x,
-                        step_y,
-                        component: c,
-                        smoothing,
-                    };
+                for &(blocks_x, blocks_y, pooling, table, visible_x, visible_y) in geometry.iter() {
+                    let c = pooling.component;
                     for local_y in 0..blocks_y {
                         for local_x in 0..blocks_x {
                             let block_x = mx * blocks_x + local_x;
                             let block_y = my * blocks_y + local_y;
-                            let computed;
-                            let quant = if let Some(blocks) = cached_blocks.as_deref_mut() {
-                                blocks
-                                    .next()
-                                    .ok_or("JPEG quantized block cache is incomplete")?
+                            if block_x >= visible_x || block_y >= visible_y {
+                                // A full padding block repeats the previous DC and emits EOB.
+                                visit(ScanStep::Block {
+                                    slot: table,
+                                    diff: 0,
+                                    block: &[0; 64],
+                                })?;
+                                continue;
+                            }
+                            let mut block = [0i32; 64];
+                            self.load_block(pooling, block_x, block_y, &mut block);
+                            let quant = if block.iter().all(|&sample| sample == block[0]) {
+                                // A constant block has only one DCT coefficient, 64 * sample.
+                                let mut quantized = [0; 64];
+                                quantized[0] = quantizers[table].quantize_one(0, 64 * block[0]);
+                                quantized
                             } else {
-                                let mut block = [0i32; 64];
-                                self.load_block(pooling, block_x, block_y, &mut block);
-                                computed = if block.iter().all(|&sample| sample == block[0]) {
-                                    // A constant block has only one DCT coefficient, 64 * sample.
-                                    let mut quantized = [0; 64];
-                                    quantized[0] = quantizers[table].quantize_one(0, 64 * block[0]);
-                                    quantized
-                                } else {
-                                    let coefficients = islow_forward(&block, self.precision);
-                                    quantizers[table].quantize(&coefficients)
-                                };
-                                &computed
+                                let coefficients = islow_forward(&block, self.precision);
+                                quantizers[table].quantize(&coefficients)
                             };
                             let dc = quant[0];
                             let diff = dc - previous_dc[c];
@@ -499,7 +647,7 @@ impl SequentialFrame {
                             visit(ScanStep::Block {
                                 slot: table,
                                 diff,
-                                block: quant,
+                                block: &quant,
                             })?;
                         }
                     }
@@ -513,14 +661,13 @@ impl SequentialFrame {
     fn write_scan(
         &self,
         out: &mut MarkerWriter,
-        tables: &Tables,
+        tables: &[Spec],
         sampling: &[(u8, u8); 3],
         smoothing: u32,
         components: &[u8],
         restart_interval: Option<u16>,
-        quantizers: &[ForwardQuantizer; 2],
+        quantizers: &[&ForwardQuantizer; 2],
         colorspace: JpegColorSpace,
-        cached_blocks: Option<&mut std::slice::Iter<'_, [i32; 64]>>,
     ) -> Result<(), String> {
         let mut bits = BitWriter::default();
         self.walk_scan(
@@ -530,7 +677,6 @@ impl SequentialFrame {
             components,
             restart_interval,
             colorspace,
-            cached_blocks,
             |step| match step {
                 ScanStep::Restart(index) => {
                     bits.flush_to_byte();
@@ -538,9 +684,9 @@ impl SequentialFrame {
                     out.write_marker(Marker::Restart(index))
                 }
                 ScanStep::Block { slot, diff, block } => {
-                    write_value(&mut bits, &tables.dc[slot].table, diff)?;
+                    write_value(&mut bits, &tables[2 * slot].table, diff)?;
                     for_each_ac(block, |symbol, value, size| {
-                        tables.ac[slot]
+                        tables[2 * slot + 1]
                             .table
                             .encode_with_suffix(symbol, value, size, &mut bits)
                     })
@@ -555,6 +701,23 @@ impl SequentialFrame {
         let offset = 1 << (self.precision - 1);
         let left = block_x * 8;
         let top = block_y * 8;
+        if pooling.step_x == 2
+            && pooling.step_y == 1
+            && self.components == 3
+            && (left + 8) * 2 <= self.width
+            && top + 8 <= self.height
+        {
+            for (y, row) in block.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                let start = ((top + y) * self.width + left * 2) * 3;
+                let source = &self.samples[start..start + 48];
+                let component = pooling.component;
+                for (x, (dest, pair)) in row.iter_mut().zip(source.as_chunks::<6>().0).enumerate() {
+                    let sum = i32::from(pair[component]) + i32::from(pair[component + 3]);
+                    *dest = ((sum + (x & 1) as i32) >> 1) - offset;
+                }
+            }
+            return;
+        }
         if pooling.smoothing == 0
             && pooling.step_x == 1
             && pooling.step_y == 1
@@ -585,9 +748,7 @@ impl SequentialFrame {
         }
     }
 
-    /// Average the `step_x * step_y` source pixels behind one downsampled
-    /// sample. Source coordinates clamp to the last pixel and the sum rounds up,
-    /// which is the existing (and reference) downsampling behavior.
+    /// Average a source cell after replicating the right and bottom edges.
     fn cell_sample(&self, pooling: Pooling, u: usize, v: usize) -> u32 {
         let mut sum = 0u32;
         for dy in 0..pooling.step_y {
@@ -597,7 +758,15 @@ impl SequentialFrame {
                 sum += self.pixel(pooling.component, column, row);
             }
         }
-        sum.div_ceil((pooling.step_x * pooling.step_y) as u32)
+        match (pooling.step_x, pooling.step_y) {
+            // jcsample.c alternates the rounding bias along each output row.
+            (2, 1) => (sum + (u & 1) as u32) >> 1,
+            (2, 2) => (sum + 1 + (u & 1) as u32) >> 2,
+            (x, y) => {
+                let count = (x * y) as u32;
+                (sum + count / 2) / count
+            }
+        }
     }
 
     /// One source sample with libjpeg's edge replication (`expand_right_edge`).
@@ -691,6 +860,67 @@ impl SequentialFrame {
         expected: Option<&FrameExpectation>,
         baseline: bool,
     ) -> Result<Self, String> {
+        let (header, samples) = Self::decode_samples(data, expected, baseline)?;
+        Ok(Self {
+            width: header.width,
+            height: header.height,
+            precision: header.precision,
+            components: header.components,
+            samples,
+            sampling: header.sampling,
+        })
+    }
+
+    pub(crate) fn decode_bytes(
+        data: &[u8],
+        expected: &FrameExpectation,
+        baseline: bool,
+        bytes_per_sample: usize,
+    ) -> Result<Vec<u8>, String> {
+        match bytes_per_sample {
+            1 if expected.precision == 8 => {
+                Self::decode_samples(data, Some(expected), baseline).map(|(_, samples)| samples)
+            }
+            2 => Self::decode_samples::<[u8; 2]>(data, Some(expected), baseline)
+                .map(|(_, samples)| samples.into_flattened()),
+            _ => Err("JPEG sample precision does not fit the output layout".into()),
+        }
+    }
+
+    pub(crate) fn decode_rgb8(
+        data: &[u8],
+        expected: &FrameExpectation,
+        baseline: bool,
+    ) -> Result<Vec<u8>, String> {
+        if expected.precision != 8 || expected.components != 3 {
+            return Err("JPEG RGB byte output requires three eight-bit components".into());
+        }
+        let (header, mut samples) = Self::decode_samples::<u8>(data, Some(expected), baseline)?;
+        if header.sampling == [(2, 1), (1, 1), (1, 1)] && header.width.div_ceil(2) > 2 {
+            super::color::ybr422_to_rgb(&mut samples, header.width, 8);
+            return Ok(samples);
+        }
+        let mut frame = Self {
+            width: header.width,
+            height: header.height,
+            precision: header.precision,
+            components: header.components,
+            samples: samples.into_iter().map(u16::from).collect(),
+            sampling: header.sampling,
+        };
+        frame.convert_to_rgb();
+        Ok(frame
+            .samples
+            .into_iter()
+            .map(|sample| sample as u8)
+            .collect())
+    }
+
+    fn decode_samples<T: DecodedSample>(
+        data: &[u8],
+        expected: Option<&FrameExpectation>,
+        baseline: bool,
+    ) -> Result<(FrameHeader, Vec<T>), String> {
         let mut r = MarkerReader::new(data);
         expect(&mut r, Marker::Soi)?;
         let mut q = [[0u16; 64]; 4];
@@ -791,15 +1021,8 @@ impl SequentialFrame {
         {
             return Err("JPEG stream does not decode every component".to_owned());
         }
-        let mut frame = Self::new(
-            header.width,
-            header.height,
-            header.precision,
-            header.components,
-            samples,
-        )?;
-        frame.sampling = header.sampling;
-        Ok(frame)
+        // SOF defines the allocation and decode_scan clamps every written sample.
+        Ok((header, samples))
     }
 
     /// Decode without a destination contract; the marker and entropy tests use
@@ -867,13 +1090,6 @@ fn max_sampling(sampling: &[(u8, u8); 3], components: u8) -> (u8, u8) {
         vmax = vmax.max(v);
     }
     (hmax, vmax)
-}
-
-/// Pixel expansion of one component: `Hmax/H_i` by `Vmax/V_i`.
-fn upsampling(sampling: &[(u8, u8); 3], components: u8, c: usize) -> (usize, usize) {
-    let (hmax, vmax) = max_sampling(sampling, components);
-    let (h, v) = sampling[c];
-    (usize::from(hmax / h), usize::from(vmax / v))
 }
 
 /// T.81 A.2.3/B.2.3 MCU grid. An interleaved scan is laid out on the frame MCU
@@ -1011,15 +1227,117 @@ pub(crate) fn fancy_upsample(
     }
 }
 
+// A short AC code and its amplitude are often contained in one ten-bit prefix.
+// Entries pack the signed coefficient, zero run and total consumed width.
+fn ac_prefixes(table: &HuffmanTable) -> [u32; 1024] {
+    let mut prefixes = [0; 1024];
+    let eob = table.codeword(0);
+    for symbol in 0..=255u8 {
+        let Some((code, length)) = table.codeword(symbol) else {
+            continue;
+        };
+        let size = symbol & 15;
+        let width = length + size;
+        if width > 10 || (size == 0 && symbol != 0) {
+            continue;
+        }
+        for amplitude in 0..(1 << size) {
+            let value = if size == 0 {
+                0
+            } else {
+                decode_amplitude(amplitude, size)
+            };
+            let prefix = ((usize::from(code) << size) | amplitude as usize) << (10 - width);
+            let packed = ((value as u32) << 16) | (u32::from(symbol >> 4) << 8) | u32::from(width);
+            let range = &mut prefixes[prefix..prefix + (1 << (10 - width))];
+            range.fill(packed);
+            if value != 0 {
+                if let Some((end_code, end_len)) = eob {
+                    if width + end_len <= 10 {
+                        let free = 10 - width - end_len;
+                        let first = usize::from(end_code) << free;
+                        range[first..first + (1 << free)]
+                            .fill((packed + u32::from(end_len)) | 0x8000);
+                    }
+                }
+            }
+        }
+    }
+    prefixes
+}
+
+struct BlockPrefixes {
+    dc: [u32; 1024],
+    ac: [u32; 1024],
+}
+
+impl BlockPrefixes {
+    fn new(dc: &HuffmanTable, ac: &HuffmanTable, max_category: u8) -> Self {
+        let mut prefixes = dc.short_amplitudes::<10, 1024>();
+        let eob = ac.codeword(0);
+        for (i, entry) in prefixes.iter_mut().enumerate() {
+            let used = *entry as u8;
+            if (*entry >> 8) as u8 > max_category {
+                *entry = 0;
+            } else if used != 0 {
+                // Consume an entire DC-only block if EOB also fits the prefix.
+                if let Some((code, len)) = eob {
+                    let total = used + len;
+                    if total <= 10 && ((i >> (10 - total)) & ((1 << len) - 1)) == usize::from(code)
+                    {
+                        *entry = (*entry & 0xffff_0000) | 0x8000 | u32::from(total);
+                    }
+                }
+            }
+        }
+        Self {
+            dc: prefixes,
+            ac: ac_prefixes(ac),
+        }
+    }
+}
+
 /// Decode one scan and return how many entropy bytes it consumed.
-fn decode_scan(
+fn decode_scan<T: DecodedSample>(
     data: &[u8],
     start: usize,
     scan: &[(u8, &HuffmanTable, &HuffmanTable)],
     frame: &FrameHeader,
     q: &[[u16; 64]; 4],
     restart_interval: Option<u16>,
-    samples: &mut [u16],
+    samples: &mut [T],
+) -> Result<usize, String> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("bmi2") {
+        // SAFETY: both target features are available on this CPU.
+        return unsafe { decode_scan_x86(data, start, scan, frame, q, restart_interval, samples) };
+    }
+    decode_scan_inner::<false, T>(data, start, scan, frame, q, restart_interval, samples)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi2")]
+unsafe fn decode_scan_x86<T: DecodedSample>(
+    data: &[u8],
+    start: usize,
+    scan: &[(u8, &HuffmanTable, &HuffmanTable)],
+    frame: &FrameHeader,
+    q: &[[u16; 64]; 4],
+    restart_interval: Option<u16>,
+    samples: &mut [T],
+) -> Result<usize, String> {
+    decode_scan_inner::<true, T>(data, start, scan, frame, q, restart_interval, samples)
+}
+
+#[inline(always)]
+fn decode_scan_inner<const AVX2: bool, T: DecodedSample>(
+    data: &[u8],
+    start: usize,
+    scan: &[(u8, &HuffmanTable, &HuffmanTable)],
+    frame: &FrameHeader,
+    q: &[[u16; 64]; 4],
+    restart_interval: Option<u16>,
+    samples: &mut [T],
 ) -> Result<usize, String> {
     let entropy = data.get(start..).ok_or("invalid JPEG entropy offset")?;
     let mut bits = BitReader::new(entropy);
@@ -1053,29 +1371,60 @@ fn decode_scan(
         interleaved,
         frame.sampling[usize::from(scan[0].0)],
     );
-    // A full-resolution MCU whose components all repeat their previous DC and
+    let mut ac_lookup: [Option<BlockPrefixes>; 3] = [None, None, None];
+    let mut ac_slots = [0; 3];
+    if mcu_w * mcu_h >= 64 {
+        for (index, &(component, dc, table)) in scan.iter().enumerate() {
+            let slot = scan[..index]
+                .iter()
+                .position(|previous| {
+                    std::ptr::eq(previous.1, dc) && std::ptr::eq(previous.2, table)
+                })
+                .unwrap_or(index);
+            if slot == index {
+                ac_lookup[slot] = Some(BlockPrefixes::new(dc, table, frame.max_dc_category));
+            }
+            ac_slots[usize::from(component)] = slot;
+        }
+    }
+    let is_444 = frame.sampling == [(1, 1); 3];
+    let is_422 = stride == 3 && frame.sampling == [(2, 1), (1, 1), (1, 1)];
+    let mcu_width = if is_422 { 16 } else { 8 };
+    // An MCU whose components all repeat their previous DC and
     // immediately emit EOB can be recognized from its exact Huffman prefix.
-    let repeat = if scan.len() == stride && frame.sampling == [(1, 1); 3] {
-        scan.iter()
-            .try_fold((0usize, 0u8), |(mut word, mut len), &(_, dc, ac)| {
-                for table in [dc, ac] {
-                    let (code, n) = table.codeword(0)?;
-                    len += n;
-                    if len > 32 {
-                        return None;
+    let repeat = if scan.len() == stride && (is_444 || is_422) {
+        scan.iter().try_fold(
+            (0usize, 0u8),
+            |(mut word, mut len), &(component, dc, ac)| {
+                for _ in 0..geometry[usize::from(component)].0 {
+                    for table in [dc, ac] {
+                        let (code, n) = table.codeword(0)?;
+                        len += n;
+                        if len > 32 {
+                            return None;
+                        }
+                        word = (word << n) | usize::from(code);
                     }
-                    word = (word << n) | usize::from(code);
                 }
                 Some((word, len))
-            })
+            },
+        )
     } else {
         None
     };
     let mut prev = [0i64; 3];
+    let repeat = repeat.map(|(word, length)| {
+        let count = 32 / length;
+        let group = (1..count).fold(word, |value, _| (value << length) | word);
+        (word, length, group, count)
+    });
     let mut mcu = 0usize;
     let mut restart_index = 0u8;
     for my in 0..mcu_h {
-        for mx in 0..mcu_w {
+        let mut next_x = 0;
+        while next_x < mcu_w {
+            let mx = next_x;
+            next_x += 1;
             if let Some(interval) = restart_interval {
                 if mcu != 0 && mcu.is_multiple_of(usize::from(interval)) {
                     bits.align_to_byte();
@@ -1093,34 +1442,139 @@ fn decode_scan(
                 }
             }
             mcu += 1;
-            if let Some((word, len)) = repeat {
-                if (mx + 1) * 8 <= width
+            if let Some((word, len, group, group_count)) = repeat {
+                if (mx + 1) * mcu_width <= width
                     && (my + 1) * 8 <= height
                     && bits.peek_prefix(len) == Some(word)
                 {
                     bits.consume_prefix(len);
-                    let mut pixel = [0u16; 3];
+                    let mut available = width / mcu_width - next_x;
+                    if let Some(interval) = restart_interval {
+                        available = available
+                            .min(usize::from(interval) - 1 - (mcu - 1) % usize::from(interval));
+                    }
+                    let mut extra = 0;
+                    while available - extra >= usize::from(group_count)
+                        && bits.peek_prefix(len * group_count) == Some(group)
+                    {
+                        bits.consume_prefix(len * group_count);
+                        extra += usize::from(group_count);
+                    }
+                    while extra < available && bits.peek_prefix(len) == Some(word) {
+                        bits.consume_prefix(len);
+                        extra += 1;
+                    }
+                    next_x += extra;
+                    mcu += extra;
+                    let mut pixel = [T::default(); 3];
                     for c in 0..stride {
                         // A previous DC value already passed the dequantization check.
                         let coefficient =
                             (prev[c] * i64::from(q[usize::from(frame.qids[c])][0])) as i32;
-                        pixel[c] =
-                            inverse_dc(coefficient).saturating_add(offset).clamp(0, max) as u16;
+                        pixel[c] = T::from_word(
+                            inverse_dc(coefficient).saturating_add(offset).clamp(0, max) as u16,
+                        );
                     }
                     if stride == 1 {
                         for y in my * 8..my * 8 + 8 {
-                            let start = y * width + mx * 8;
-                            samples[start..start + 8].fill(pixel[0]);
+                            let start = y * width + mx * mcu_width;
+                            samples[start..start + (extra + 1) * mcu_width].fill(pixel[0]);
                         }
                     } else {
-                        let row: [u16; 24] = std::array::from_fn(|i| pixel[i % 3]);
+                        let row: [T; 24] = std::array::from_fn(|i| pixel[i % 3]);
                         for y in my * 8..my * 8 + 8 {
-                            let start = (y * width + mx * 8) * 3;
-                            samples[start..start + 24].copy_from_slice(&row);
+                            let start = (y * width + mx * mcu_width) * 3;
+                            for block in samples[start..start + (extra + 1) * mcu_width * 3]
+                                .chunks_exact_mut(24)
+                            {
+                                block.copy_from_slice(&row);
+                            }
                         }
                     }
                     continue;
                 }
+            }
+            if stride == 1 && (mx + 1) * 8 <= width && (my + 1) * 8 <= height {
+                let (_, dc, ac) = scan[0];
+                let start = my * 8 * width + mx * 8;
+                decode_block(
+                    &mut bits,
+                    dc,
+                    ac,
+                    ac_lookup[ac_slots[0]].as_ref(),
+                    &q[usize::from(frame.qids[0])],
+                    &mut prev[0],
+                    frame,
+                    BlockOutput::new(&mut samples[start..], width),
+                )?;
+                continue;
+            }
+            if scan.len() == 3
+                && (is_444 || is_422)
+                && (mx + 1) * mcu_width <= width
+                && (my + 1) * 8 <= height
+            {
+                let mut blocks = [[0u16; 64]; 4];
+                for &(component, dc_table, ac_table) in scan {
+                    let c = usize::from(component);
+                    let first = if c == 0 { 0 } else { c + 1 };
+                    for output in &mut blocks[first..first + geometry[c].0] {
+                        decode_block(
+                            &mut bits,
+                            dc_table,
+                            ac_table,
+                            ac_lookup[ac_slots[c]].as_ref(),
+                            &q[usize::from(frame.qids[c])],
+                            &mut prev[c],
+                            frame,
+                            BlockOutput::new(output, 8),
+                        )?;
+                    }
+                }
+                let stride = 3 * width;
+                let start = my * 8 * stride + mx * mcu_width * 3;
+                let output = &mut samples[start..start + 7 * stride + mcu_width * 3];
+                #[cfg(target_arch = "x86_64")]
+                if AVX2 {
+                    // SAFETY: The AVX2 scan entry point already checked CPU
+                    // support, and the output has eight writable MCU rows.
+                    unsafe {
+                        if is_422 {
+                            interleave_mcu_avx2::<0, T>(
+                                [&blocks[0], &blocks[2], &blocks[3]],
+                                output,
+                                stride,
+                            );
+                            interleave_mcu_avx2::<1, T>(
+                                [&blocks[1], &blocks[2], &blocks[3]],
+                                &mut output[24..],
+                                stride,
+                            );
+                        } else {
+                            interleave_mcu_avx2::<2, T>(
+                                [&blocks[0], &blocks[2], &blocks[3]],
+                                output,
+                                stride,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                for dy in 0..8 {
+                    let start = dy * stride;
+                    for (dx, pixel) in output[start..start + mcu_width * 3]
+                        .as_chunks_mut::<3>()
+                        .0
+                        .iter_mut()
+                        .enumerate()
+                    {
+                        let luma = dy * 8 + dx % 8;
+                        let chroma = dy * 8 + (dx >> usize::from(is_422));
+                        *pixel = [blocks[dx / 8][luma], blocks[2][chroma], blocks[3][chroma]]
+                            .map(T::from_word);
+                    }
+                }
+                continue;
             }
             for &(component, dc_table, ac_table) in scan {
                 let c = usize::from(component);
@@ -1130,105 +1584,57 @@ fn decode_scan(
                     for local_x in 0..blocks_x {
                         let block_x = mx * blocks_x + local_x;
                         let block_y = my * blocks_y + local_y;
-                        let mut coeff = [0i32; 64];
-                        let dc = read_value(&mut bits, dc_table, frame.max_dc_category)?;
-                        prev[c] = prev[c]
-                            .checked_add(i64::from(dc))
-                            .ok_or_else(|| "JPEG DC predictor overflows i64".to_owned())?;
-                        let quant_dc = i32::try_from(prev[c]).map_err(|_| {
-                            "JPEG DC coefficient is outside the i32 range".to_owned()
-                        })?;
-                        coeff[0] = quant_dc.checked_mul(i32::from(qtable[0])).ok_or_else(|| {
-                            "JPEG dequantized coefficient is outside the i32 range".to_owned()
-                        })?;
-                        let mut k = 1;
-                        while k < 64 {
-                            let sym = ac_table.decode(&mut bits)?;
-                            if sym == 0 {
-                                break;
-                            }
-                            let run = sym >> 4;
-                            let size = sym & 15;
-                            if size == 0 {
-                                if run != 15 {
-                                    return Err("invalid JPEG AC run".into());
-                                }
-                                k += 16;
-                                if k > 64 {
-                                    return Err("JPEG AC run exceeds block".into());
-                                }
-                            } else {
-                                k += usize::from(run);
-                                if k >= 64 {
-                                    return Err("JPEG AC run exceeds block".into());
-                                }
-                                let index = ZIGZAG[k];
-                                // The four-bit category and sixteen-bit quantizer give
-                                // a product bounded by 32767 * 65535.
-                                coeff[index] = decode_amplitude(bits.read_bits(size)?, size)
-                                    * i32::from(qtable[index]);
-                                k += 1;
-                            }
-                        }
+                        let mut block = [0u16; 64];
+                        decode_block(
+                            &mut bits,
+                            dc_table,
+                            ac_table,
+                            ac_lookup[ac_slots[c]].as_ref(),
+                            qtable,
+                            &mut prev[c],
+                            frame,
+                            BlockOutput::new(&mut block, 8),
+                        )?;
                         let left = block_x * 8;
                         let top = block_y * 8;
-                        let full =
-                            step_x == 1 && step_y == 1 && left + 8 <= width && top + 8 <= height;
-                        if full && k == 1 {
-                            let value =
-                                inverse_dc(coeff[0]).saturating_add(offset).clamp(0, max) as u16;
-                            let row_stride = width * stride;
-                            let start = top * row_stride + left * stride;
-                            for y in 0..8 {
-                                let row = start + y * row_stride;
-                                if stride == 1 {
-                                    samples[row..row + 8].fill(value);
-                                } else {
-                                    for pixel in samples[row..row + 24].chunks_exact_mut(3) {
-                                        pixel[c] = value;
-                                    }
+                        let full = step_y == 1 && (left + 8) * step_x <= width && top + 8 <= height;
+                        if full && stride == 3 && step_x == 2 {
+                            for (dy, row) in block.as_chunks::<8>().0.iter().enumerate() {
+                                let start = ((top + dy) * width + 2 * left) * 3;
+                                let pairs = samples[start..start + 48].as_chunks_mut::<6>().0;
+                                for (pair, &value) in pairs.iter_mut().zip(row) {
+                                    let value = T::from_word(value);
+                                    pair[c] = value;
+                                    pair[c + 3] = value;
                                 }
                             }
                             continue;
                         }
-                        let block = inverse(&coeff);
-                        if full {
+                        if full && step_x == 1 {
                             for (dy, row) in block.chunks_exact(8).enumerate() {
                                 let start = ((top + dy) * width + left) * stride;
                                 let target = &mut samples[start..start + 8 * stride];
                                 if stride == 1 {
-                                    for (dest, &value) in target.iter_mut().zip(row) {
-                                        *dest = value.saturating_add(offset).clamp(0, max) as u16;
+                                    for (pixel, &value) in target.iter_mut().zip(row) {
+                                        *pixel = T::from_word(value);
                                     }
                                 } else {
                                     for (pixel, &value) in target.chunks_exact_mut(3).zip(row) {
-                                        pixel[c] =
-                                            value.saturating_add(offset).clamp(0, max) as u16;
+                                        pixel[c] = T::from_word(value);
                                     }
                                 }
                             }
                             continue;
                         }
-                        // ponytail: trailing blocks clamp out-of-plane samples onto
-                        // the last visible column/row instead of dropping them, which
-                        // keeps single-scan output byte-compatible with the original
-                        // implementation. T.81 leaves those padding blocks undefined;
-                        // edge-replicated padding (as libjpeg and this encoder write)
-                        // makes the clamped values harmless.
+                        // The transform covers a padded MCU. Only its visible
+                        // samples belong to the output component plane.
                         for yy in 0..8 {
                             for xx in 0..8 {
                                 let px = (block_x * 8 + xx) * step_x;
                                 let py = (block_y * 8 + yy) * step_y;
-                                // Widen before the bias: a crafted Pq=1 table can
-                                // saturate a dequantized coefficient near i32::MAX,
-                                // and `block + offset` would then overflow.
-                                let value = (i64::from(block[yy * 8 + xx]) + i64::from(offset))
-                                    .clamp(0, i64::from(max))
-                                    as u16;
-                                for dy in 0..step_y {
-                                    let y = (py + dy).min(height - 1);
-                                    for dx in 0..step_x {
-                                        let x = (px + dx).min(width - 1);
+                                let value = T::from_word(block[yy * 8 + xx]);
+                                for y in py..(py + step_y).min(height) {
+                                    for x in px..(px + step_x).min(width) {
                                         samples[(y * width + x) * stride + c] = value;
                                     }
                                 }
@@ -1241,6 +1647,151 @@ fn decode_scan(
     }
     bits.align_to_byte();
     Ok(bits.position())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn interleave_mcu_avx2<const CHROMA_HALF: u8, T: DecodedSample>(
+    planes: [&[u16; 64]; 3],
+    output: &mut [T],
+    stride: usize,
+) {
+    use std::arch::x86_64::*;
+
+    const MASKS: [[[u8; 32]; 3]; 3] = {
+        let mut masks = [[[0x80; 32]; 3]; 3];
+        let mut word = 0;
+        while word < 24 {
+            let component = word % 3;
+            let sample = word / 3;
+            let vector = word / 8;
+            let byte = 2 * (word % 8);
+            masks[vector][component][byte] = 2 * sample as u8;
+            masks[vector][component][byte + 1] = 2 * sample as u8 + 1;
+            masks[vector][component][byte + 16] = 2 * sample as u8;
+            masks[vector][component][byte + 17] = 2 * sample as u8 + 1;
+            word += 1;
+        }
+        masks
+    };
+    // Two rows fit in the independent 128-bit shuffle lanes. Every load covers
+    // 16 plane samples and every store covers eight samples of a validated row.
+    unsafe {
+        for y in (0..8).step_by(2) {
+            let y0 = _mm256_loadu_si256(planes[0].as_ptr().add(8 * y).cast());
+            let chroma = |plane: &[u16; 64]| {
+                let values = _mm256_loadu_si256(plane.as_ptr().add(8 * y).cast());
+                match CHROMA_HALF {
+                    0 => _mm256_unpacklo_epi16(values, values),
+                    1 => _mm256_unpackhi_epi16(values, values),
+                    _ => values,
+                }
+            };
+            let cb = chroma(planes[1]);
+            let cr = chroma(planes[2]);
+            for (vector, masks) in MASKS.iter().enumerate() {
+                let a = _mm256_shuffle_epi8(y0, _mm256_loadu_si256(masks[0].as_ptr().cast()));
+                let b = _mm256_shuffle_epi8(cb, _mm256_loadu_si256(masks[1].as_ptr().cast()));
+                let c = _mm256_shuffle_epi8(cr, _mm256_loadu_si256(masks[2].as_ptr().cast()));
+                let pixels = _mm256_or_si256(_mm256_or_si256(a, b), c);
+                let dest = output.as_mut_ptr().add(y * stride + 8 * vector);
+                T::store_row(dest, _mm256_castsi256_si128(pixels));
+                T::store_row(dest.add(stride), _mm256_extracti128_si256::<1>(pixels));
+            }
+        }
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn decode_block<T: DecodedSample>(
+    bits: &mut BitReader<'_>,
+    dc_table: &HuffmanTable,
+    ac_table: &HuffmanTable,
+    lookup: Option<&BlockPrefixes>,
+    qtable: &[u16; 64],
+    previous: &mut i64,
+    frame: &FrameHeader,
+    mut output: BlockOutput<'_, T>,
+) -> Result<(), String> {
+    let mut coeff = [0i32; 64];
+    let prefix = lookup
+        .and_then(|p| bits.peek_prefix(10).map(|i| p.dc[i]))
+        .unwrap_or(0);
+    let dc = if prefix as u8 == 0 {
+        read_value(bits, dc_table, frame.max_dc_category)?
+    } else {
+        bits.consume_prefix(prefix as u8);
+        (prefix as i32) >> 16
+    };
+    *previous = (*previous)
+        .checked_add(i64::from(dc))
+        .ok_or_else(|| "JPEG DC predictor overflows i64".to_owned())?;
+    let quant_dc = i32::try_from(*previous)
+        .map_err(|_| "JPEG DC coefficient is outside the i32 range".to_owned())?;
+    coeff[0] = quant_dc
+        .checked_mul(i32::from(qtable[0]))
+        .ok_or_else(|| "JPEG dequantized coefficient is outside the i32 range".to_owned())?;
+    if prefix & 0x8000 != 0 {
+        output.fill_dc(coeff[0], frame.precision);
+        return Ok(());
+    }
+    let mut k = 1;
+    while k < 64 {
+        if let Some(prefix) = lookup.and_then(|p| bits.peek_prefix(10).map(|i| p.ac[i])) {
+            let length = prefix as u8;
+            let run = ((prefix >> 8) & 15) as usize;
+            let ends_block = prefix & 0x8000 != 0;
+            // The last coefficient has no following EOB. The next bits in this
+            // case belong to the next block, even when they match an EOB code.
+            if length != 0 && !(ends_block && k + run == 63) {
+                bits.consume_prefix(length);
+                let value = (prefix as i32) >> 16;
+                if value == 0 {
+                    break;
+                }
+                k += run;
+                let index = *ZIGZAG.get(k).ok_or("JPEG AC run exceeds block")?;
+                coeff[index] = value * i32::from(qtable[index]);
+                k += 1;
+                if ends_block {
+                    break;
+                }
+                continue;
+            }
+        }
+        let sym = ac_table.decode(bits)?;
+        if sym == 0 {
+            break;
+        }
+        let run = sym >> 4;
+        let size = sym & 15;
+        if size == 0 {
+            if run != 15 {
+                return Err("invalid JPEG AC run".into());
+            }
+            k += 16;
+            if k > 64 {
+                return Err("JPEG AC run exceeds block".into());
+            }
+        } else {
+            k += usize::from(run);
+            if k >= 64 {
+                return Err("JPEG AC run exceeds block".into());
+            }
+            let index = ZIGZAG[k];
+            // The four-bit category and sixteen-bit quantizer give
+            // a product bounded by 32767 * 65535.
+            coeff[index] = decode_amplitude(bits.read_bits(size)?, size) * i32::from(qtable[index]);
+            k += 1;
+        }
+    }
+    if k == 1 {
+        output.fill_dc(coeff[0], frame.precision);
+    } else {
+        inverse(&coeff, frame.precision, k, &mut output);
+    }
+    Ok(())
 }
 
 fn category(v: i32) -> u8 {
@@ -1264,7 +1815,7 @@ fn decode_amplitude(v: u32, n: u8) -> i32 {
         v as i32
     }
 }
-fn write_value(w: &mut BitWriter, h: &HuffmanTable, v: i32) -> Result<(), String> {
+fn write_value(w: &mut BitWriter, h: &HuffmanEncoder, v: i32) -> Result<(), String> {
     let n = category(v);
     h.encode_with_suffix(n, amplitude(v, n), n, w)
 }
@@ -1314,12 +1865,12 @@ fn read_value(r: &mut BitReader<'_>, h: &HuffmanTable, max_category: u8) -> Resu
     }
 }
 /// Allocate the frame buffer without aborting when the request cannot be met.
-fn allocate_samples(length: usize) -> Result<Vec<u16>, String> {
+fn allocate_samples<T: DecodedSample>(length: usize) -> Result<Vec<T>, String> {
     let mut samples = Vec::new();
     samples
         .try_reserve_exact(length)
         .map_err(|_| "JPEG frame is too large to allocate".to_owned())?;
-    samples.resize(length, 0);
+    samples.resize(length, T::default());
     Ok(samples)
 }
 fn expect(r: &mut MarkerReader<'_>, m: Marker) -> Result<(), String> {
@@ -1403,6 +1954,9 @@ fn test_colorspace(components: u8) -> JpegColorSpace {
 fn parse_sof(p: &[u8], marker: Marker, baseline: bool) -> Result<FrameHeader, String> {
     if p.len() < 6 {
         return Err("truncated SOF".into());
+    }
+    if p[1..3] == [0, 0] || p[3..5] == [0, 0] {
+        return Err("JPEG frame dimensions must be nonzero".into());
     }
     let n = p[5];
     if p.len() != 6 + usize::from(n) * 3 {
@@ -1597,6 +2151,86 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn byte_decode_matches_word_decode_for_visible_pixels() {
+        let (width, height) = (35, 19);
+        for (precision, bytes_per_sample, components, subsample) in [
+            (8, 1, 1, false),
+            (8, 1, 3, false),
+            (8, 1, 3, true),
+            (8, 2, 1, false),
+            (12, 2, 1, false),
+            (12, 2, 3, true),
+        ] {
+            let samples = (0..width * height * usize::from(components))
+                .map(|i| ((i * 131 + i / 4 * 17) & ((1 << precision) - 1)) as u16)
+                .collect();
+            let frame =
+                SequentialFrame::new(width, height, precision, components, samples).unwrap();
+            let color = if components == 1 {
+                JpegColorSpace::Grayscale
+            } else {
+                JpegColorSpace::Ycbcr
+            };
+            let baseline = precision == 8;
+            let encoded = frame
+                .encode_with_colorspace(90, !baseline, subsample, 0, Some(3), color)
+                .unwrap();
+            let layout = FrameExpectation {
+                width,
+                height,
+                precision,
+                components,
+            };
+            let bytes =
+                SequentialFrame::decode_bytes(&encoded, &layout, baseline, bytes_per_sample)
+                    .unwrap();
+            let words = SequentialFrame::decode_expected(&encoded, Some(&layout), baseline)
+                .unwrap()
+                .samples;
+            if bytes_per_sample == 1 {
+                assert!(bytes.iter().copied().map(u16::from).eq(words));
+            } else {
+                assert!(bytes
+                    .iter()
+                    .copied()
+                    .eq(words.into_iter().flat_map(u16::to_le_bytes)));
+            }
+        }
+    }
+
+    #[test]
+    fn partial_mcu_keeps_only_visible_pixels() {
+        let full = SequentialFrame::new(
+            8,
+            8,
+            8,
+            1,
+            (0..64).map(|i| ((i * 47) % 256) as u16).collect(),
+        )
+        .unwrap();
+        let mut encoded = full
+            .encode_with_smoothing(90, false, false, 0, Some(1))
+            .unwrap();
+        let decoded = SequentialFrame::decode(&encoded).unwrap();
+        let sof = encoded
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xc0])
+            .unwrap();
+        encoded[sof + 5..sof + 9].copy_from_slice(&[0, 5, 0, 3]);
+        let cropped = SequentialFrame::decode(&encoded).unwrap();
+        let expected: Vec<_> = decoded
+            .samples
+            .chunks_exact(8)
+            .take(5)
+            .flat_map(|row| row[..3].iter().copied())
+            .collect();
+        assert_eq!(cropped.samples, expected);
+        encoded[sof + 6] = 0;
+        assert!(SequentialFrame::decode(&encoded).is_err());
+    }
+
     #[test]
     fn round_trips_baseline_frame() {
         let f = SequentialFrame::new(9, 7, 8, 1, (0..63).map(|x| x as u16 * 3).collect()).unwrap();
@@ -1617,16 +2251,16 @@ mod tests {
 
     #[test]
     fn repeated_dc_mcus_match_separate_color_scans_across_restarts_and_edges() {
-        let (width, height) = (65, 17);
+        let (width, height) = (385, 17);
         let samples = (0..height)
             .flat_map(|y| {
                 (0..width).flat_map(move |x| {
-                    if x < 32 {
+                    if x < 256 {
                         [15, 108, 201]
-                    } else if x < 56 {
+                    } else if x < 352 {
                         [191, 40, 30]
                     } else {
-                        [(y * 5) as u16, 52, (x * 2) as u16]
+                        [(y * 5) as u16, 52, ((x * 2) % 256) as u16]
                     }
                 })
             })
@@ -1634,7 +2268,7 @@ mod tests {
         let frame = SequentialFrame::new(width, height, 8, 3, samples).unwrap();
         let encode = |scans: &[Vec<u8>]| {
             let data = frame
-                .encode_scans(90, false, false, 0, Some(4), scans)
+                .encode_scans(90, false, false, 0, Some(17), scans)
                 .unwrap();
             SequentialFrame::decode(&data).unwrap().samples
         };
@@ -1642,6 +2276,28 @@ mod tests {
             encode(&[vec![2, 0, 1]]),
             encode(&[vec![0], vec![1], vec![2]])
         );
+    }
+
+    #[test]
+    fn repeated_grayscale_mcus_can_use_a_full_32_bit_prefix() {
+        let mut lengths = [0; 16];
+        lengths[15] = 1;
+        let zero = HuffmanTable::new(&lengths, &[0]).unwrap();
+        let sof = [8, 0, 8, 0, 16, 1, 1, 0x11, 0];
+        let header = parse_sof(&sof, Marker::Sof0, true).unwrap();
+        let mut samples = [0u16; 128];
+        let consumed = decode_scan(
+            &[0; 8],
+            0,
+            &[(0, &zero, &zero)],
+            &header,
+            &[[1; 64]; 4],
+            None,
+            &mut samples,
+        )
+        .unwrap();
+        assert_eq!(consumed, 8);
+        assert_eq!(samples, [128; 128]);
     }
 
     #[test]

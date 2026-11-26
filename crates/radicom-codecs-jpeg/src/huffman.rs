@@ -16,6 +16,98 @@ struct CodeRange {
     count: u32,
 }
 
+pub(crate) struct HuffmanEncoder([Code; 256]);
+
+impl HuffmanEncoder {
+    pub(crate) fn new(lengths: &[u8], values: &[u8]) -> Result<Self, String> {
+        canonical_codes(lengths, values, |_, _| {}, |_, _| {}).map(Self)
+    }
+
+    #[inline]
+    pub(crate) fn encode_with_suffix(
+        &self,
+        symbol: u8,
+        suffix: u32,
+        suffix_bits: u8,
+        writer: &mut BitWriter,
+    ) -> Result<(), String> {
+        write_code(
+            self.0[usize::from(symbol)],
+            symbol,
+            suffix,
+            suffix_bits,
+            writer,
+        )
+    }
+}
+
+#[inline]
+fn write_code(
+    code: Code,
+    symbol: u8,
+    suffix: u32,
+    suffix_bits: u8,
+    writer: &mut BitWriter,
+) -> Result<(), String> {
+    if code.length == 0 {
+        return Err(format!("Huffman symbol 0x{symbol:02x} is not defined"));
+    }
+    let value = (u32::from(code.value) << suffix_bits) | suffix;
+    writer.write_bits(value, code.length + suffix_bits)
+}
+
+fn canonical_codes(
+    lengths: &[u8],
+    values: &[u8],
+    mut visit_range: impl FnMut(usize, CodeRange),
+    mut visit_code: impl FnMut(u8, Code),
+) -> Result<[Code; 256], String> {
+    if lengths.len() > 16 {
+        return Err("JPEG Huffman tables support at most 16 code lengths".to_owned());
+    }
+    let total = lengths.iter().copied().map(usize::from).sum::<usize>();
+    if total != values.len() {
+        return Err(format!(
+            "Huffman code counts describe {total} symbols, got {}",
+            values.len()
+        ));
+    }
+    let mut codes = [Code::default(); 256];
+    let mut code = 0u32;
+    let mut value_index = 0;
+    for (length_index, &count) in lengths.iter().enumerate() {
+        let length = (length_index + 1) as u8;
+        code <<= 1;
+        visit_range(
+            length_index,
+            CodeRange {
+                first_code: code,
+                first_symbol: value_index,
+                count: count.into(),
+            },
+        );
+        let limit = 1u32 << length;
+        for _ in 0..count {
+            if code >= limit {
+                return Err("Huffman code lengths are oversubscribed".to_owned());
+            }
+            let symbol = values[value_index];
+            let entry = &mut codes[usize::from(symbol)];
+            if entry.length != 0 {
+                return Err(format!("Huffman symbol 0x{symbol:02x} is duplicated"));
+            }
+            *entry = Code {
+                value: code as u16,
+                length,
+            };
+            visit_code(symbol, *entry);
+            value_index += 1;
+            code += 1;
+        }
+    }
+    Ok(codes)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct HuffmanTable {
     codes: [Code; 256],
@@ -65,56 +157,21 @@ impl HuffmanTable {
     }
 
     pub(crate) fn new(lengths: &[u8], values: &[u8]) -> Result<Self, String> {
-        if lengths.len() > 16 {
-            return Err("JPEG Huffman tables support at most 16 code lengths".to_owned());
-        }
-        let total = lengths.iter().try_fold(0usize, |sum, count| {
-            sum.checked_add(usize::from(*count))
-                .ok_or_else(|| "Huffman symbol count overflows usize".to_owned())
-        })?;
-        if total != values.len() {
-            return Err(format!(
-                "Huffman code counts describe {total} symbols, got {}",
-                values.len()
-            ));
-        }
-        let mut codes = [Code::default(); 256];
         let mut prefixes = [0; 256];
         let mut ranges = [CodeRange::default(); 16];
-        let mut code = 0u32;
-        let mut value_index = 0usize;
-        for (length_index, &count) in lengths.iter().enumerate() {
-            let length = u8::try_from(length_index + 1).unwrap();
-            code <<= 1;
-            ranges[length_index] = CodeRange {
-                first_code: code,
-                first_symbol: value_index,
-                count: count.into(),
-            };
-            let limit = 1u32 << length;
-            for _ in 0..count {
-                if code >= limit {
-                    return Err("Huffman code lengths are oversubscribed".to_owned());
-                }
-                let symbol = values[value_index];
-                let entry = &mut codes[usize::from(symbol)];
-                if entry.length != 0 {
-                    return Err(format!("Huffman symbol 0x{symbol:02x} is duplicated"));
-                }
-                *entry = Code {
-                    value: u16::try_from(code).unwrap(),
-                    length,
-                };
+        let codes = canonical_codes(
+            lengths,
+            values,
+            |i, range| ranges[i] = range,
+            |symbol, Code { value, length }| {
                 if length <= 8 {
                     let shift = 8 - length;
-                    let start = (code << shift) as usize;
+                    let start = usize::from(value) << shift;
                     let end = start + (1usize << shift);
                     prefixes[start..end].fill(u16::from(length) << 8 | u16::from(symbol));
                 }
-                value_index += 1;
-                code += 1;
-            }
-        }
+            },
+        )?;
         Ok(Self {
             codes,
             prefixes,
@@ -139,27 +196,37 @@ impl HuffmanTable {
             .map(|(symbol, &count)| (Reverse(u64::from(count)), symbol))
             .chain([(Reverse(1), 256)])
             .collect();
-        let mut codesize = [0u32; 257];
-        let mut others = [None; 257];
+        let used = trees.len() - 1;
+        if used <= 1 {
+            let symbol = trees.iter().find(|&&(_, symbol)| symbol != 256);
+            let mut counts = vec![0; 16];
+            counts[0] = 1;
+            return (counts, vec![symbol.map_or(0, |&(_, symbol)| symbol as u8)]);
+        }
+        const END: u16 = u16::MAX;
+        let mut codesize = [0u16; 257];
+        let mut others = [END; 257];
 
         while let Some((Reverse(first_count), first)) = trees.pop() {
-            let Some((Reverse(second_count), second)) = trees.pop() else {
+            let Some(mut runner_up) = trees.peek_mut() else {
                 break;
             };
-            trees.push((Reverse(first_count + second_count), first));
+            let (Reverse(second_count), second) = *runner_up;
+            *runner_up = (Reverse(first_count + second_count), first);
+            drop(runner_up);
 
             let mut node = first;
             codesize[node] += 1;
-            while let Some(next) = others[node] {
-                node = next;
+            while others[node] != END {
+                node = usize::from(others[node]);
                 codesize[node] += 1;
             }
-            others[node] = Some(second);
+            others[node] = second as u16;
 
             let mut node = second;
             codesize[node] += 1;
-            while let Some(next) = others[node] {
-                node = next;
+            while others[node] != END {
+                node = usize::from(others[node]);
                 codesize[node] += 1;
             }
         }
@@ -171,10 +238,26 @@ impl HuffmanTable {
         // length that is being abandoned.
         let mut bits = [0i32; 257];
         let mut max_length = 0;
-        for length in codesize.map(|length| length as usize) {
+        for &length in &codesize {
+            let length = usize::from(length);
             if length != 0 {
                 bits[length] += 1;
                 max_length = max_length.max(length);
+            }
+        }
+        // Emit symbols in original code-length order, breaking ties by symbol.
+        // Length limiting below modifies the counts, but preserves this ordering.
+        let mut offsets = [0u16; 257];
+        for length in 1..max_length {
+            let real = bits[length] as u16 - u16::from(length == usize::from(codesize[256]));
+            offsets[length + 1] = offsets[length] + real;
+        }
+        let mut values = vec![0; used];
+        for (symbol, &length) in codesize[..256].iter().enumerate() {
+            if length != 0 {
+                let next = &mut offsets[usize::from(length)];
+                values[usize::from(*next)] = symbol as u8;
+                *next += 1;
             }
         }
 
@@ -201,25 +284,12 @@ impl HuffmanTable {
         while longest > 0 && bits[longest] <= 0 {
             longest -= 1;
         }
-        if longest == 0 {
-            let mut counts = vec![0u8; 16];
-            counts[0] = 1;
-            return (counts, vec![0]);
-        }
         bits[longest] -= 1;
 
         let counts: Vec<u8> = bits[1..=16]
             .iter()
             .map(|&count| count.clamp(0, 255) as u8)
             .collect();
-        let mut values = Vec::new();
-        for length in 1..=max_length as u32 {
-            for (symbol, &size) in codesize.iter().enumerate().take(256) {
-                if size == length {
-                    values.push(symbol as u8);
-                }
-            }
-        }
         (counts, values)
     }
 
@@ -235,12 +305,13 @@ impl HuffmanTable {
         suffix_bits: u8,
         writer: &mut BitWriter,
     ) -> Result<(), String> {
-        let code = self.codes[usize::from(symbol)];
-        if code.length == 0 {
-            return Err(format!("Huffman symbol 0x{symbol:02x} is not defined"));
-        }
-        let value = (u32::from(code.value) << suffix_bits) | suffix;
-        writer.write_bits(value, code.length + suffix_bits)
+        write_code(
+            self.codes[usize::from(symbol)],
+            symbol,
+            suffix,
+            suffix_bits,
+            writer,
+        )
     }
 
     pub(crate) fn decode(&self, reader: &mut BitReader<'_>) -> Result<u8, String> {
@@ -249,6 +320,17 @@ impl HuffmanTable {
             if entry != 0 {
                 reader.consume_prefix((entry >> 8) as u8);
                 return Ok(entry as u8);
+            }
+            if let Some(window) = reader.peek_prefix(16) {
+                for (i, range) in self.ranges[8..].iter().enumerate() {
+                    let code = (window as u32) >> (7 - i);
+                    let offset = code.wrapping_sub(range.first_code);
+                    if offset < range.count {
+                        reader.consume_prefix(9 + i as u8);
+                        return Ok(self.symbols[range.first_symbol + offset as usize]);
+                    }
+                }
+                return Err("JPEG Huffman code is not defined".to_owned());
             }
             (reader.read_bits(8)?, 8)
         } else {

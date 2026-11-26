@@ -1,8 +1,5 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
-use std::f64::consts::PI;
-use std::sync::LazyLock;
-
 pub(crate) const ZIGZAG: [usize; 64] = [
     0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
     13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
@@ -171,117 +168,62 @@ fn islow_forward_scalar(input: &[i32; 64], precision: u8) -> [i32; 64] {
 
 /// Per-coefficient forward quantization, ported from `jcdctmgr.c`.
 ///
-/// The 8-bit and 12-bit libjpeg builds use different algorithms: 8-bit uses the
-/// fixed-point reciprocal table from `compute_reciprocal`, while 12-bit divides
-/// by `qval << 3` with explicit rounding. The coefficient results (JCOEF, a
-/// 16-bit value) are truncated the way the C cast truncates.
+/// The reciprocal performs the rounded division for both precisions. The 8-bit
+/// build truncates its divisor to UINT16, and both truncate the result to JCOEF.
 pub(crate) struct ForwardQuantizer {
-    precision: u8,
     reciprocal: [u32; 64],
     correction: [u32; 64],
     shift: [i32; 64],
-    divisor: [i32; 64],
 }
 
 impl ForwardQuantizer {
     pub(crate) fn new(table: &[u16; 64], precision: u8) -> Self {
         let mut quantizer = Self {
-            precision,
             reciprocal: [0; 64],
             correction: [0; 64],
             shift: [0; 64],
-            divisor: [0; 64],
         };
         for (i, &quant) in table.iter().enumerate() {
-            if precision == 8 {
-                // `compute_reciprocal` takes a UINT16 divisor, so the
-                // `quantval << 3` argument is truncated to 16 bits by the C
-                // call. Reproduce that conversion.
-                let divisor = ((u32::from(quant) << 3) & 0xffff) as u16;
-                let (reciprocal, correction, shift) = compute_reciprocal(divisor);
-                quantizer.reciprocal[i] = reciprocal;
-                quantizer.correction[i] = correction;
-                quantizer.shift[i] = shift;
+            let divisor = u32::from(quant) << 3;
+            let divisor = if precision == 8 {
+                // The 8-bit IJG build passes the divisor through UINT16.
+                divisor & 0xffff
             } else {
-                quantizer.divisor[i] = (i32::from(quant)) << 3;
-            }
+                divisor
+            };
+            let (reciprocal, correction, shift) = compute_reciprocal(divisor);
+            quantizer.reciprocal[i] = reciprocal;
+            quantizer.correction[i] = correction;
+            quantizer.shift[i] = shift + 32;
         }
         quantizer
     }
 
     pub(crate) fn quantize(&self, coefficients: &[i32; 64]) -> [i32; 64] {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: The feature check guards the AVX2 kernel.
+            return unsafe { avx2::quantize(coefficients, self) };
+        }
         std::array::from_fn(|i| self.quantize_one(i, coefficients[i]))
     }
 
     #[inline]
     pub(crate) fn quantize_one(&self, i: usize, coefficient: i32) -> i32 {
-        let value = if self.precision == 8 {
-            let mut temp = coefficient;
-            let reciprocal = u64::from(self.reciprocal[i]);
-            let correction = u64::from(self.correction[i]);
-            // `shift + sizeof(DCTELEM) * 8`; the negative shift used by the
-            // divisor <= 1 path (`-32`) turns into a zero shift.
-            let shift = (self.shift[i] + 32) as u32;
-            if temp < 0 {
-                temp = -temp;
-                let product = (temp as u64 + correction) * reciprocal;
-                -((product >> shift) as i32)
-            } else {
-                let product = (temp as u64 + correction) * reciprocal;
-                (product >> shift) as i32
-            }
-        } else {
-            let divisor = self.divisor[i];
-            let mut temp = coefficient;
-            if temp < 0 {
-                temp = -temp;
-                temp += divisor >> 1;
-                temp = if temp >= divisor { temp / divisor } else { 0 };
-                -temp
-            } else {
-                temp += divisor >> 1;
-                if temp >= divisor {
-                    temp / divisor
-                } else {
-                    0
-                }
-            }
-        };
+        let magnitude = u64::from(coefficient.unsigned_abs()) + u64::from(self.correction[i]);
+        let rounded = ((magnitude * u64::from(self.reciprocal[i])) >> self.shift[i]) as i32;
+        let value = if coefficient < 0 { -rounded } else { rounded };
         i32::from(value as i16)
     }
 }
 
-/// `flss` from `jcdctmgr.c`: one plus the index of the highest set bit.
-fn flss(mut value: u16) -> i32 {
-    let mut bit = 16;
-    if value == 0 {
-        return 0;
-    }
-    if value & 0xff00 == 0 {
-        bit -= 8;
-        value <<= 8;
-    }
-    if value & 0xf000 == 0 {
-        bit -= 4;
-        value <<= 4;
-    }
-    if value & 0xc000 == 0 {
-        bit -= 2;
-        value <<= 2;
-    }
-    if value & 0x8000 == 0 {
-        bit -= 1;
-    }
-    bit
-}
-
 /// `compute_reciprocal` from `jcdctmgr.c`: reciprocal, correction+round factor,
 /// and bit shift for dividing by `divisor` with rounding in 32-bit arithmetic.
-fn compute_reciprocal(divisor: u16) -> (u32, u32, i32) {
+fn compute_reciprocal(divisor: u32) -> (u32, u32, i32) {
     if divisor <= 1 {
         return (1, 0, -32);
     }
-    let b = flss(divisor) - 1;
+    let b = divisor.ilog2() as i32;
     let mut r = 32 + b;
     let mut fq = (1u64 << r) / u64::from(divisor);
     let fr = (1u64 << r) % u64::from(divisor);
@@ -297,123 +239,202 @@ fn compute_reciprocal(divisor: u16) -> (u32, u32, i32) {
     (fq as u32, c as u32, r - 32)
 }
 
-const DC_SCALE: f64 = 1.0 / std::f64::consts::SQRT_2;
-
-static INVERSE_BASIS: LazyLock<[[f64; 8]; 8]> = LazyLock::new(|| {
-    std::array::from_fn(|sample| {
-        std::array::from_fn(|frequency| (((2 * sample + 1) * frequency) as f64 * PI / 16.0).cos())
-    })
-});
+// Loeffler's inverse butterfly, with IJG's 13-bit integer constants. Both
+// arithmetic implementations delay rounding until the end of each pass.
+macro_rules! inverse_butterfly {
+    ($values:expr, $add:ident, $sub:ident, $mul:ident) => {{
+        let [dc, a, b, c, d, e, f, g] = $values;
+        let rot = $mul($add(b, f), 4433);
+        let even2 = $add(rot, $mul(f, -15137));
+        let even3 = $add(rot, $mul(b, 6270));
+        let lo = $mul($add(dc, d), 8192);
+        let hi = $mul($sub(dc, d), 8192);
+        let even = [
+            $add(lo, even3),
+            $add(hi, even2),
+            $sub(hi, even2),
+            $sub(lo, even3),
+        ];
+        let z1 = $mul($add(g, a), -7373);
+        let z2 = $mul($add(e, c), -20995);
+        let z3 = $add(g, c);
+        let z4 = $add(e, a);
+        let z5 = $mul($add(z3, z4), 9633);
+        let z3 = $add($mul(z3, -16069), z5);
+        let z4 = $add($mul(z4, -3196), z5);
+        let odd = [
+            $add($mul(a, 12299), $add(z1, z4)),
+            $add($mul(c, 25172), $add(z2, z3)),
+            $add($mul(e, 16819), $add(z2, z4)),
+            $add($mul(g, 2446), $add(z1, z3)),
+        ];
+        [
+            $add(even[0], odd[0]),
+            $add(even[1], odd[1]),
+            $add(even[2], odd[2]),
+            $add(even[3], odd[3]),
+            $sub(even[3], odd[3]),
+            $sub(even[2], odd[2]),
+            $sub(even[1], odd[1]),
+            $sub(even[0], odd[0]),
+        ]
+    }};
+}
 
 #[cfg(target_arch = "x86_64")]
 #[path = "dct_avx2.rs"]
 mod avx2;
 
-pub(crate) fn inverse(input: &[i32; 64]) -> [i32; 64] {
-    if input[1..].iter().all(|&coefficient| coefficient == 0) {
-        return [inverse_dc(input[0]); 64];
+pub(crate) trait DecodedSample: Copy + Default {
+    fn from_word(value: u16) -> Self;
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn store_row(output: *mut Self, values: std::arch::x86_64::__m128i);
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn load_row(input: *const Self) -> std::arch::x86_64::__m128i;
+}
+
+impl DecodedSample for u16 {
+    #[inline]
+    fn from_word(value: u16) -> Self {
+        value
     }
-    let basis = &*INVERSE_BASIS;
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn store_row(output: *mut Self, values: std::arch::x86_64::__m128i) {
+        // SAFETY: The caller reserves eight writable sample slots.
+        unsafe { std::arch::x86_64::_mm_storeu_si128(output.cast(), values) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn load_row(input: *const Self) -> std::arch::x86_64::__m128i {
+        unsafe { std::arch::x86_64::_mm_loadu_si128(input.cast()) }
+    }
+}
+
+impl DecodedSample for u8 {
+    #[inline]
+    fn from_word(value: u16) -> Self {
+        value as u8
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn store_row(output: *mut Self, values: std::arch::x86_64::__m128i) {
+        use std::arch::x86_64::{_mm_packus_epi16, _mm_storel_epi64};
+        // SAFETY: The caller reserves eight byte samples. SSE2 is part of x86-64.
+        unsafe { _mm_storel_epi64(output.cast(), _mm_packus_epi16(values, values)) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn load_row(input: *const Self) -> std::arch::x86_64::__m128i {
+        use std::arch::x86_64::{_mm_loadl_epi64, _mm_setzero_si128, _mm_unpacklo_epi8};
+        unsafe { _mm_unpacklo_epi8(_mm_loadl_epi64(input.cast()), _mm_setzero_si128()) }
+    }
+}
+
+impl DecodedSample for [u8; 2] {
+    #[inline]
+    fn from_word(value: u16) -> Self {
+        value.to_le_bytes()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn store_row(output: *mut Self, values: std::arch::x86_64::__m128i) {
+        // SAFETY: The caller reserves eight writable words. x86-64 is little-endian.
+        unsafe { std::arch::x86_64::_mm_storeu_si128(output.cast(), values) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn load_row(input: *const Self) -> std::arch::x86_64::__m128i {
+        unsafe { std::arch::x86_64::_mm_loadu_si128(input.cast()) }
+    }
+}
+
+pub(crate) struct BlockOutput<'a, T> {
+    samples: &'a mut [T],
+    stride: usize,
+}
+
+impl<'a, T: DecodedSample> BlockOutput<'a, T> {
+    pub(crate) fn new(samples: &'a mut [T], stride: usize) -> Self {
+        assert!(samples.len() >= 8 && stride >= 8 && stride <= (samples.len() - 8) / 7);
+        Self { samples, stride }
+    }
+
+    pub(crate) fn fill_dc(&mut self, dc: i32, precision: u8) {
+        let center = 1 << (precision - 1);
+        let value = T::from_word(
+            inverse_dc(dc)
+                .saturating_add(center)
+                .clamp(0, 2 * center - 1) as u16,
+        );
+        for y in 0..8 {
+            self.samples[y * self.stride..y * self.stride + 8].fill(value);
+        }
+    }
+}
+
+pub(crate) fn inverse<T: DecodedSample>(
+    input: &[i32; 64],
+    precision: u8,
+    count: usize,
+    output: &mut BlockOutput<'_, T>,
+) {
+    let pass_bits = if precision == 8 { 2 } else { 1 };
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: The feature check guards the AVX2 kernel.
-        let (mut output, mut boundaries) = unsafe { avx2::inverse(input, basis) };
-        if boundaries != 0 {
-            let (terms, count) = inverse_rounding_terms(input);
-            while boundaries != 0 {
-                let index = boundaries.trailing_zeros() as usize;
-                output[index] = inverse_boundary(&terms[..count], basis, index);
-                boundaries &= boundaries - 1;
-            }
+        if unsafe { avx2::inverse(input, pass_bits, count, precision, output) } {
+            return;
         }
-        return output;
     }
-    inverse_scalar(input, basis)
+    let center = 1 << (precision - 1);
+    let block = inverse_scalar(input, pass_bits, count);
+    for (y, row) in block.as_chunks::<8>().0.iter().enumerate() {
+        let values = row.map(|value| {
+            T::from_word(value.saturating_add(center).clamp(0, 2 * center - 1) as u16)
+        });
+        output.samples[y * output.stride..y * output.stride + 8].copy_from_slice(&values);
+    }
 }
 
 pub(crate) fn inverse_dc(coefficient: i32) -> i32 {
-    (DC_SCALE * DC_SCALE * f64::from(coefficient) / 4.0).round() as i32
+    ((i64::from(coefficient) + 4) >> 3) as i32
 }
 
-fn inverse_scalar(input: &[i32; 64], basis: &[[f64; 8]; 8]) -> [i32; 64] {
-    let mut vertical = [[0.0; 8]; 8];
-    for column in 0..8 {
-        let values = std::array::from_fn(|row| f64::from(input[row * 8 + column]));
-        let transformed = inverse_1d(values, basis);
-        for (row, value) in vertical.iter_mut().zip(transformed) {
-            row[column] = value;
+fn inverse_scalar(input: &[i32; 64], pass_bits: i32, count: usize) -> [i32; 64] {
+    let pass = |values, shift: i32| {
+        let add = |a: i64, b| a + b;
+        let sub = |a: i64, b| a - b;
+        let mul = |a: i64, c| a * c;
+        let output = inverse_butterfly!(values, add, sub, mul);
+        output.map(|v| (v + (1i64 << (shift - 1))) >> shift)
+    };
+    let mut workspace = [[0i64; 8]; 8];
+    let columns = match count {
+        0..=3 => 2,
+        4..=10 => 4,
+        _ => 8,
+    };
+    for x in 0..columns {
+        let column = std::array::from_fn(|y| i64::from(input[y * 8 + x]));
+        let transformed = pass(column, 13 - pass_bits);
+        for (row, value) in workspace.iter_mut().zip(transformed) {
+            row[x] = value;
         }
     }
     let mut output = [0; 64];
-    let mut rounding_terms = None;
-    for (y, values) in vertical.into_iter().enumerate() {
-        for (x, value) in inverse_1d(values, basis).into_iter().enumerate() {
-            let value = value * 0.25;
-            let integer = value as i32;
-            let fraction = value - f64::from(integer);
-            // Recheck rounding boundaries in the original summation order.
-            // 0.002 exceeds the accumulated f64 error even with 64 i32::MAX terms.
-            output[y * 8 + x] = if (fraction.abs() - 0.5).abs() < 0.002 {
-                let (terms, count) =
-                    rounding_terms.get_or_insert_with(|| inverse_rounding_terms(input));
-                inverse_boundary(&terms[..*count], basis, y * 8 + x)
-            } else {
-                let adjustment = i32::from(fraction >= 0.5) - i32::from(fraction <= -0.5);
-                integer.saturating_add(adjustment)
-            };
+    for (row, values) in output.chunks_exact_mut(8).zip(workspace) {
+        for (dest, value) in row.iter_mut().zip(pass(values, 16 + pass_bits)) {
+            *dest = value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
         }
-    }
-    output
-}
-
-fn inverse_rounding_terms(input: &[i32; 64]) -> ([(usize, usize, f64); 64], usize) {
-    let mut terms = [(0, 0, 0.0); 64];
-    let mut count = 0;
-    for (index, &coefficient) in input.iter().enumerate() {
-        if coefficient != 0 {
-            let (i, j) = (index % 8, index / 8);
-            let a = if i == 0 { DC_SCALE } else { 1.0 };
-            let b = if j == 0 { DC_SCALE } else { 1.0 };
-            terms[count] = (i, j, a * b * f64::from(coefficient));
-            count += 1;
-        }
-    }
-    (terms, count)
-}
-
-fn inverse_boundary(terms: &[(usize, usize, f64)], basis: &[[f64; 8]; 8], index: usize) -> i32 {
-    let (x, y) = (index % 8, index / 8);
-    let mut sum = 0.0;
-    for &(i, j, coefficient) in terms {
-        sum += coefficient * basis[x][i] * basis[y][j];
-    }
-    (sum * 0.25).round() as i32
-}
-
-#[inline]
-fn inverse_1d(values: [f64; 8], basis: &[[f64; 8]; 8]) -> [f64; 8] {
-    let [dc, a, b, c, d, e, f, g] = values;
-    let dc = dc * DC_SCALE;
-    if values[1..].iter().all(|&value| value == 0.0) {
-        return [dc; 8];
-    }
-    let [_, _, cos2, _, cos4, _, cos6, _] = basis[0];
-    let even_outer = dc + d * cos4;
-    let even_inner = dc - d * cos4;
-    let even0 = b * cos2 + f * cos6;
-    let even1 = b * cos6 - f * cos2;
-    let even = [
-        even_outer + even0,
-        even_inner + even1,
-        even_inner - even1,
-        even_outer - even0,
-    ];
-    let mut output = [0.0; 8];
-    for (x, &even) in even.iter().enumerate() {
-        let weights = &basis[x];
-        let odd = a * weights[1] + c * weights[3] + e * weights[5] + g * weights[7];
-        output[x] = even + odd;
-        output[7 - x] = even - odd;
     }
     output
 }
@@ -489,12 +510,16 @@ mod tests {
     fn dct_round_trip_stays_within_two_samples() {
         let input: [i32; 64] = std::array::from_fn(|i| (i as i32 * 13 % 255) - 128);
         let coefficients: [i32; 64] = islow_forward(&input, 8).map(|value| value / 8);
-        let output = inverse(&coefficients);
-        assert!(input.iter().zip(output).all(|(a, b)| (*a - b).abs() <= 2));
+        let mut output = [0u16; 64];
+        inverse(&coefficients, 8, 64, &mut BlockOutput::new(&mut output, 8));
+        assert!(input
+            .iter()
+            .zip(output)
+            .all(|(a, b)| (*a + 128 - i32::from(b)).abs() <= 2));
     }
 
     #[test]
-    fn inverse_preserves_rounding_for_sparse_and_wide_coefficients() {
+    fn inverse_matches_wide_integer_arithmetic_for_both_precisions() {
         let mut state = 0x1234_5678u32;
         let cases = (0..128).map(|index| {
             let mut input = [0i32; 64];
@@ -510,24 +535,63 @@ mod tests {
             input
         });
         for input in cases {
-            let expected = std::array::from_fn(|index| {
-                let (x, y) = (index % 8, index / 8);
-                let mut sum = 0.0;
-                for j in 0..8 {
-                    for i in 0..8 {
-                        let a = if i == 0 { 1.0 / 2.0_f64.sqrt() } else { 1.0 };
-                        let b = if j == 0 { 1.0 / 2.0_f64.sqrt() } else { 1.0 };
-                        sum += a
-                            * b
-                            * f64::from(input[j * 8 + i])
-                            * (((2 * x + 1) * i) as f64 * PI / 16.0).cos()
-                            * (((2 * y + 1) * j) as f64 * PI / 16.0).cos();
+            for (precision, pass_bits) in [(8, 2), (12, 1)] {
+                let center = 1 << (precision - 1);
+                for count in [3, 10, 64] {
+                    let mut truncated = input;
+                    for &index in &ZIGZAG[count..] {
+                        truncated[index] = 0;
                     }
+                    let mut actual = [0; 64];
+                    inverse(
+                        &truncated,
+                        precision,
+                        count,
+                        &mut BlockOutput::new(&mut actual, 8),
+                    );
+                    let expected = inverse_scalar(&truncated, pass_bits, 64)
+                        .map(|value| value.saturating_add(center).clamp(0, 2 * center - 1) as u16);
+                    assert_eq!(actual, expected);
                 }
-                (sum / 4.0).round() as i32
-            });
-            assert_eq!(inverse(&input), expected);
-            assert_eq!(inverse_scalar(&input, &INVERSE_BASIS), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn dc_half_steps_round_toward_positive_infinity() {
+        for (dc, expected) in [(-12, -1), (-4, 0), (4, 1), (12, 2)] {
+            let mut block = [0; 64];
+            block[0] = dc;
+            assert_eq!(inverse_dc(dc), expected);
+            for precision in [8, 12] {
+                let mut actual = [0; 64];
+                inverse(&block, precision, 1, &mut BlockOutput::new(&mut actual, 8));
+                assert_eq!(actual, [(expected + (1 << (precision - 1))) as u16; 64]);
+            }
+        }
+    }
+
+    #[test]
+    fn reciprocal_quantization_matches_rounded_division_for_extended_tables() {
+        let table = std::array::from_fn(|i| [1, 7, 255, 256, 4095, 8192, 16383, 32767][i % 8]);
+        for precision in [8, 12] {
+            let quantizer = ForwardQuantizer::new(&table, precision);
+            for n in -260..=260 {
+                let input = std::array::from_fn(|i| n * 503 + i as i32);
+                let expected = std::array::from_fn(|i| {
+                    let divisor = u32::from(table[i]) * 8;
+                    let divisor = if precision == 8 {
+                        divisor & 0xffff
+                    } else {
+                        divisor
+                    }
+                    .max(1);
+                    let coefficient = input[i];
+                    let value = (coefficient.unsigned_abs() + divisor / 2) / divisor;
+                    i32::from((coefficient.signum() * value as i32) as i16)
+                });
+                assert_eq!(quantizer.quantize(&input), expected);
+            }
         }
     }
 }

@@ -1,6 +1,39 @@
 use std::arch::x86_64::*;
 
-use super::DC_SCALE;
+use super::ForwardQuantizer;
+
+#[target_feature(enable = "avx2")]
+pub(super) fn quantize(input: &[i32; 64], quantizer: &ForwardQuantizer) -> [i32; 64] {
+    let mut output = [0; 64];
+    for i in (0..64).step_by(8) {
+        // SAFETY: Each input, table and output row contains eight 32-bit lanes.
+        unsafe {
+            let coefficient = _mm256_loadu_si256(input.as_ptr().add(i).cast());
+            let correction = _mm256_loadu_si256(quantizer.correction.as_ptr().add(i).cast());
+            let reciprocal = _mm256_loadu_si256(quantizer.reciprocal.as_ptr().add(i).cast());
+            let shift = _mm256_loadu_si256(quantizer.shift.as_ptr().add(i).cast());
+            let magnitude = _mm256_add_epi32(_mm256_abs_epi32(coefficient), correction);
+            let even = _mm256_srlv_epi64(
+                _mm256_mul_epu32(magnitude, reciprocal),
+                _mm256_and_si256(shift, _mm256_set1_epi64x(0xffff_ffff)),
+            );
+            let odd = _mm256_srlv_epi64(
+                _mm256_mul_epu32(
+                    _mm256_srli_epi64::<32>(magnitude),
+                    _mm256_srli_epi64::<32>(reciprocal),
+                ),
+                _mm256_srli_epi64::<32>(shift),
+            );
+            let result = _mm256_sign_epi32(
+                _mm256_or_si256(even, _mm256_slli_epi64::<32>(odd)),
+                coefficient,
+            );
+            let truncated = _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(result));
+            _mm256_storeu_si256(output.as_mut_ptr().add(i).cast(), truncated);
+        }
+    }
+    output
+}
 
 #[target_feature(enable = "avx2")]
 pub(super) fn forward(input: &[i32; 64], precision: u8) -> [i32; 64] {
@@ -112,107 +145,106 @@ fn transpose_i32([a, b, c, d, e, f, g, h]: [__m256i; 8]) -> [__m256i; 8] {
 }
 
 #[target_feature(enable = "avx2")]
-pub(super) fn inverse(input: &[i32; 64], basis: &[[f64; 8]; 8]) -> ([i32; 64], u64) {
-    let vertical = |column| {
-        let coefficients = std::array::from_fn(|row| {
-            // SAFETY: Each row has eight coefficients and column is 0 or 4.
-            let lanes = unsafe { _mm_loadu_si128(input.as_ptr().add(row * 8 + column).cast()) };
-            _mm256_cvtepi32_pd(lanes)
-        });
-        inverse_lanes(coefficients, basis)
+pub(super) fn inverse<T: super::DecodedSample>(
+    input: &[i32; 64],
+    pass_bits: i32,
+    count: usize,
+    precision: u8,
+    output: &mut super::BlockOutput<'_, T>,
+) -> bool {
+    let rows = std::array::from_fn(|y| {
+        // SAFETY: All eight rows contain eight i32 coefficients.
+        unsafe { _mm256_loadu_si256(input.as_ptr().add(y * 8).cast()) }
+    });
+    let Some(rows) = (match (pass_bits, count) {
+        (2, 0..=3) => inverse_block::<2, 11, 18>(rows),
+        (2, 4..=10) => inverse_block::<4, 11, 18>(rows),
+        (2, _) => inverse_block::<8, 11, 18>(rows),
+        (_, 0..=3) => inverse_block::<2, 12, 17>(rows),
+        (_, 4..=10) => inverse_block::<4, 12, 17>(rows),
+        _ => inverse_block::<8, 12, 17>(rows),
+    }) else {
+        return false;
     };
-    let left = vertical(0);
-    let right = vertical(4);
-    let mut output = [0; 64];
-    let mut boundaries = 0u64;
-    for row in [0, 4] {
-        let [a, b, c, d] = transpose([left[row], left[row + 1], left[row + 2], left[row + 3]]);
-        let [e, f, g, h] = transpose([right[row], right[row + 1], right[row + 2], right[row + 3]]);
-        let columns = inverse_lanes([a, b, c, d, e, f, g, h], basis);
-        for column in [0, 4] {
-            let rows = transpose([
-                columns[column],
-                columns[column + 1],
-                columns[column + 2],
-                columns[column + 3],
-            ]);
-            for (dy, values) in rows.into_iter().enumerate() {
-                let index = (row + dy) * 8 + column;
-                let values = _mm256_mul_pd(values, _mm256_set1_pd(0.25));
-                let rounded =
-                    _mm256_round_pd::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(values);
-                let difference =
-                    _mm256_andnot_pd(_mm256_set1_pd(-0.0), _mm256_sub_pd(values, rounded));
-                let near_half = _mm256_cmp_pd::<_CMP_GT_OQ>(difference, _mm256_set1_pd(0.497));
-                boundaries |= (_mm256_movemask_pd(near_half) as u64) << index;
-                let clamped = _mm256_min_pd(
-                    _mm256_max_pd(rounded, _mm256_set1_pd(f64::from(i32::MIN))),
-                    _mm256_set1_pd(f64::from(i32::MAX)),
-                );
-                // SAFETY: index is the start of four adjacent pixels in output.
-                unsafe {
-                    _mm_storeu_si128(
-                        output.as_mut_ptr().add(index).cast(),
-                        _mm256_cvttpd_epi32(clamped),
-                    );
-                }
-            }
+    let center = _mm256_set1_epi32(1 << (precision - 1));
+    let max = _mm256_set1_epi32((1 << precision) - 1);
+    for (y, row) in rows.into_iter().enumerate() {
+        let row = _mm256_min_epi32(_mm256_add_epi32(row, center), max);
+        let row = _mm_packus_epi32(
+            _mm256_castsi256_si128(row),
+            _mm256_extracti128_si256::<1>(row),
+        );
+        // SAFETY: BlockOutput validates eight writable samples in all eight rows.
+        unsafe {
+            T::store_row(output.samples.as_mut_ptr().add(y * output.stride), row);
         }
     }
-    (output, boundaries)
+    true
 }
 
 #[target_feature(enable = "avx2")]
-fn inverse_lanes(values: [__m256d; 8], basis: &[[f64; 8]; 8]) -> [__m256d; 8] {
-    let [dc, a, b, c, d, e, f, g] = values;
-    let [_, _, cos2, _, cos4, _, cos6, _] = basis[0];
-    let dc = _mm256_mul_pd(dc, _mm256_set1_pd(DC_SCALE));
-    let d = _mm256_mul_pd(d, _mm256_set1_pd(cos4));
-    let even_outer = _mm256_add_pd(dc, d);
-    let even_inner = _mm256_sub_pd(dc, d);
-    let even0 = _mm256_add_pd(
-        _mm256_mul_pd(b, _mm256_set1_pd(cos2)),
-        _mm256_mul_pd(f, _mm256_set1_pd(cos6)),
-    );
-    let even1 = _mm256_sub_pd(
-        _mm256_mul_pd(b, _mm256_set1_pd(cos6)),
-        _mm256_mul_pd(f, _mm256_set1_pd(cos2)),
-    );
-    let even = [
-        _mm256_add_pd(even_outer, even0),
-        _mm256_add_pd(even_inner, even1),
-        _mm256_sub_pd(even_inner, even1),
-        _mm256_sub_pd(even_outer, even0),
-    ];
-    let mut output = [_mm256_setzero_pd(); 8];
-    for (x, even) in even.into_iter().enumerate() {
-        let weights = &basis[x];
-        let odd = _mm256_add_pd(
-            _mm256_add_pd(
-                _mm256_add_pd(
-                    _mm256_mul_pd(a, _mm256_set1_pd(weights[1])),
-                    _mm256_mul_pd(c, _mm256_set1_pd(weights[3])),
-                ),
-                _mm256_mul_pd(e, _mm256_set1_pd(weights[5])),
-            ),
-            _mm256_mul_pd(g, _mm256_set1_pd(weights[7])),
-        );
-        output[x] = _mm256_add_pd(even, odd);
-        output[7 - x] = _mm256_sub_pd(even, odd);
+#[inline]
+fn inverse_block<const N: usize, const FIRST: i32, const LAST: i32>(
+    rows: [__m256i; 8],
+) -> Option<[__m256i; 8]> {
+    let vertical = inverse_pass::<N, FIRST>(rows)?;
+    let horizontal = inverse_pass::<N, LAST>(transpose_i32(vertical))?;
+    Some(transpose_i32(horizontal))
+}
+
+#[target_feature(enable = "avx2")]
+#[inline]
+fn inverse_pass<const N: usize, const SHIFT: i32>(v: [__m256i; 8]) -> Option<[__m256i; 8]> {
+    use std::arch::x86_64::{_mm256_add_epi32 as add, _mm256_sub_epi32 as sub};
+    // With |DC| < 65536 and each |AC| < 16384, the DC term is below
+    // 2^29 and the other seven output weights are at most 11364.
+    let mut ac = _mm256_setzero_si256();
+    for value in &v[1..N] {
+        ac = _mm256_or_si256(ac, _mm256_abs_epi32(*value));
     }
-    output
-}
-
-#[target_feature(enable = "avx2")]
-fn transpose([a, b, c, d]: [__m256d; 4]) -> [__m256d; 4] {
-    let ab_low = _mm256_unpacklo_pd(a, b);
-    let ab_high = _mm256_unpackhi_pd(a, b);
-    let cd_low = _mm256_unpacklo_pd(c, d);
-    let cd_high = _mm256_unpackhi_pd(c, d);
-    [
-        _mm256_permute2f128_pd::<0x20>(ab_low, cd_low),
-        _mm256_permute2f128_pd::<0x20>(ab_high, cd_high),
-        _mm256_permute2f128_pd::<0x31>(ab_low, cd_low),
-        _mm256_permute2f128_pd::<0x31>(ab_high, cd_high),
-    ]
+    let wide = _mm256_or_si256(
+        _mm256_and_si256(ac, _mm256_set1_epi32(!16383)),
+        _mm256_and_si256(_mm256_abs_epi32(v[0]), _mm256_set1_epi32(!65535)),
+    );
+    if _mm256_testz_si256(wide, wide) == 0 {
+        return None;
+    }
+    let pair = |left, right| _mm256_blend_epi16::<0xaa>(left, _mm256_slli_epi32::<16>(right));
+    let dot = |pair, left: i16, right: i16| {
+        _mm256_madd_epi16(
+            pair,
+            _mm256_set1_epi32(i32::from(left as u16) | (i32::from(right) << 16)),
+        )
+    };
+    let zero = _mm256_setzero_si256();
+    let v = |i| if i < N { v[i] } else { zero };
+    let sum = _mm256_slli_epi32::<13>(add(v(0), v(4)));
+    let difference = _mm256_slli_epi32::<13>(sub(v(0), v(4)));
+    let bf = pair(v(2), v(6));
+    let outer = dot(bf, 10703, 4433);
+    let inner = dot(bf, 4433, -10704);
+    let even = [
+        add(sum, outer),
+        add(difference, inner),
+        sub(difference, inner),
+        sub(sum, outer),
+    ];
+    // Fold the ISLOW odd rotations into integer dot products. Keeping their
+    // exact integer weights preserves the rounding of both transform passes.
+    let ac = pair(v(1), v(3));
+    let eg = pair(v(5), v(7));
+    let odd = [
+        add(dot(ac, 11363, 9633), dot(eg, 6437, 2260)),
+        add(dot(ac, 9633, -2259), dot(eg, -11362, -6436)),
+        add(dot(ac, 6437, -11362), dot(eg, 2261, 9633)),
+        add(dot(ac, 2260, -6436), dot(eg, 9633, -11363)),
+    ];
+    let rounded = even.map(|value| add(value, _mm256_set1_epi32(1 << (SHIFT - 1))));
+    Some(std::array::from_fn(|i| {
+        if i < 4 {
+            _mm256_srai_epi32::<SHIFT>(add(rounded[i], odd[i]))
+        } else {
+            _mm256_srai_epi32::<SHIFT>(sub(rounded[7 - i], odd[7 - i]))
+        }
+    }))
 }

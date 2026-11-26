@@ -2,7 +2,7 @@
 
 use super::color::{rgb_to_ycc, JpegColorSpace};
 use super::lossless::{LosslessFrame, Selection};
-use super::sequential::{fancy_upsample, FrameExpectation, SequentialFrame};
+use super::sequential::{FrameExpectation, SequentialFrame};
 use radicom::error::{CodecError, Error};
 use radicom::model::tag::Tag;
 use radicom::model::vr::Vr;
@@ -302,19 +302,6 @@ impl Layout {
     }
 }
 
-fn ybr_to_rgb(samples: &mut [u16], precision: u8) {
-    let max = f64::from((1u32 << precision) - 1);
-    let center = max / 2.0;
-    for pixel in samples.chunks_exact_mut(3) {
-        let y = f64::from(pixel[0]);
-        let cb = f64::from(pixel[1]) - center;
-        let cr = f64::from(pixel[2]) - center;
-        pixel[0] = (y + 1.402 * cr).round().clamp(0.0, max) as u16;
-        pixel[1] = (y - 0.344136 * cb - 0.714136 * cr).round().clamp(0.0, max) as u16;
-        pixel[2] = (y + 1.772 * cb).round().clamp(0.0, max) as u16;
-    }
-}
-
 pub(crate) fn encode_sequential(
     src: &PixelDataRef<'_>,
     dst: &mut PixelData<'_>,
@@ -353,12 +340,6 @@ pub(crate) fn encode_sequential(
             ));
         }
     }
-    if params.convert_colorspace_to_rgb {
-        return Err(operation_error(
-            codec,
-            "convert_colorspace_to_rgb is a decode-only parameter for sequential JPEG",
-        ));
-    }
     let layout = Layout::from_source(src, true).map_err(|m| operation_error(codec, &m))?;
     // Signed samples are coded as their two's-complement bit patterns, which is
     // what libjpeg sees too; the level shift cancels on decode. Only the bit
@@ -370,16 +351,11 @@ pub(crate) fn encode_sequential(
             "sequential JPEG supports 8-bit Process 1 or 8/12-bit Process 2/4 samples",
         ));
     }
-    let sampling_half = matches!(
-        params.sample_factor,
-        radicom::pixel::codec::SampleFactor::Half
-    );
-    if sampling_half && layout.components != 3 {
-        return Err(operation_error(
-            codec,
-            "4:2:2 sampling requires three components",
-        ));
-    }
+    let sampling_half = layout.components == 3
+        && matches!(
+            params.sample_factor,
+            radicom::pixel::codec::SampleFactor::Half
+        );
     if layout.components == 3
         && !matches!(
             layout.photometric,
@@ -425,13 +401,14 @@ pub(crate) fn encode_sequential(
         .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?;
         frames.push(
             frame
-                .encode_with_colorspace(
+                .encode_frame(
                     params.quality,
                     !baseline,
                     sampling_half,
                     params.smoothing_factor,
                     (params.restart_interval != 0).then_some(params.restart_interval),
                     colorspace,
+                    layout.bits_stored > 8,
                 )
                 .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?,
         );
@@ -473,46 +450,20 @@ pub(crate) fn decode_sequential(
         components: u8::try_from(dst.samples_per_pixel()).unwrap_or(0),
         precision: u8::try_from(dst.bits_stored()).unwrap_or(0),
     };
-    let mut frames = Vec::new();
-    for i in 0..src.number_of_frames() {
-        let frame_bytes = src
-            .get_frame(i)
-            .map_err(|e| operation_error(codec, &format!("frame {i}: {e}")))?;
-        let bytes = frame_bytes
-            .data()
-            .map_err(|e| operation_error(codec, &format!("frame {i}: {e}")))?;
-        let frame = SequentialFrame::decode_expected(bytes.as_ref(), Some(&expected), baseline)
-            .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?;
-        if (baseline && frame.precision != 8) || (!baseline && !matches!(frame.precision, 8 | 12)) {
-            return Err(operation_error(
-                codec,
-                &format!("frame {i}: codestream layout does not match destination"),
-            ));
-        }
-        frames.push(frame);
-    }
     let photometric = src.photometric_interpretation();
     let convert = params.convert_colorspace_to_rgb
         && matches!(
             photometric,
             Some(PhotometricInterpretation::YbrFull) | Some(PhotometricInterpretation::YbrFull422)
         )
-        && frames.first().is_some_and(|frame| frame.components == 3);
-    if convert && dst.pixel_representation() != 0 {
-        return Err(operation_error(
-            codec,
-            "color conversion is unsupported for signed samples",
-        ));
-    }
-    let mut layout = Layout::from_destination(dst, true).map_err(|m| operation_error(codec, &m))?;
-    if convert
-        && (layout.photometric == PhotometricInterpretation::YbrFull422 || layout.planar == 1)
-    {
+        && expected.components == 3
+        && src.number_of_frames() != 0;
+    let layout = if convert {
         // Conversion emits three interleaved samples per pixel labelled RGB. A
         // 4:2:2 destination packs two bytes per pixel and a planar destination
         // writes per-plane; both must be rebuilt as interleaved RGB so the
         // bytes match the metadata we set below.
-        layout = Layout::from_values(
+        Layout::from_values(
             dst.width(),
             dst.height(),
             dst.bits_allocated()
@@ -524,20 +475,45 @@ pub(crate) fn decode_sequential(
             Some(PhotometricInterpretation::Rgb),
             false,
         )
-        .map_err(|m| operation_error(codec, &m))?;
-    }
-    let mut output = Vec::with_capacity(frames.len());
-    for mut frame in frames {
-        if convert {
-            fancy_upsample(
-                &mut frame.samples,
-                frame.width,
-                frame.height,
-                frame.precision,
-                frame.components,
-                &frame.sampling,
+        .map_err(|m| operation_error(codec, &m))?
+    } else {
+        Layout::from_destination(dst, true).map_err(|m| operation_error(codec, &m))?
+    };
+    let direct = !convert
+        && (layout.planar == 0 || layout.components == 1)
+        && layout.photometric != PhotometricInterpretation::YbrFull422;
+    let mut output = Vec::new();
+    for i in 0..src.number_of_frames() {
+        let frame_bytes = src
+            .get_frame(i)
+            .map_err(|e| operation_error(codec, &format!("frame {i}: {e}")))?;
+        let bytes = frame_bytes
+            .data()
+            .map_err(|e| operation_error(codec, &format!("frame {i}: {e}")))?;
+        let frame_error = |m| operation_error(codec, &format!("frame {i}: {m}"));
+        if convert && layout.bits_allocated == 1 && expected.precision == 8 {
+            output.push(
+                SequentialFrame::decode_rgb8(bytes.as_ref(), &expected, baseline)
+                    .map_err(frame_error)?,
             );
-            ybr_to_rgb(&mut frame.samples, frame.precision);
+            continue;
+        }
+        if direct {
+            output.push(
+                SequentialFrame::decode_bytes(
+                    bytes.as_ref(),
+                    &expected,
+                    baseline,
+                    layout.bits_allocated,
+                )
+                .map_err(frame_error)?,
+            );
+            continue;
+        }
+        let mut frame = SequentialFrame::decode_expected(bytes.as_ref(), Some(&expected), baseline)
+            .map_err(frame_error)?;
+        if convert {
+            frame.convert_to_rgb();
         }
         output.push(
             layout
@@ -592,7 +568,12 @@ pub(crate) fn encode_lossless(
         ));
     }
     let mut encoded_frames = Vec::new();
-    let colorspace = JpegColorSpace::from_photometric(layout.photometric);
+    let colorspace = if layout.photometric == PhotometricInterpretation::PaletteColor {
+        // TurboJPEG treats the index plane as grayscale. DICOM retains the LUT.
+        JpegColorSpace::Grayscale
+    } else {
+        JpegColorSpace::from_photometric(layout.photometric)
+    };
     for frame_index in 0..src.number_of_frames() {
         let buffer = src
             .get_frame(frame_index)

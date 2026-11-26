@@ -11,6 +11,14 @@ impl BitWriter {
         if count == 0 || count > 32 || (count < 32 && value >= (1u32 << count)) {
             return Err(format!("invalid bit value {value:#x} with width {count}"));
         }
+        self.write_codeword(value, count);
+        Ok(())
+    }
+
+    /// Appends a previously constructed Huffman code and its amplitude.
+    #[inline]
+    pub(crate) fn write_codeword(&mut self, value: u32, count: u8) {
+        debug_assert!((1..=32).contains(&count) && (count == 32 || value < 1 << count));
         self.current = (self.current << count) | u64::from(value);
         self.used += count;
         if self.used >= 32 {
@@ -25,7 +33,6 @@ impl BitWriter {
                 self.bytes.extend_from_slice(&bytes);
             }
         }
-        Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Result<Vec<u8>, String> {
@@ -61,6 +68,7 @@ impl BitWriter {
 pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     position: usize,
+    // Unread bits are at the high end. Slots below them are zero.
     buffer: u64,
     remaining: u8,
     stuffed: u8,
@@ -88,8 +96,9 @@ impl<'a> BitReader<'a> {
                 return Err("truncated JPEG entropy data or premature marker".to_owned());
             }
         }
-        self.remaining -= count;
-        Ok(((self.buffer >> self.remaining) & ((1u64 << count) - 1)) as u32)
+        let value = (self.buffer >> (64 - count)) as u32;
+        self.consume_prefix(count);
+        Ok(value)
     }
 
     #[inline]
@@ -103,7 +112,7 @@ impl<'a> BitReader<'a> {
             self.refill();
         }
         if self.remaining >= count {
-            Some(((self.buffer >> (self.remaining - count)) & ((1 << count) - 1)) as usize)
+            Some((self.buffer >> (64 - count)) as usize)
         } else {
             None
         }
@@ -112,6 +121,16 @@ impl<'a> BitReader<'a> {
     #[inline]
     pub(crate) fn consume_prefix(&mut self, count: u8) {
         self.remaining -= count;
+        self.buffer = self.buffer.unbounded_shl(u32::from(count));
+    }
+
+    /// Left-aligned unstuffed bits, for decoding several symbols per refill.
+    #[inline]
+    pub(crate) fn window(&mut self) -> (u64, u8) {
+        if self.remaining < 32 {
+            self.refill();
+        }
+        (self.buffer, self.remaining)
     }
 
     pub(crate) fn take_marker(&mut self) -> Result<Option<u8>, String> {
@@ -141,6 +160,7 @@ impl<'a> BitReader<'a> {
 
     pub(crate) fn align_to_byte(&mut self) {
         self.position = self.position();
+        self.buffer = 0;
         self.remaining = 0;
     }
 
@@ -154,6 +174,20 @@ impl<'a> BitReader<'a> {
     }
 
     fn refill(&mut self) {
+        if let Some(bytes) = self.data[self.position..].first_chunk::<8>() {
+            let word = u64::from_be_bytes(*bytes);
+            let inverted = !word;
+            if inverted.wrapping_sub(0x0101_0101_0101_0101) & !inverted & 0x8080_8080_8080_8080 == 0
+            {
+                let count = (64 - self.remaining) / 8;
+                let mask = u64::MAX << (64 - count * 8);
+                self.buffer |= (word & mask) >> self.remaining;
+                self.stuffed = (u16::from(self.stuffed) << count) as u8;
+                self.remaining += count * 8;
+                self.position += usize::from(count);
+                return;
+            }
+        }
         while self.remaining <= 56 {
             if self.remaining <= 32 {
                 if let Some(bytes) = self.data[self.position..].first_chunk::<4>() {
@@ -163,7 +197,7 @@ impl<'a> BitReader<'a> {
                     if !has_ff {
                         self.position += 4;
                         self.stuffed <<= 4;
-                        self.buffer = (self.buffer << 32) | u64::from(word);
+                        self.buffer |= u64::from(word) << (32 - self.remaining);
                         self.remaining += 32;
                         continue;
                     }
@@ -178,7 +212,7 @@ impl<'a> BitReader<'a> {
             }
             self.position += 1 + usize::from(stuffed);
             self.stuffed = (self.stuffed << 1) | u8::from(stuffed);
-            self.buffer = (self.buffer << 8) | u64::from(byte);
+            self.buffer |= u64::from(byte) << (56 - self.remaining);
             self.remaining += 8;
         }
     }
@@ -240,5 +274,23 @@ mod tests {
         assert_eq!(reader.peek_byte(), None);
         reader.align_to_byte();
         assert_eq!(reader.take_marker().unwrap(), Some(0xd0));
+    }
+
+    #[test]
+    fn full_window_refills_across_stuffing_and_a_restart() {
+        let data = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0xff, 0x00, 0x88, 0x99, 0xff, 0xd2,
+            0xaa, 0xbb,
+        ];
+        let mut reader = BitReader::new(&data);
+        assert_eq!(reader.window(), (0x0011_2233_4455_6677, 64));
+        assert_eq!(reader.read_bits(4).unwrap(), 0);
+        assert_eq!(reader.read_bits(28).unwrap(), 0x0011_2233);
+        assert_eq!(reader.read_bits(32).unwrap(), 0x4455_6677);
+        assert_eq!(reader.read_bits(16).unwrap(), 0xff88);
+        assert_eq!(reader.read_bits(3).unwrap(), 4);
+        reader.align_to_byte();
+        assert_eq!(reader.take_marker().unwrap(), Some(0xd2));
+        assert_eq!(reader.read_bits(16).unwrap(), 0xaabb);
     }
 }

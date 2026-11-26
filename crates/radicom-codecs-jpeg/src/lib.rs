@@ -38,7 +38,11 @@ macro_rules! sequential_jpeg_codec {
             }
 
             fn default_params(&self) -> CodecParams {
-                CodecParams::Jpeg(JpegParams::default())
+                CodecParams::Jpeg(JpegParams {
+                    sample_factor: radicom::pixel::codec::SampleFactor::Half,
+                    convert_colorspace_to_rgb: true,
+                    ..JpegParams::default()
+                })
             }
 
             fn encode(

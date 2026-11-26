@@ -193,12 +193,23 @@ impl LosslessFrame {
             }
         }
         let mut frequencies = [[0u32; 256]; 2];
+        let shared_left = predictor == 1
+            && point_transform == 0
+            && restart_interval.is_none()
+            && !used[1]
+            && scans.len() == 1
+            && scans[0].iter().copied().eq(0..self.components)
+            && self.samples.len() >= 4096;
         let mut reconstructed = if predictor == 1 && restart_interval.is_none() {
             Vec::new()
         } else {
             allocate_samples(self.samples.len())?
         };
         for scan in scans {
+            if shared_left {
+                self.count_left_differences(&mut frequencies[0]);
+                continue;
+            }
             self.walk_scan(
                 scan,
                 &mut reconstructed,
@@ -256,6 +267,12 @@ impl LosslessFrame {
                 &sos_payload(scan, predictor, point_transform, colorspace)?,
             )?;
             let mut entropy = BitWriter::default();
+            if shared_left {
+                encode_left_differences(self, &tables[0].as_ref().unwrap().2, &mut entropy);
+                entropy.flush_to_byte();
+                output_bytes(&mut output, entropy.take_bytes());
+                continue;
+            }
             // With 8-bit left prediction all differences fit in -255..=255.
             // An interleaved RGB or grayscale scan uses a single DC table.
             let cached = if self.precision == 8
@@ -316,6 +333,52 @@ impl LosslessFrame {
         }
         output.write_marker(Marker::Eoi)?;
         Ok(output.into_bytes())
+    }
+
+    fn left_differences(&self, mut visit: impl FnMut(&[u16])) {
+        let stride = usize::from(self.components);
+        let mut above = [1u16 << (self.precision - 1); 3];
+        let mut scratch = [0; 256];
+        for row in self.samples.chunks_exact(self.width * stride) {
+            for c in 0..stride {
+                scratch[c] = row[c].wrapping_sub(above[c]);
+                above[c] = row[c];
+            }
+            visit(&scratch[..stride]);
+            for (values, previous) in row[stride..].chunks(256).zip(row.chunks(256)) {
+                let differences = &mut scratch[..values.len()];
+                for ((out, &value), &left) in differences.iter_mut().zip(values).zip(previous) {
+                    *out = value.wrapping_sub(left);
+                }
+                visit(differences);
+            }
+        }
+    }
+
+    fn count_left_differences(&self, frequencies: &mut [u32; 256]) {
+        // Independent counters keep short repeated categories from serializing the histogram.
+        let mut counts = [[0u32; 17]; 4];
+        self.left_differences(|differences| {
+            let (blocks, tail) = differences.as_chunks::<8>();
+            for block in blocks {
+                if *block == [0; 8] {
+                    counts[0][0] += 8;
+                } else {
+                    for (i, &difference) in block.iter().enumerate() {
+                        let category = category(i32::from(difference as i16));
+                        counts[i % 4][usize::from(category)] += 1;
+                    }
+                }
+            }
+            for &difference in tail {
+                counts[0][usize::from(category(i32::from(difference as i16)))] += 1;
+            }
+        });
+        for lane in counts {
+            for (frequency, count) in frequencies.iter_mut().zip(lane) {
+                *frequency += count;
+            }
+        }
     }
 
     /// Walks one scan in coding order, reporting each coded difference and each
@@ -567,6 +630,54 @@ impl LosslessFrame {
     }
 }
 
+fn encode_left_differences(frame: &LosslessFrame, table: &HuffmanTable, bits: &mut BitWriter) {
+    let code = |difference: i32| {
+        let category = category(difference);
+        let Some((prefix, width)) = table.codeword(category) else {
+            return (0, 0);
+        };
+        if matches!(category, 0 | 16) {
+            (u32::from(prefix), width)
+        } else {
+            (
+                (u32::from(prefix) << category) | encode_amplitude(difference, category),
+                width + category,
+            )
+        }
+    };
+    let cache: [_; 512] = std::array::from_fn(|i| code(i as i32 - 256));
+    let put = |bits: &mut BitWriter, raw: u16| {
+        let difference = i32::from(raw as i16);
+        let (value, width) = if (-256..256).contains(&difference) {
+            cache[(difference + 256) as usize]
+        } else {
+            code(difference)
+        };
+        bits.write_codeword(value, width);
+    };
+    let (value, width) = cache[256];
+    let zeros = if width <= 4 {
+        (0..8).fold(0, |word, _| (word << width) | value)
+    } else {
+        0
+    };
+    frame.left_differences(|differences| {
+        let (blocks, tail) = differences.as_chunks::<8>();
+        for block in blocks {
+            if width <= 4 && *block == [0; 8] {
+                bits.write_codeword(zeros, width * 8);
+            } else {
+                for &raw in block {
+                    put(bits, raw);
+                }
+            }
+        }
+        for &raw in tail {
+            put(bits, raw);
+        }
+    });
+}
+
 /// One lossless scan: the components it carries (as frame component indices plus
 /// their DC Huffman table selectors), the predictor and the point transform.
 struct Scan {
@@ -598,6 +709,32 @@ fn decode_scan(
     let stride = usize::from(components);
     let mut restart_index = 0u8;
     let mut next_restart = restart_interval.map_or(usize::MAX, usize::from);
+    if scan.predictor == 1
+        && scan.point_transform == 0
+        && restart_interval.is_none()
+        && samples.len() >= 256
+        && scan.components.len() == stride
+        && scan
+            .components
+            .iter()
+            .enumerate()
+            .all(|(slot, &(component, id))| {
+                usize::from(component) == slot && id == scan.components[0].1
+            })
+        && matches!(stride, 1 | 3)
+    {
+        let id = scan.components[0].1;
+        let huffman = tables[usize::from(id)]
+            .as_ref()
+            .ok_or_else(|| format!("missing JPEG DC Huffman table {id}"))?;
+        if stride == 1 {
+            decode_shared_dc::<1>(&mut bits, huffman, samples, width, precision)?;
+        } else {
+            decode_shared_dc::<3>(&mut bits, huffman, samples, width, precision)?;
+        }
+        bits.align_to_byte();
+        return Ok(bits.position());
+    }
     let mut scan_tables = Vec::with_capacity(scan.components.len());
     for &(component, table) in &scan.components {
         let huffman = tables[usize::from(table)]
@@ -698,6 +835,97 @@ fn decode_scan(
     }
     bits.align_to_byte();
     Ok(bits.position())
+}
+
+fn decode_shared_dc<const N: usize>(
+    bits: &mut BitReader<'_>,
+    huffman: &HuffmanTable,
+    samples: &mut [u16],
+    width: usize,
+    precision: u8,
+) -> Result<(), String> {
+    let amplitudes = huffman.short_amplitudes::<10, 1024>();
+    #[derive(Clone, Copy, Default)]
+    struct Pair {
+        differences: [u16; 2],
+        count: u8,
+        bits: u8,
+    }
+    let mut lookup = [Pair::default(); 1024];
+    // A ten-bit prefix can contain two complete difference codes in smooth regions.
+    for (prefix, entry) in lookup.iter_mut().enumerate() {
+        let first = amplitudes[prefix];
+        let first_width = first as u8;
+        if first_width == 0 || (first >> 8) as u8 > precision + 1 {
+            continue;
+        }
+        entry.differences[0] = (first >> 16) as u16;
+        entry.bits = first_width;
+        entry.count = 1;
+        let second = amplitudes[(prefix << first_width) & 1023];
+        let second_width = second as u8;
+        if second_width > 0
+            && first_width + second_width <= 10
+            && (second >> 8) as u8 <= precision + 1
+        {
+            entry.differences[1] = (second >> 16) as u16;
+            entry.bits += second_width;
+            entry.count = 2;
+        }
+    }
+    let max = (1i32 << precision) - 1;
+    let mut above = [1i32 << (precision - 1); N];
+    for (y, row) in samples.chunks_exact_mut(width * N).enumerate() {
+        let mut index = 0;
+        while index < row.len() {
+            let (mut window, available) = bits.window();
+            let mut left = available;
+            // Eight Huffman bits and fifteen amplitude bits fit in this window.
+            while left >= 24 && index + 1 < row.len() {
+                let entry = lookup[(window >> 54) as usize];
+                let mut consumed = entry.bits;
+                if consumed != 0 {
+                    row[index..index + 2].copy_from_slice(&entry.differences);
+                    index += usize::from(entry.count);
+                } else {
+                    let code = huffman.short_code((window >> 56) as u8);
+                    let category = code as u8;
+                    let length = (code >> 8) as u8;
+                    if length == 0 || category > precision + 1 || category > 15 {
+                        break;
+                    }
+                    consumed = length + category;
+                    let amplitude = (window >> (64 - consumed)) as u32 & ((1 << category) - 1);
+                    row[index] = decode_amplitude(amplitude, category) as u16;
+                    index += 1;
+                }
+                window <<= consumed;
+                left -= consumed;
+            }
+            bits.consume_prefix(available - left);
+            // Longer codes, the row tail and short windows near markers use the checked reader.
+            if index < row.len() && (left >= 24 || available < 24) {
+                row[index] = read_difference(bits, huffman, &amplitudes, precision)? as u16;
+                index += 1;
+            }
+        }
+        let mut left = above;
+        for (x, pixel) in row.as_chunks_mut::<N>().0.iter_mut().enumerate() {
+            for c in 0..N {
+                let difference = i32::from(pixel[c] as i16);
+                let value = left[c] + difference;
+                if precision < 16 && !(0..=max).contains(&value) {
+                    return Err(format!("JPEG lossless sample is outside the declared precision at pixel {}, component {c}: prediction={}, amplitude={difference}, shifted={value}, max={max}", y * width + x, left[c]));
+                }
+                pixel[c] = value as u16;
+                left[c] = i32::from(pixel[c]);
+            }
+        }
+        for c in 0..N {
+            above[c] = i32::from(row[c]);
+        }
+    }
+    Ok(())
 }
 
 fn decode_predictor_one<const STRIDE: usize>(
@@ -1381,6 +1609,37 @@ mod tests {
             let frame = sample_frame(precision, 3);
             let stream = frame.encode_scans(1, 0, None, &[vec![2, 0, 1]]).unwrap();
             assert_eq!(decode_any(&stream).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn shared_dc_matches_scalar_coding_at_row_and_word_boundaries() {
+        // A restart exactly at the end of the image writes only the DRI header.
+        let (width, height) = (79, 53);
+        for (precision, components) in [(8, 3u8), (12, 1), (16, 1)] {
+            let mask = (1u32 << precision) - 1;
+            let samples = (0..width * height * usize::from(components))
+                .map(|i| match i % 43 {
+                    0..=16 => 0,
+                    17 => 1 << (precision - 1),
+                    18 => mask as u16,
+                    _ => ((i as u32 * 739) & mask) as u16,
+                })
+                .collect();
+            let frame = LosslessFrame::new(width, height, precision, components, samples).unwrap();
+            let space = if components == 1 {
+                JpegColorSpace::Grayscale
+            } else {
+                JpegColorSpace::Rgb
+            };
+            let optimized = frame.encode_with_colorspace(1, 0, None, space).unwrap();
+            let mut scalar = frame
+                .encode_with_colorspace(1, 0, Some((width * height) as u16), space)
+                .unwrap();
+            let dri = scalar.windows(2).position(|p| p == [0xff, 0xdd]).unwrap();
+            scalar.drain(dri..dri + 6);
+            assert_eq!(optimized, scalar);
+            assert_eq!(decode_any(&optimized).unwrap(), frame);
         }
     }
 
