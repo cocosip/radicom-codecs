@@ -9,22 +9,11 @@ pub(crate) fn encode_mapped(
     let high = m >> k;
     let threshold = limit.saturating_sub(u32::from(qbpp) + 1);
     if high < threshold {
-        for _ in 0..high {
-            w.write_bit(false)
-        }
-        w.write_bit(true);
-        if k > 0 {
-            w.write_bits(m & ((1u32 << k) - 1), k)?
-        }
+        w.write_unary_with_suffix(high, m & ((1u32 << k) - 1), k)
     } else {
-        for _ in 0..threshold {
-            w.write_bit(false)
-        }
-        w.write_bit(true);
         let v = m.checked_sub(1).ok_or("invalid mapped error")?;
-        w.write_bits(v & ((1u32 << qbpp) - 1), qbpp)?
+        w.write_unary_with_suffix(threshold, v & ((1u32 << qbpp) - 1), qbpp)
     }
-    Ok(())
 }
 pub(crate) fn decode_mapped(
     r: &mut BitReader<'_>,
@@ -33,13 +22,7 @@ pub(crate) fn decode_mapped(
     qbpp: u8,
 ) -> Result<u32, String> {
     let threshold = limit.saturating_sub(u32::from(qbpp) + 1);
-    let mut high = 0;
-    while !r.read_bit()? {
-        high += 1;
-        if high > threshold {
-            return Err("Golomb unary exceeds limit".into());
-        }
-    }
+    let high = r.read_unary(threshold)?;
     if high == threshold {
         Ok(r.read_bits(qbpp)?.saturating_add(1))
     } else {

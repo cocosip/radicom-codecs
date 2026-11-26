@@ -27,26 +27,26 @@ fn quantized_error(value: i32, near: i32, range: i32) -> i32 {
     } else {
         -((near - value) / (2 * near + 1))
     };
-    let mut e = quantized.rem_euclid(range);
+    let mut e = if quantized < 0 {
+        quantized + range
+    } else {
+        quantized
+    };
     if e >= (range + 1) / 2 {
         e -= range;
     }
     e
 }
 
-fn reconstructed(pred: i32, e: i32, sign: i32, near: i32, maxval: i32) -> i32 {
-    if near == 0 {
-        (pred + sign * e).rem_euclid(maxval + 1)
-    } else {
-        let mut value = pred + sign * e * (2 * near + 1);
-        let range = (maxval + 2 * near) / (2 * near + 1) + 1;
-        if value < -near {
-            value += range * (2 * near + 1);
-        } else if value > maxval + near {
-            value -= range * (2 * near + 1);
-        }
-        correct_prediction(value, maxval)
+fn reconstructed(pred: i32, e: i32, sign: i32, near: i32, maxval: i32, range: i32) -> i32 {
+    let step = 2 * near + 1;
+    let mut value = pred + sign * e * step;
+    if value < -near {
+        value += range * step;
+    } else if value > maxval + near {
+        value -= range * step;
     }
+    correct_prediction(value, maxval)
 }
 
 fn correct_prediction(pred: i32, maxval: i32) -> i32 {
@@ -131,17 +131,16 @@ fn begin_restart_interval<'a>(
 fn encode_regular(
     w: &mut BitWriter,
     ctx: &mut RegularContext,
+    qs: i32,
     x: i32,
     ra: i32,
     rb: i32,
     rc: i32,
-    rd: i32,
     c: &ScanConfig,
     range: i32,
     limit: u32,
     qbpp: u8,
 ) -> i32 {
-    let qs = context_id(ra, rb, rc, rd, &c.preset, c.near as i32);
     let sign = if qs < 0 { -1 } else { 1 };
     let corrected = correct_prediction(predict(ra, rb, rc) + sign * ctx.bias(), c.maxval as i32);
     let error = quantized_error((x - corrected) * sign, c.near as i32, range);
@@ -150,7 +149,14 @@ fn encode_regular(
     let mapped = map_error(error ^ correction);
     encode_mapped(w, k, mapped, limit, qbpp).expect("bounded Golomb parameters");
     ctx.update(error, c.near as i32, c.preset.reset as i32);
-    reconstructed(corrected, error, sign, c.near as i32, c.maxval as i32)
+    reconstructed(
+        corrected,
+        error,
+        sign,
+        c.near as i32,
+        c.maxval as i32,
+        range,
+    )
 }
 
 fn decode_regular(
@@ -161,6 +167,7 @@ fn decode_regular(
     rb: i32,
     rc: i32,
     c: &ScanConfig,
+    range: i32,
     limit: u32,
     qbpp: u8,
 ) -> Result<i32, String> {
@@ -168,15 +175,14 @@ fn decode_regular(
     let corrected = correct_prediction(predict(ra, rb, rc) + sign * ctx.bias(), c.maxval as i32);
     let k = ctx.k();
     let mapped = decode_mapped(r, k, limit, qbpp)?;
-    let range = c.preset.range(c.near);
-    if mapped > range {
+    if mapped > range as u32 {
         return Err("mapped prediction error exceeds RANGE".into());
     }
     let mut error = unmap_error(mapped);
     if k == 0 && c.near == 0 {
         error ^= ctx.correction(k);
     }
-    if error < -(range as i32 / 2) || error > (range as i32 - 1) / 2 {
+    if error < -(range / 2) || error > (range - 1) / 2 {
         return Err("prediction error exceeds RANGE".into());
     }
     ctx.update(error, c.near as i32, c.preset.reset as i32);
@@ -186,6 +192,7 @@ fn decode_regular(
         sign,
         c.near as i32,
         c.maxval as i32,
+        range,
     ))
 }
 
@@ -220,7 +227,7 @@ fn encode_run_interrupt(
         -1
     };
     let reference = if typ == 1 { ra } else { rb };
-    reconstructed(reference, error, sign, near, c.maxval as i32)
+    reconstructed(reference, error, sign, near, c.maxval as i32, range)
 }
 
 fn decode_run_interrupt(
@@ -230,6 +237,7 @@ fn decode_run_interrupt(
     ra: i32,
     rb: i32,
     c: &ScanConfig,
+    range: i32,
     limit: u32,
     qbpp: u8,
 ) -> Result<i32, String> {
@@ -241,7 +249,6 @@ fn decode_run_interrupt(
     };
     let k = contexts[typ].k();
     let mapped = decode_mapped(r, k, limit - u32::from(J[run_index]) - 1, qbpp)? as i32;
-    let range = c.preset.range(c.near) as i32;
     if mapped > range {
         return Err("mapped run interruption error exceeds RANGE".into());
     }
@@ -249,7 +256,14 @@ fn decode_run_interrupt(
     if error < -(range / 2) || error > (range - 1) / 2 {
         return Err("run interruption error exceeds RANGE".into());
     }
-    Ok(reconstructed(reference, error, sign, near, c.maxval as i32))
+    Ok(reconstructed(
+        reference,
+        error,
+        sign,
+        near,
+        c.maxval as i32,
+        range,
+    ))
 }
 
 fn encode_run_length(
@@ -320,6 +334,7 @@ fn encode_scan_inner(
     let mut run_contexts = [RunContext::new(0, range), RunContext::new(1, range)];
     let mut run_index = 0usize;
     let mut previous = vec![0i32; c.width * c.components];
+    let mut current = vec![0i32; previous.len()];
     let mut previous_left = vec![0i32; c.components];
     for y in 0..c.height {
         // T.87 B.4/D.4: an MCU is one image line, so a restart boundary always
@@ -335,13 +350,12 @@ fn encode_scan_inner(
                 &mut previous_left,
             );
         }
-        let mut current = vec![0i32; c.width * c.components];
         let mut x = 0usize;
         while x < c.width {
-            let mut ra = vec![0i32; c.components];
-            let mut rb = vec![0i32; c.components];
-            let mut rc = vec![0i32; c.components];
-            let mut rd = vec![0i32; c.components];
+            let mut ra = [0; 3];
+            let mut rb = [0; 3];
+            let mut rc = [0; 3];
+            let mut qs = [0; 3];
             for i in 0..c.components {
                 ra[i] = if x == 0 {
                     if y == 0 {
@@ -362,15 +376,13 @@ fn encode_scan_inner(
                 } else {
                     previous[(x - 1) * c.components + i]
                 };
-                rd[i] = if x + 1 == c.width {
+                let rd = if x + 1 == c.width {
                     rb[i]
                 } else {
                     previous[(x + 1) * c.components + i]
                 };
+                qs[i] = context_id(ra[i], rb[i], rc[i], rd, &c.preset, c.near as i32);
             }
-            let qs: Vec<i32> = (0..c.components)
-                .map(|i| context_id(ra[i], rb[i], rc[i], rd[i], &c.preset, c.near as i32))
-                .collect();
             let base = (y * c.width + x) * c.components;
             if qs.iter().all(|&q| q == 0) {
                 let room = c.width - x;
@@ -395,9 +407,6 @@ fn encode_scan_inner(
                 } else {
                     let pos = x + run;
                     let sample = (y * c.width + pos) * c.components;
-                    let prev_at = (0..c.components)
-                        .map(|i| previous[pos * c.components + i])
-                        .collect::<Vec<_>>();
                     for i in 0..c.components {
                         current[pos * c.components + i] = encode_run_interrupt(
                             &mut writer,
@@ -405,7 +414,7 @@ fn encode_scan_inner(
                             run_index,
                             input[sample + i] as i32,
                             ra[i],
-                            prev_at[i],
+                            previous[pos * c.components + i],
                             &c,
                             range,
                             limit,
@@ -422,11 +431,11 @@ fn encode_scan_inner(
                     current[x * c.components + i] = encode_regular(
                         &mut writer,
                         &mut contexts[idx],
+                        qs[i],
                         sample,
                         ra[i],
                         rb[i],
                         rc[i],
-                        rd[i],
                         &c,
                         range,
                         limit,
@@ -437,7 +446,7 @@ fn encode_scan_inner(
             }
         }
         previous_left.copy_from_slice(&previous[..c.components]);
-        previous = current;
+        std::mem::swap(&mut previous, &mut current);
     }
     output.extend(writer.finish());
     Ok(output)
@@ -542,11 +551,11 @@ fn encode_line_scan(
                     current[at] = encode_regular(
                         &mut writer,
                         &mut contexts[idx],
+                        qs,
                         sample,
                         ra,
                         rb,
                         rc,
-                        rd,
                         &c,
                         range,
                         limit,
@@ -593,6 +602,7 @@ pub(crate) fn decode_scan(
     let mut run_contexts = [RunContext::new(0, range), RunContext::new(1, range)];
     let mut run_index = 0usize;
     let mut previous = vec![0i32; c.width * c.components];
+    let mut current = vec![0i32; previous.len()];
     let mut previous_left = vec![0i32; c.components];
     let mut output = vec![0u16; c.width * c.height * c.components];
     for y in 0..c.height {
@@ -609,13 +619,12 @@ pub(crate) fn decode_scan(
                 &mut previous_left,
             );
         }
-        let mut current = vec![0i32; c.width * c.components];
         let mut x = 0usize;
         while x < c.width {
-            let mut ra = vec![0i32; c.components];
-            let mut rb = vec![0i32; c.components];
-            let mut rc = vec![0i32; c.components];
-            let mut rd = vec![0i32; c.components];
+            let mut ra = [0; 3];
+            let mut rb = [0; 3];
+            let mut rc = [0; 3];
+            let mut qs = [0; 3];
             for i in 0..c.components {
                 ra[i] = if x == 0 {
                     if y == 0 {
@@ -636,15 +645,13 @@ pub(crate) fn decode_scan(
                 } else {
                     previous[(x - 1) * c.components + i]
                 };
-                rd[i] = if x + 1 == c.width {
+                let rd = if x + 1 == c.width {
                     rb[i]
                 } else {
                     previous[(x + 1) * c.components + i]
                 };
+                qs[i] = context_id(ra[i], rb[i], rc[i], rd, &c.preset, c.near as i32);
             }
-            let qs: Vec<i32> = (0..c.components)
-                .map(|i| context_id(ra[i], rb[i], rc[i], rd[i], &c.preset, c.near as i32))
-                .collect();
             if qs.iter().all(|&q| q == 0) {
                 let mut run = 0usize;
                 while x + run < c.width && reader.read_bit()? {
@@ -687,6 +694,7 @@ pub(crate) fn decode_scan(
                         ra[i],
                         previous[pos * c.components + i],
                         &c,
+                        range,
                         limit,
                         qbpp,
                     )?;
@@ -704,6 +712,7 @@ pub(crate) fn decode_scan(
                         rb[i],
                         rc[i],
                         &c,
+                        range,
                         limit,
                         qbpp,
                     )?;
@@ -715,7 +724,7 @@ pub(crate) fn decode_scan(
             output[y * c.width * c.components + i] = current[i] as u16;
         }
         previous_left.copy_from_slice(&previous[..c.components]);
-        previous = current;
+        std::mem::swap(&mut previous, &mut current);
     }
     reader.finish()?;
     Ok(output)
@@ -736,6 +745,7 @@ fn decode_component_line(
     previous_left: i32,
     current: &mut [i32],
     c: &ScanConfig,
+    range: i32,
     limit: u32,
     qbpp: u8,
 ) -> Result<usize, String> {
@@ -790,6 +800,7 @@ fn decode_component_line(
                     ra,
                     previous[pos],
                     c,
+                    range,
                     limit,
                     qbpp,
                 )?;
@@ -798,8 +809,18 @@ fn decode_component_line(
             }
         } else {
             let idx = qs.unsigned_abs() as usize;
-            current[x] =
-                decode_regular(reader, &mut contexts[idx], qs, ra, rb, rc, c, limit, qbpp)?;
+            current[x] = decode_regular(
+                reader,
+                &mut contexts[idx],
+                qs,
+                ra,
+                rb,
+                rc,
+                c,
+                range,
+                limit,
+                qbpp,
+            )?;
             x += 1;
         }
     }
@@ -886,6 +907,7 @@ pub(crate) fn decode_line_scan_planes(
                     left,
                     &mut current[offset..offset + width],
                     &component,
+                    range,
                     limit,
                     qbpp,
                 )?;

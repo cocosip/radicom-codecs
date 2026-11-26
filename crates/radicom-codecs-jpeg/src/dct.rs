@@ -1,6 +1,7 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 use std::f64::consts::PI;
+use std::sync::LazyLock;
 
 pub(crate) const ZIGZAG: [usize; 64] = [
     0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
@@ -41,6 +42,15 @@ pub(crate) fn scaled_table(base: &[u8; 64], quality: u32, max_qval: u16) -> [u16
 /// for the C signed arithmetic. `precision` selects `PASS1_BITS` (2 for 8-bit
 /// samples, 1 for 12-bit) exactly as `jfdctint.c` does.
 pub(crate) fn islow_forward(input: &[i32; 64], precision: u8) -> [i32; 64] {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: The feature check guards the AVX2 kernel.
+        return unsafe { avx2::forward(input, precision) };
+    }
+    islow_forward_scalar(input, precision)
+}
+
+fn islow_forward_scalar(input: &[i32; 64], precision: u8) -> [i32; 64] {
     const FIX_0_298631336: i32 = 2446;
     const FIX_0_390180644: i32 = 3196;
     const FIX_0_541196100: i32 = 4433;
@@ -286,24 +296,125 @@ fn compute_reciprocal(divisor: u16) -> (u32, u32, i32) {
     (fq as u32, c as u32, r - 32)
 }
 
+const DC_SCALE: f64 = 1.0 / std::f64::consts::SQRT_2;
+
+static INVERSE_BASIS: LazyLock<[[f64; 8]; 8]> = LazyLock::new(|| {
+    std::array::from_fn(|sample| {
+        std::array::from_fn(|frequency| (((2 * sample + 1) * frequency) as f64 * PI / 16.0).cos())
+    })
+});
+
+#[cfg(target_arch = "x86_64")]
+#[path = "dct_avx2.rs"]
+mod avx2;
+
 pub(crate) fn inverse(input: &[i32; 64]) -> [i32; 64] {
-    std::array::from_fn(|v| {
-        let y = v / 8;
-        let x = v % 8;
-        let mut sum = 0.0;
-        for j in 0..8 {
-            for i in 0..8 {
-                let a = if i == 0 { 1.0 / 2.0_f64.sqrt() } else { 1.0 };
-                let b = if j == 0 { 1.0 / 2.0_f64.sqrt() } else { 1.0 };
-                sum += a
-                    * b
-                    * f64::from(input[j * 8 + i])
-                    * (((2 * x + 1) as f64 * i as f64 * PI) / 16.0).cos()
-                    * (((2 * y + 1) as f64 * j as f64 * PI) / 16.0).cos();
+    if input[1..].iter().all(|&coefficient| coefficient == 0) {
+        return [inverse_dc(input[0]); 64];
+    }
+    let basis = &*INVERSE_BASIS;
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: The feature check guards the AVX2 kernel.
+        let (mut output, mut boundaries) = unsafe { avx2::inverse(input, basis) };
+        if boundaries != 0 {
+            let (terms, count) = inverse_rounding_terms(input);
+            while boundaries != 0 {
+                let index = boundaries.trailing_zeros() as usize;
+                output[index] = inverse_boundary(&terms[..count], basis, index);
+                boundaries &= boundaries - 1;
             }
         }
-        (sum / 4.0).round() as i32
-    })
+        return output;
+    }
+    inverse_scalar(input, basis)
+}
+
+pub(crate) fn inverse_dc(coefficient: i32) -> i32 {
+    (DC_SCALE * DC_SCALE * f64::from(coefficient) / 4.0).round() as i32
+}
+
+fn inverse_scalar(input: &[i32; 64], basis: &[[f64; 8]; 8]) -> [i32; 64] {
+    let mut vertical = [[0.0; 8]; 8];
+    for column in 0..8 {
+        let values = std::array::from_fn(|row| f64::from(input[row * 8 + column]));
+        let transformed = inverse_1d(values, basis);
+        for (row, value) in vertical.iter_mut().zip(transformed) {
+            row[column] = value;
+        }
+    }
+    let mut output = [0; 64];
+    let mut rounding_terms = None;
+    for (y, values) in vertical.into_iter().enumerate() {
+        for (x, value) in inverse_1d(values, basis).into_iter().enumerate() {
+            let value = value * 0.25;
+            let integer = value as i32;
+            let fraction = value - f64::from(integer);
+            // Recheck rounding boundaries in the original summation order.
+            // 0.002 exceeds the accumulated f64 error even with 64 i32::MAX terms.
+            output[y * 8 + x] = if (fraction.abs() - 0.5).abs() < 0.002 {
+                let (terms, count) =
+                    rounding_terms.get_or_insert_with(|| inverse_rounding_terms(input));
+                inverse_boundary(&terms[..*count], basis, y * 8 + x)
+            } else {
+                let adjustment = i32::from(fraction >= 0.5) - i32::from(fraction <= -0.5);
+                integer.saturating_add(adjustment)
+            };
+        }
+    }
+    output
+}
+
+fn inverse_rounding_terms(input: &[i32; 64]) -> ([(usize, usize, f64); 64], usize) {
+    let mut terms = [(0, 0, 0.0); 64];
+    let mut count = 0;
+    for (index, &coefficient) in input.iter().enumerate() {
+        if coefficient != 0 {
+            let (i, j) = (index % 8, index / 8);
+            let a = if i == 0 { DC_SCALE } else { 1.0 };
+            let b = if j == 0 { DC_SCALE } else { 1.0 };
+            terms[count] = (i, j, a * b * f64::from(coefficient));
+            count += 1;
+        }
+    }
+    (terms, count)
+}
+
+fn inverse_boundary(terms: &[(usize, usize, f64)], basis: &[[f64; 8]; 8], index: usize) -> i32 {
+    let (x, y) = (index % 8, index / 8);
+    let mut sum = 0.0;
+    for &(i, j, coefficient) in terms {
+        sum += coefficient * basis[x][i] * basis[y][j];
+    }
+    (sum * 0.25).round() as i32
+}
+
+#[inline]
+fn inverse_1d(values: [f64; 8], basis: &[[f64; 8]; 8]) -> [f64; 8] {
+    let [dc, a, b, c, d, e, f, g] = values;
+    let dc = dc * DC_SCALE;
+    if values[1..].iter().all(|&value| value == 0.0) {
+        return [dc; 8];
+    }
+    let [_, _, cos2, _, cos4, _, cos6, _] = basis[0];
+    let even_outer = dc + d * cos4;
+    let even_inner = dc - d * cos4;
+    let even0 = b * cos2 + f * cos6;
+    let even1 = b * cos6 - f * cos2;
+    let even = [
+        even_outer + even0,
+        even_inner + even1,
+        even_inner - even1,
+        even_outer - even0,
+    ];
+    let mut output = [0.0; 8];
+    for (x, &even) in even.iter().enumerate() {
+        let weights = &basis[x];
+        let odd = a * weights[1] + c * weights[3] + e * weights[5] + g * weights[7];
+        output[x] = even + odd;
+        output[7 - x] = even - odd;
+    }
+    output
 }
 
 #[cfg(test)]
@@ -379,5 +490,43 @@ mod tests {
         let coefficients: [i32; 64] = islow_forward(&input, 8).map(|value| value / 8);
         let output = inverse(&coefficients);
         assert!(input.iter().zip(output).all(|(a, b)| (*a - b).abs() <= 2));
+    }
+
+    #[test]
+    fn inverse_preserves_rounding_for_sparse_and_wide_coefficients() {
+        let mut state = 0x1234_5678u32;
+        let cases = (0..128).map(|index| {
+            let mut input = [0i32; 64];
+            input[0] = 8 * index - 508;
+            if index % 3 != 0 {
+                for (slot, coefficient) in input.iter_mut().enumerate().skip(1) {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    if index % 3 == 1 || slot % 5 == 0 {
+                        *coefficient = (state as i32) >> if index < 96 { 21 } else { 0 };
+                    }
+                }
+            }
+            input
+        });
+        for input in cases {
+            let expected = std::array::from_fn(|index| {
+                let (x, y) = (index % 8, index / 8);
+                let mut sum = 0.0;
+                for j in 0..8 {
+                    for i in 0..8 {
+                        let a = if i == 0 { 1.0 / 2.0_f64.sqrt() } else { 1.0 };
+                        let b = if j == 0 { 1.0 / 2.0_f64.sqrt() } else { 1.0 };
+                        sum += a
+                            * b
+                            * f64::from(input[j * 8 + i])
+                            * (((2 * x + 1) * i) as f64 * PI / 16.0).cos()
+                            * (((2 * y + 1) * j) as f64 * PI / 16.0).cos();
+                    }
+                }
+                (sum / 4.0).round() as i32
+            });
+            assert_eq!(inverse(&input), expected);
+            assert_eq!(inverse_scalar(&input, &INVERSE_BASIS), expected);
+        }
     }
 }

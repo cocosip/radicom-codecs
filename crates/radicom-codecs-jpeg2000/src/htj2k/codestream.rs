@@ -334,14 +334,9 @@ fn encode_block_irreversible(
     if irreversible_block_is_empty(&coefficients, missing) {
         return Ok(());
     }
-    let data = encode_cleanup(&coefficients, width, height, missing)?;
+    block.data = encode_cleanup(&coefficients, width, height, missing)?;
     block.total_passes = 1;
     block.zero_bitplanes = missing.min(255) as u8;
-    block.data = data.clone();
-    block.segments = vec![crate::geometry::CodeBlockSegment {
-        data,
-        pass_count: 1,
-    }];
     Ok(())
 }
 /// OpenJPH's zero-block test is `max_val < 1 << (31 - K_max)`, where `max_val`
@@ -391,14 +386,9 @@ fn encode_block(
     if !any {
         return Ok(());
     }
-    let data = encode_cleanup(&coefficients, width, height, missing)?;
+    block.data = encode_cleanup(&coefficients, width, height, missing)?;
     block.total_passes = 1;
     block.zero_bitplanes = missing.min(255) as u8;
-    block.data = data.clone();
-    block.segments = vec![crate::geometry::CodeBlockSegment {
-        data,
-        pass_count: 1,
-    }];
     Ok(())
 }
 
@@ -698,7 +688,7 @@ pub(crate) fn decode(
                 0,
                 0,
             )?;
-            component.samples = component.coefficients.clone();
+            component.samples = std::mem::take(&mut component.coefficients);
         } else {
             let mut plane = component
                 .irreversible

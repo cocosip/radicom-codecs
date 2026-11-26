@@ -15,14 +15,7 @@ impl RegularContext {
         }
     }
     pub(crate) fn k(&self) -> u8 {
-        // CharLS caps the Golomb parameter at 16 (constants.h). Evaluate the
-        // comparison in i64 so a crafted LSE/RESET stream cannot overflow
-        // `n << k` before the cap is reached.
-        let mut k = 0;
-        while k < 16 && (i64::from(self.n) << k) < i64::from(self.a) {
-            k += 1;
-        }
-        k
+        golomb_k(i64::from(self.a), self.n)
     }
     pub(crate) fn correction(&self, k: u8) -> i32 {
         if k == 0 && (2 * self.b + self.n - 1) < 0 {
@@ -107,16 +100,8 @@ impl RunContext {
         }
     }
     pub(crate) fn k(&self) -> u8 {
-        // i64 with a CharLS-compatible k cap of 16: a crafted run context must
-        // not drive `nt <<= 1` into an i32 overflow or an unbounded loop.
-        let temp = i64::from(self.a) + i64::from(self.n >> 1) * i64::from(self.typ);
-        let mut nt = i64::from(self.n);
-        let mut k = 0;
-        while k < 16 && nt < temp {
-            nt <<= 1;
-            k += 1;
-        }
-        k
+        let a = i64::from(self.a) + i64::from(self.n >> 1) * i64::from(self.typ);
+        golomb_k(a, self.n)
     }
     fn map_error(&self, e: i32, k: u8) -> bool {
         (k == 0 && e > 0 && 2 * self.nn < self.n)
@@ -153,4 +138,12 @@ impl RunContext {
         }
         self.n = self.n.saturating_add(1)
     }
+}
+
+/// Compare at the difference in bit widths, then resolve the one-bit ambiguity.
+#[inline]
+fn golomb_k(a: i64, n: i32) -> u8 {
+    let n = i64::from(n);
+    let shift = n.leading_zeros().saturating_sub(a.leading_zeros()).min(16);
+    (shift + u32::from((n << shift) < a)).min(16) as u8
 }

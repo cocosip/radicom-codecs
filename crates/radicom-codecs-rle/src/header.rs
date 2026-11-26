@@ -1,5 +1,5 @@
 pub(crate) const HEADER_LENGTH: usize = 64;
-const MAX_SEGMENTS: usize = 15;
+pub(crate) const MAX_SEGMENTS: usize = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RleHeader {

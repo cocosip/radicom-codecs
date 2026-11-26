@@ -160,6 +160,21 @@ const ZERO_CONTEXTS: [[u8; 512]; 4] = {
     table
 };
 
+const DECODE_ZERO_CONTEXTS: [[u8; 256]; 4] = {
+    let mut table = [[0; 256]; 4];
+    let mut orientation = 0;
+    while orientation < 4 {
+        let mut neighbors = 0;
+        while neighbors < 256 {
+            table[orientation][neighbors] =
+                zero_context((neighbors as u32) << 4, orientation as u8) as u8;
+            neighbors += 1;
+        }
+        orientation += 1;
+    }
+    table
+};
+
 const SIGN_CONTEXTS: [(u8, bool); 256] = {
     let mut table = [(0, false); 256];
     let mut index = 0;
@@ -561,7 +576,7 @@ struct Tier1Decoder {
     stride: usize,
     data: Vec<i32>,
     flags: Vec<u32>,
-    orientation: u8,
+    zero_contexts: &'static [u8; 256],
     style: u8,
     bit_plane: i32,
     in_cleanup: bool,
@@ -575,7 +590,7 @@ impl Tier1Decoder {
             stride: width + 2,
             data: vec![0; (width + 2) * (height + 2)],
             flags: vec![0; (width + 2) * (height + 2)],
-            orientation,
+            zero_contexts: &DECODE_ZERO_CONTEXTS[usize::from(orientation)],
             style,
             bit_plane: 0,
             in_cleanup: false,
@@ -584,10 +599,6 @@ impl Tier1Decoder {
 
     fn index(&self, x: usize, y: usize) -> usize {
         (y + 1) * self.stride + (x + 1)
-    }
-
-    fn index_i(&self, x: i32, y: i32) -> usize {
-        ((y + 1) as usize) * self.stride + (x + 1) as usize
     }
 
     fn run(
@@ -653,13 +664,11 @@ impl Tier1Decoder {
 
     fn decode_sigpass(&mut self, mq: &mut MqDecoder<'_>, raw: &mut RawBitReader<'_>, lazy: bool) {
         for stripe in (0..self.height).step_by(4) {
+            let rows = (self.height - stripe).min(4);
             for x in 0..self.width {
-                for dy in 0..4 {
-                    let y = stripe + dy;
-                    if y >= self.height {
-                        break;
-                    }
-                    let index = self.index(x, y);
+                let first = self.index(x, stripe);
+                for dy in 0..rows {
+                    let index = first + dy * self.stride;
                     let flags = self.flags[index];
                     if flags & SIG != 0 || flags & SIG_NEIGHBORS == 0 {
                         continue;
@@ -667,14 +676,16 @@ impl Tier1Decoder {
                     let bit = if lazy {
                         raw.read_bit()
                     } else {
-                        mq.decode(zero_context(flags, self.orientation))
+                        mq.decode(usize::from(
+                            self.zero_contexts[((flags >> 4) & 255) as usize],
+                        ))
                     };
                     self.flags[index] |= VISITED;
                     if bit {
                         if lazy {
-                            self.set_significant_raw(x, y, index, raw);
+                            self.set_significant_value(index, dy, raw.read_bit());
                         } else {
-                            self.set_significant_mq(x, y, index, mq);
+                            self.set_significant_mq(index, dy, mq);
                         }
                     }
                 }
@@ -683,14 +694,13 @@ impl Tier1Decoder {
     }
 
     fn decode_refpass(&mut self, mq: &mut MqDecoder<'_>, raw: &mut RawBitReader<'_>, lazy: bool) {
+        let half = (1i32 << self.bit_plane) >> 1;
         for stripe in (0..self.height).step_by(4) {
+            let rows = (self.height - stripe).min(4);
             for x in 0..self.width {
-                for dy in 0..4 {
-                    let y = stripe + dy;
-                    if y >= self.height {
-                        break;
-                    }
-                    let index = self.index(x, y);
+                let first = self.index(x, stripe);
+                for dy in 0..rows {
+                    let index = first + dy * self.stride;
                     let flags = self.flags[index];
                     if flags & SIG == 0 || flags & VISITED != 0 {
                         continue;
@@ -700,7 +710,6 @@ impl Tier1Decoder {
                     } else {
                         mq.decode(magnitude_context(flags))
                     };
-                    let half = (1i32 << self.bit_plane) >> 1;
                     if self.data[index] < 0 {
                         self.data[index] += if bit { -half } else { half };
                     } else {
@@ -714,17 +723,16 @@ impl Tier1Decoder {
 
     fn decode_cleanup(&mut self, mq: &mut MqDecoder<'_>) -> Result<(), String> {
         for stripe in (0..self.height).step_by(4) {
+            let rows = (self.height - stripe).min(4);
             for x in 0..self.width {
-                let mut can_run_length = stripe + 3 < self.height;
-                if can_run_length {
-                    for dy in 0..4 {
-                        let flags = self.flags[self.index(x, stripe + dy)];
-                        if flags & (VISITED | SIG | SIG_NEIGHBORS) != 0 {
-                            can_run_length = false;
-                            break;
-                        }
-                    }
-                }
+                let first = self.index(x, stripe);
+                let can_run_length = rows == 4
+                    && (self.flags[first]
+                        | self.flags[first + self.stride]
+                        | self.flags[first + 2 * self.stride]
+                        | self.flags[first + 3 * self.stride])
+                        & (VISITED | SIG | SIG_NEIGHBORS)
+                        == 0;
                 if can_run_length && !mq.decode(CTX_RUN) {
                     continue;
                 }
@@ -733,60 +741,46 @@ impl Tier1Decoder {
                 } else {
                     -1
                 };
-                for dy in 0..4 {
-                    let y = stripe + dy;
-                    if y >= self.height {
-                        break;
-                    }
+                for dy in 0..rows {
                     if can_run_length && (dy as i32) < run_length {
                         continue;
                     }
-                    let index = self.index(x, y);
+                    let index = first + dy * self.stride;
                     let flags = self.flags[index];
                     if flags & VISITED != 0 || flags & SIG != 0 {
-                        self.flags[index] &= !VISITED;
                         continue;
                     }
                     let significant = if can_run_length && dy as i32 == run_length {
                         true
                     } else {
-                        mq.decode(zero_context(flags, self.orientation))
+                        mq.decode(usize::from(
+                            self.zero_contexts[((flags >> 4) & 255) as usize],
+                        ))
                     };
                     if significant {
-                        self.set_significant_mq(x, y, index, mq);
+                        self.set_significant_mq(index, dy, mq);
                     }
-                    self.flags[index] &= !VISITED;
                 }
             }
         }
         Ok(())
     }
 
-    fn set_significant_mq(&mut self, x: usize, y: usize, index: usize, mq: &mut MqDecoder<'_>) {
+    fn set_significant_mq(&mut self, index: usize, row: usize, mq: &mut MqDecoder<'_>) {
         if self.style & 0x20 != 0 && self.in_cleanup {
             // SEGSYM: signs of coefficients that become significant in the
             // cleanup pass are coded with the uniform context.
             let sign_bit = mq.decode(CTX_UNIFORM);
-            self.set_significant_value(x, y, index, sign_bit);
+            self.set_significant_value(index, row, sign_bit);
             return;
         }
-        let sign_bit =
-            mq.decode(sign_context(self.flags[index])) ^ sign_prediction(self.flags[index]);
-        self.set_significant_value(x, y, index, sign_bit);
+        let flags = self.flags[index];
+        let key = ((flags >> 4) & 15) | ((flags >> 9) & 0xf0);
+        let (context, prediction) = SIGN_CONTEXTS[key as usize];
+        self.set_significant_value(index, row, mq.decode(usize::from(context)) ^ prediction);
     }
 
-    fn set_significant_raw(
-        &mut self,
-        x: usize,
-        y: usize,
-        index: usize,
-        raw: &mut RawBitReader<'_>,
-    ) {
-        let sign_bit = raw.read_bit();
-        self.set_significant_value(x, y, index, sign_bit);
-    }
-
-    fn set_significant_value(&mut self, x: usize, y: usize, index: usize, sign_bit: bool) {
+    fn set_significant_value(&mut self, index: usize, row: usize, sign_bit: bool) {
         let one = 1i32 << self.bit_plane;
         let value = one | (one >> 1);
         self.data[index] = if sign_bit { -value } else { value };
@@ -794,33 +788,19 @@ impl Tier1Decoder {
             self.flags[index] |= SIGN;
         }
         self.flags[index] |= SIG;
-        self.update_neighbors(x, y);
-    }
-
-    fn update_neighbors(&mut self, x: usize, y: usize) {
-        let negative = self.flags[self.index(x, y)] & SIGN != 0;
-        if !(self.style & 0x08 != 0 && y & 3 == 0) {
-            self.mark(x as i32, y as i32 - 1, SIG_S, negative, SIGN_S);
-            let idx_nw = self.index_i(x as i32 - 1, y as i32 - 1);
-            let idx_ne = self.index_i(x as i32 + 1, y as i32 - 1);
-            self.flags[idx_nw] |= SIG_SE;
-            self.flags[idx_ne] |= SIG_SW;
+        let sign = if sign_bit { u32::MAX } else { 0 };
+        if !(self.style & 0x08 != 0 && row == 0) {
+            let north = index - self.stride;
+            self.flags[north] |= SIG_S | (sign & SIGN_S);
+            self.flags[north - 1] |= SIG_SE;
+            self.flags[north + 1] |= SIG_SW;
         }
-        self.mark(x as i32, y as i32 + 1, SIG_N, negative, SIGN_N);
-        self.mark(x as i32 - 1, y as i32, SIG_E, negative, SIGN_E);
-        self.mark(x as i32 + 1, y as i32, SIG_W, negative, SIGN_W);
-        let idx_sw = self.index_i(x as i32 - 1, y as i32 + 1);
-        let idx_se = self.index_i(x as i32 + 1, y as i32 + 1);
-        self.flags[idx_sw] |= SIG_NE;
-        self.flags[idx_se] |= SIG_NW;
-    }
-
-    fn mark(&mut self, x: i32, y: i32, sig_flag: u32, negative: bool, sign_flag: u32) {
-        let index = self.index_i(x, y);
-        self.flags[index] |= sig_flag;
-        if negative {
-            self.flags[index] |= sign_flag;
-        }
+        let south = index + self.stride;
+        self.flags[south] |= SIG_N | (sign & SIGN_N);
+        self.flags[index - 1] |= SIG_E | (sign & SIGN_E);
+        self.flags[index + 1] |= SIG_W | (sign & SIGN_W);
+        self.flags[south - 1] |= SIG_NE;
+        self.flags[south + 1] |= SIG_NW;
     }
 
     fn finish(self) -> Vec<i32> {

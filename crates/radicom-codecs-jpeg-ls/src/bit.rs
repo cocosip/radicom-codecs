@@ -22,14 +22,45 @@ impl BitWriter {
             self.used = 0;
         }
     }
-    pub(crate) fn write_bits(&mut self, value: u32, count: u8) -> Result<(), String> {
+    #[inline]
+    pub(crate) fn write_bits(&mut self, value: u32, mut count: u8) -> Result<(), String> {
         if count == 0 || count > 32 || (count < 32 && value >= (1u32 << count)) {
             return Err("invalid bit width/value".into());
         }
-        for i in (0..count).rev() {
-            self.write_bit(((value >> i) & 1) != 0);
+        while count != 0 {
+            if self.stuff_pending {
+                self.used += 1;
+                self.stuff_pending = false;
+            }
+            let take = count.min(8 - self.used);
+            count -= take;
+            let mask = (1u16 << take) - 1;
+            let bits = ((value >> count) as u16) & mask;
+            self.current = ((u16::from(self.current) << take) | bits) as u8;
+            self.used += take;
+            if self.used == 8 {
+                self.push(self.current);
+                self.current = 0;
+                self.used = 0;
+            }
         }
         Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn write_unary_with_suffix(
+        &mut self,
+        mut zeroes: u32,
+        suffix: u32,
+        suffix_bits: u8,
+    ) -> Result<(), String> {
+        let payload_bits = u32::from(suffix_bits) + 1;
+        while zeroes + payload_bits > 32 {
+            let leading = zeroes.min(32);
+            self.write_bits(0, leading as u8)?;
+            zeroes -= leading;
+        }
+        self.write_bits((1 << suffix_bits) | suffix, (zeroes + payload_bits) as u8)
     }
     pub(crate) fn finish(mut self) -> Vec<u8> {
         if self.stuff_pending {
@@ -53,7 +84,7 @@ impl BitWriter {
 pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
-    current: u8,
+    current: u32,
     left: u8,
     previous_ff: bool,
 }
@@ -75,15 +106,44 @@ impl<'a> BitReader<'a> {
         self.left -= 1;
         Ok(bit)
     }
-    pub(crate) fn read_bits(&mut self, n: u8) -> Result<u32, String> {
+    #[inline]
+    pub(crate) fn read_bits(&mut self, mut n: u8) -> Result<u32, String> {
         if n == 0 || n > 32 {
             return Err("invalid bit width".into());
         }
-        let mut v = 0;
-        for _ in 0..n {
-            v = (v << 1) | u32::from(self.read_bit()?)
+        let mut v = 0u32;
+        while n != 0 {
+            if self.left == 0 {
+                self.fill()?;
+            }
+            let take = n.min(self.left);
+            self.left -= take;
+            let mask = u32::MAX >> (32 - take);
+            v = v.wrapping_shl(u32::from(take)) | ((self.current >> self.left) & mask);
+            n -= take;
         }
         Ok(v)
+    }
+
+    #[inline]
+    pub(crate) fn read_unary(&mut self, limit: u32) -> Result<u32, String> {
+        let mut zeroes = 0;
+        loop {
+            if self.left == 0 {
+                self.fill()?;
+            }
+            let pending = self.current << (32 - self.left);
+            let take = (pending.leading_zeros() as u8).min(self.left);
+            zeroes += u32::from(take);
+            if zeroes > limit {
+                return Err("Golomb unary exceeds limit".into());
+            }
+            if take < self.left {
+                self.left -= take + 1;
+                return Ok(zeroes);
+            }
+            self.left = 0;
+        }
     }
     /// Verifies that the segment ended on a byte boundary with zero padding and
     /// no unconsumed bytes. Takes `&mut self` so a restart boundary can finish
@@ -93,22 +153,19 @@ impl<'a> BitReader<'a> {
             // A full final 0xff still needs a stuffed zero and zero padding.
             self.fill()?;
         }
-        if self.left > 0 {
-            let mask = if self.left == 8 {
-                u8::MAX
-            } else {
-                (1u8 << self.left) - 1
-            };
-            if self.current & mask != 0 {
-                return Err("non-zero JPEG-LS padding bits".into());
-            }
+        let trailing_bytes = usize::from(self.left / 8);
+        let padding_mask =
+            ((1u32 << (self.left % 8)) - 1).wrapping_shl((trailing_bytes * 8) as u32);
+        if self.current & padding_mask != 0 {
+            return Err("non-zero JPEG-LS padding bits".into());
         }
-        if self.pos < self.data.len() {
+        let tail = self.pos - trailing_bytes;
+        if tail < self.data.len() {
             // Writers may pad an entropy segment with a single zero byte before
             // the next marker (fo-dicom pads a fragment to an even length) and
             // CharLS accepts one trailing 0x00 as well. Anything longer, or a
             // non-zero byte, is trailing entropy/data.
-            let trailing = &self.data[self.pos..];
+            let trailing = &self.data[tail..];
             if trailing.len() > 1 || trailing[0] != 0 {
                 return Err("trailing JPEG-LS entropy data".into());
             }
@@ -116,17 +173,29 @@ impl<'a> BitReader<'a> {
         Ok(())
     }
     fn fill(&mut self) -> Result<(), String> {
+        if !self.previous_ff {
+            if let Some(bytes) = self.data[self.pos..].first_chunk::<4>() {
+                let word = u32::from_be_bytes(*bytes);
+                let inverted = !word;
+                if inverted.wrapping_sub(0x0101_0101) & !inverted & 0x8080_8080 == 0 {
+                    self.pos += 4;
+                    self.current = word;
+                    self.left = 32;
+                    return Ok(());
+                }
+            }
+        }
         let b = *self.data.get(self.pos).ok_or("truncated scan")?;
         self.pos += 1;
         if self.previous_ff {
             if b & 0x80 != 0 {
                 return Err("invalid JPEG-LS stuffed bit".into());
             }
-            self.current = b;
+            self.current = u32::from(b);
             self.left = 7;
             self.previous_ff = false
         } else {
-            self.current = b;
+            self.current = u32::from(b);
             self.left = 8
         }
         if b == 0xff {
@@ -151,10 +220,37 @@ mod tests {
     }
 
     #[test]
+    fn unary_across_a_stuffed_byte_ignores_the_stuffed_bit() {
+        let mut writer = BitWriter::new();
+        writer.write_bits(255, 8).unwrap();
+        writer.write_unary_with_suffix(39, 0, 0).unwrap();
+        let bytes = writer.finish();
+        let mut reader = BitReader::new(&bytes);
+        assert_eq!(reader.read_bits(8).unwrap(), 255);
+        assert_eq!(reader.read_unary(39).unwrap(), 39);
+        reader.finish().unwrap();
+    }
+
+    #[test]
     fn rejects_non_zero_padding_bits() {
         let mut reader = BitReader::new(&[0b1000_0001]);
         assert!(reader.read_bit().unwrap());
         assert!(reader.finish().is_err());
+    }
+
+    #[test]
+    fn validates_prefetched_padding_and_trailing_bytes() {
+        for (bytes, bits, valid) in [
+            ([0x80, 0, 0, 0], 17, true),
+            ([0x80, 0, 1, 0], 17, false),
+            ([0x80, 0, 0, 1], 17, false),
+            ([0x80, 0, 0, 0], 9, false),
+            ([0x80, 0, 0, 0], 32, true),
+        ] {
+            let mut reader = BitReader::new(&bytes);
+            assert_eq!(reader.read_bits(bits).unwrap(), 1u32 << (bits - 1));
+            assert_eq!(reader.finish().is_ok(), valid);
+        }
     }
 
     #[test]

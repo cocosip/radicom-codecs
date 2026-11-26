@@ -166,6 +166,19 @@ impl Layout {
         } else {
             (1u16 << self.bits_stored) - 1
         };
+        if self.planar == 0 || self.components == 1 {
+            let frame = &bytes[..self.frame_length];
+            if self.bits_allocated == 1 {
+                samples.extend(frame.iter().map(|&value| u16::from(value) & mask));
+            } else {
+                samples.extend(
+                    frame
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]) & mask),
+                );
+            }
+            return Ok(samples);
+        }
         for sample in 0..sample_count {
             let source_index = self.native_offset(sample)?;
             let value = if self.bits_allocated == 1 {
@@ -192,6 +205,16 @@ impl Layout {
                 "decoded JPEG sample count {} does not match expected {expected}",
                 samples.len()
             ));
+        }
+        if self.planar == 0 || self.components == 1 {
+            if self.bits_allocated == 1 {
+                return Ok(samples.iter().map(|&value| value as u8).collect());
+            }
+            let mut bytes = vec![0u8; self.frame_length];
+            for (slot, value) in bytes.chunks_exact_mut(2).zip(samples) {
+                slot.copy_from_slice(&value.to_le_bytes());
+            }
+            return Ok(bytes);
         }
         let mut bytes = vec![0u8; self.frame_length];
         for (sample, &value) in samples.iter().enumerate() {

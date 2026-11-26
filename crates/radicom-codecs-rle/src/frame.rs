@@ -1,4 +1,4 @@
-use super::header::{RleHeader, HEADER_LENGTH};
+use super::header::{RleHeader, HEADER_LENGTH, MAX_SEGMENTS};
 use super::layout::RleLayout;
 use super::segment::{decode_segment, encode_segment};
 use crate::MAX_DECODED_BYTES;
@@ -11,28 +11,42 @@ pub(crate) fn encode_frame(layout: &RleLayout, raw: &[u8]) -> Result<Vec<u8>, St
             layout.frame_length
         ));
     }
-    let mut frame = vec![0u8; 64];
-    let mut offsets = Vec::with_capacity(layout.segment_count);
-    for segment_index in 0..layout.segment_count {
-        let samples = if layout.bit_packed {
-            unpack_bits(layout, raw)?
+    let mut frame =
+        Vec::with_capacity(HEADER_LENGTH + layout.frame_length.min(128) + 2 * layout.segment_count);
+    frame.resize(HEADER_LENGTH, 0);
+    let mut offsets = [0; MAX_SEGMENTS];
+    let offsets = &mut offsets[..layout.segment_count];
+    let mut small_plane = [0u8; 128];
+    let mut samples = Vec::new();
+    let raw = &raw[..layout.frame_length];
+    for (segment_index, offset) in offsets.iter_mut().enumerate() {
+        let segment = if layout.bit_packed {
+            samples = unpack_bits(layout, raw)?;
+            &samples
         } else {
-            let (sample, plane) = layout.segment_indices(segment_index)?;
-            let mut samples = Vec::with_capacity(layout.pixel_count);
-            for pixel in 0..layout.pixel_count {
-                samples.push(raw[layout.raw_offset(pixel, sample, plane)?]);
+            let (range, stride) = segment_span(layout, segment_index)?;
+            let plane = &raw[range];
+            if stride == 1 {
+                plane
+            } else if let Some(buffer) = small_plane.get_mut(..layout.pixel_count) {
+                for (slot, &sample) in buffer.iter_mut().zip(plane.iter().step_by(stride)) {
+                    *slot = sample;
+                }
+                &*buffer
+            } else {
+                samples.clear();
+                samples.extend(plane.iter().step_by(stride).copied());
+                &samples
             }
-            samples
         };
-        let encoded = encode_segment(&samples)?;
-        offsets.push(frame.len());
-        frame.extend_from_slice(&encoded);
-        if encoded.len() % 2 == 1 {
+        *offset = frame.len();
+        encode_segment(segment, &mut frame);
+        if frame.len() % 2 == 1 {
             frame.push(0);
         }
     }
-    let header = RleHeader::write(&offsets)?;
-    frame[..64].copy_from_slice(&header);
+    let header = RleHeader::write(offsets)?;
+    frame[..HEADER_LENGTH].copy_from_slice(&header);
     Ok(frame)
 }
 
@@ -73,15 +87,32 @@ pub(crate) fn decode_frame(layout: &RleLayout, rle: &[u8]) -> Result<Vec<u8>, St
             pack_bits(layout, &mut raw, &decoded)?;
             continue;
         }
-        let (sample, plane) = layout.segment_indices(segment_index)?;
-        for (pixel, &value) in decoded.iter().enumerate() {
-            let offset = layout.raw_offset(pixel, sample, plane)?;
-            *raw.get_mut(offset)
-                .ok_or_else(|| "decoded pixel offset is outside the output frame".to_owned())? =
-                value;
+        let (range, stride) = segment_span(layout, segment_index)?;
+        let plane = &mut raw[range];
+        if stride == 1 {
+            plane.copy_from_slice(&decoded);
+        } else {
+            for (slot, value) in plane.iter_mut().step_by(stride).zip(decoded) {
+                *slot = value;
+            }
         }
     }
     Ok(raw)
+}
+
+fn segment_span(
+    layout: &RleLayout,
+    segment: usize,
+) -> Result<(std::ops::RangeInclusive<usize>, usize), String> {
+    let (sample, plane) = layout.segment_indices(segment)?;
+    let start = layout.raw_offset(0, sample, plane)?;
+    let end = layout.raw_offset(layout.pixel_count - 1, sample, plane)?;
+    let stride = if layout.planar == 1 {
+        layout.bytes_allocated
+    } else {
+        layout.segment_count
+    };
+    Ok((start..=end, stride))
 }
 
 /// Rejects a declared decoded size that the compressed frame cannot justify,
@@ -196,7 +227,7 @@ mod tests {
         let layout = RleLayout::new_for_test(1, 3, 1, 1, 0).unwrap();
         let mut frame = vec![0u8; 64];
         frame[..64].copy_from_slice(&RleHeader::write(&[64]).unwrap());
-        frame.extend_from_slice(&encode_segment(&[0, 1, 2]).unwrap());
+        encode_segment(&[0, 1, 2], &mut frame);
         let error = decode_frame(&layout, &frame).unwrap_err();
         assert!(error.contains("is not 0 or 1"), "{error}");
     }

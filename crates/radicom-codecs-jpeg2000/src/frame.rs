@@ -498,8 +498,8 @@ pub(crate) fn decode_ht(
     validate_components(&components, layout)?;
     align_precision(&mut components, layout)?;
     let planes: Vec<Vec<i32>> = components
-        .iter()
-        .map(|component| component.samples.clone())
+        .into_iter()
+        .map(|component| component.samples)
         .collect();
     layout.write(&planes)
 }
@@ -508,8 +508,8 @@ pub(crate) fn decode(layout: &Layout, data: &[u8]) -> Result<Vec<u8>, String> {
     validate_components(&components, layout)?;
     align_precision(&mut components, layout)?;
     let planes: Vec<Vec<i32>> = components
-        .iter()
-        .map(|component| component.samples.clone())
+        .into_iter()
+        .map(|component| component.samples)
         .collect();
     layout.write(&planes)
 }

@@ -1,60 +1,33 @@
 use crate::MAX_DECODED_BYTES;
 
-pub(crate) fn encode_segment(source: &[u8]) -> Result<Vec<u8>, String> {
-    let mut output = Vec::with_capacity(source.len().saturating_add(source.len().div_ceil(128)));
-    let mut literals = Vec::with_capacity(132);
-    let mut previous = None;
-    let mut repeat_count = 0usize;
-    for &value in source {
-        if Some(value) == previous {
-            repeat_count += 1;
-            if repeat_count > 2 && !literals.is_empty() {
-                flush_literals(&mut output, &mut literals);
-            } else if repeat_count > 128 {
-                write_repeat(
-                    &mut output,
-                    previous.ok_or_else(|| "missing previous byte".to_owned())?,
-                    128,
-                );
-                repeat_count -= 128;
+pub(crate) fn encode_segment(source: &[u8], output: &mut Vec<u8>) {
+    let mut literal_start = 0;
+    let mut position = 0;
+    while position < source.len() {
+        let value = source[position];
+        let mut end = position + 1;
+        let limit = source.len().min(position + 128);
+        while end < limit && source[end] == value {
+            end += 1;
+        }
+        let length = end - position;
+        // Match fo-dicom's packetization for a two-byte run at the end.
+        if length >= 3 || (length == 2 && end == source.len()) {
+            for chunk in source[literal_start..position].chunks(128) {
+                write_literal(output, chunk);
             }
-            continue;
+            output.extend_from_slice(&[(1i16 - length as i16) as u8, value]);
+            literal_start = end;
+        } else if end - literal_start >= 128 {
+            let next_literal = literal_start + 128;
+            write_literal(output, &source[literal_start..next_literal]);
+            literal_start = next_literal;
         }
-        match repeat_count {
-            0 => {}
-            1 | 2 => {
-                for _ in 0..repeat_count {
-                    literals.push(previous.ok_or_else(|| "missing previous byte".to_owned())?);
-                }
-            }
-            count => write_repeats(
-                &mut output,
-                previous.ok_or_else(|| "missing previous byte".to_owned())?,
-                count,
-            ),
-        }
-        flush_oversized_literals(&mut output, &mut literals);
-        previous = Some(value);
-        repeat_count = 1;
+        position = end;
     }
-    match repeat_count {
-        0 => {}
-        1 => literals.push(previous.ok_or_else(|| "missing previous byte".to_owned())?),
-        // A run that is still open when the segment ends is a repeat run, even
-        // for two bytes: fo-dicom's `Flush` emits `FF xx` there, while a run of
-        // two seen mid-stream would have gone into the literal buffer. Match that
-        // byte-for-byte; the literal buffer must be emitted first.
-        count => {
-            flush_literals(&mut output, &mut literals);
-            write_repeats(
-                &mut output,
-                previous.ok_or_else(|| "missing previous byte".to_owned())?,
-                count,
-            );
-        }
+    if literal_start < source.len() {
+        write_literal(output, &source[literal_start..]);
     }
-    flush_literals(&mut output, &mut literals);
-    Ok(output)
 }
 
 /// Rejects an output size that the segment input cannot justify, before the
@@ -137,52 +110,34 @@ pub(crate) fn decode_segment(encoded: &[u8], expected_length: usize) -> Result<V
     Ok(output)
 }
 
-fn flush_oversized_literals(output: &mut Vec<u8>, literals: &mut Vec<u8>) {
-    while literals.len() > 128 {
-        write_literal(output, &literals[..128]);
-        literals.drain(..128);
-    }
-}
-fn flush_literals(output: &mut Vec<u8>, literals: &mut Vec<u8>) {
-    while !literals.is_empty() {
-        let length = literals.len().min(128);
-        write_literal(output, &literals[..length]);
-        literals.drain(..length);
-    }
-}
 fn write_literal(output: &mut Vec<u8>, bytes: &[u8]) {
     output.push((bytes.len() - 1) as u8);
     output.extend_from_slice(bytes);
 }
-fn write_repeats(output: &mut Vec<u8>, value: u8, mut count: usize) {
-    while count != 0 {
-        let length = count.min(128);
-        write_repeat(output, value, length);
-        count -= length;
-    }
-}
-fn write_repeat(output: &mut Vec<u8>, value: u8, count: usize) {
-    output.push((1i16 - count as i16) as u8);
-    output.push(value);
-}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{decode_segment, ensure_decoded_size_fits};
+
+    fn encode_segment(source: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        super::encode_segment(source, &mut output);
+        output
+    }
 
     #[test]
     fn encodes_and_decodes_literal_repeat_and_mixed_runs() {
-        assert_eq!(encode_segment(&[10, 11, 12]).unwrap(), [2, 10, 11, 12]);
-        assert_eq!(encode_segment(&[7, 7, 7]).unwrap(), [254, 7]);
+        assert_eq!(encode_segment(&[10, 11, 12]), [2, 10, 11, 12]);
+        assert_eq!(encode_segment(&[7, 7, 7]), [254, 7]);
         let source = [1, 2, 9, 9, 9, 9, 3];
-        assert_eq!(encode_segment(&source).unwrap(), [1, 1, 2, 253, 9, 0, 3]);
+        assert_eq!(encode_segment(&source), [1, 1, 2, 253, 9, 0, 3]);
         assert_eq!(decode_segment(&[1, 1, 2, 253, 9, 0, 3], 7).unwrap(), source);
     }
 
     #[test]
     fn handles_boundaries_and_noop() {
         let source = vec![4u8; 129];
-        let encoded = encode_segment(&source).unwrap();
+        let encoded = encode_segment(&source);
         assert_eq!(decode_segment(&encoded, source.len()).unwrap(), source);
         assert_eq!(decode_segment(&[0x80, 0, 4], 1).unwrap(), [4]);
         assert!(decode_segment(&[2, 1, 2], 3).is_err());
@@ -193,7 +148,7 @@ mod tests {
     fn matches_the_reference_133_byte_packetization() {
         let mut source: Vec<u8> = (0..128).map(|value| value as u8).collect();
         source.extend_from_slice(&[200, 200, 200, 5, 6]);
-        let encoded = encode_segment(&source).unwrap();
+        let encoded = encode_segment(&source);
         let mut expected = vec![127u8];
         expected.extend(0..128);
         expected.extend_from_slice(&[254, 200, 1, 5, 6]);
@@ -202,12 +157,12 @@ mod tests {
 
     #[test]
     fn encodes_a_two_byte_tail_run_as_a_repeat_like_the_reference() {
-        let encoded = encode_segment(&[1, 2, 3, 3]).unwrap();
+        let encoded = encode_segment(&[1, 2, 3, 3]);
         assert_eq!(encoded, [1, 1, 2, 0xff, 3]);
         assert_eq!(decode_segment(&encoded, 4).unwrap(), [1, 2, 3, 3]);
-        assert_eq!(encode_segment(&[7, 7]).unwrap(), [0xff, 7]);
+        assert_eq!(encode_segment(&[7, 7]), [0xff, 7]);
         // A run of two followed by another byte stays a literal run.
-        assert_eq!(encode_segment(&[7, 7, 9]).unwrap(), [2, 7, 7, 9]);
+        assert_eq!(encode_segment(&[7, 7, 9]), [2, 7, 7, 9]);
         assert_eq!(
             decode_segment(&[1, 1, 2, 0xff, 3], 4).unwrap(),
             [1, 2, 3, 3]

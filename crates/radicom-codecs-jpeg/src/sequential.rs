@@ -7,8 +7,8 @@
 use super::bit::{BitReader, BitWriter};
 use super::color::JpegColorSpace;
 use super::dct::{
-    inverse, islow_forward, scaled_table, ForwardQuantizer, CHROMA_Q, LUMA_Q, MAX_QUANTIZATION,
-    ZIGZAG,
+    inverse, inverse_dc, islow_forward, scaled_table, ForwardQuantizer, CHROMA_Q, LUMA_Q,
+    MAX_QUANTIZATION, ZIGZAG,
 };
 use super::huffman::HuffmanTable;
 use super::marker::{check_trailing, Marker, MarkerReader, MarkerWriter};
@@ -323,6 +323,14 @@ impl SequentialFrame {
         ];
         let mut dc_frequencies = [[0u32; 256]; 2];
         let mut ac_frequencies = [[0u32; 256]; 2];
+        // Each component can end with up to four blocks of MCU padding.
+        // Limit the extra working set and use the original two passes on large frames.
+        let cache_capacity = (self.width.div_ceil(8) + 4)
+            * (self.height.div_ceil(8) + 4)
+            * usize::from(self.components);
+        let mut block_cache = Vec::new();
+        let cache_blocks = cache_capacity <= (64 << 20) / size_of::<[i32; 64]>()
+            && block_cache.try_reserve_exact(cache_capacity).is_ok();
         for scan in scans {
             self.walk_scan(
                 &quantizers,
@@ -331,8 +339,12 @@ impl SequentialFrame {
                 scan,
                 restart_interval,
                 colorspace,
+                None,
                 |step| {
                     if let ScanStep::Block { slot, diff, block } = step {
+                        if cache_blocks {
+                            block_cache.push(*block);
+                        }
                         dc_frequencies[slot][usize::from(category(diff))] += 1;
                         for_each_ac(block, |symbol, _, _| {
                             ac_frequencies[slot][usize::from(symbol)] += 1;
@@ -369,6 +381,7 @@ impl SequentialFrame {
         let mut sent_dc = [false; 2];
         let mut sent_ac = [false; 2];
         let mut last_restart_interval = 0u16;
+        let mut cached_blocks = block_cache.iter();
         for scan in scans {
             for &component in scan {
                 let id = usize::from(colorspace.table_id(usize::from(component)));
@@ -397,6 +410,7 @@ impl SequentialFrame {
                 restart_interval,
                 &quantizers,
                 colorspace,
+                cache_blocks.then_some(&mut cached_blocks),
             )?;
         }
         out.write_marker(Marker::Eoi)?;
@@ -415,6 +429,7 @@ impl SequentialFrame {
         components: &[u8],
         restart_interval: Option<u16>,
         colorspace: JpegColorSpace,
+        mut cached_blocks: Option<&mut std::slice::Iter<'_, [i32; 64]>>,
         mut visit: impl FnMut(ScanStep<'_>) -> Result<(), String>,
     ) -> Result<(), String> {
         let interleaved = components.len() > 1;
@@ -459,17 +474,25 @@ impl SequentialFrame {
                         for local_x in 0..blocks_x {
                             let block_x = mx * blocks_x + local_x;
                             let block_y = my * blocks_y + local_y;
-                            let mut block = [0i32; 64];
-                            self.load_block(pooling, block_x, block_y, &mut block);
-                            let coefficients = islow_forward(&block, self.precision);
-                            let quant = quantizers[table].quantize(&coefficients);
+                            let computed;
+                            let quant = if let Some(blocks) = cached_blocks.as_deref_mut() {
+                                blocks
+                                    .next()
+                                    .ok_or("JPEG quantized block cache is incomplete")?
+                            } else {
+                                let mut block = [0i32; 64];
+                                self.load_block(pooling, block_x, block_y, &mut block);
+                                let coefficients = islow_forward(&block, self.precision);
+                                computed = quantizers[table].quantize(&coefficients);
+                                &computed
+                            };
                             let dc = quant[0];
                             let diff = dc - previous_dc[c];
                             previous_dc[c] = dc;
                             visit(ScanStep::Block {
                                 slot: table,
                                 diff,
-                                block: &quant,
+                                block: quant,
                             })?;
                         }
                     }
@@ -490,6 +513,7 @@ impl SequentialFrame {
         restart_interval: Option<u16>,
         quantizers: &[ForwardQuantizer; 2],
         colorspace: JpegColorSpace,
+        cached_blocks: Option<&mut std::slice::Iter<'_, [i32; 64]>>,
     ) -> Result<(), String> {
         let mut bits = BitWriter::default();
         self.walk_scan(
@@ -499,6 +523,7 @@ impl SequentialFrame {
             components,
             restart_interval,
             colorspace,
+            cached_blocks,
             |step| match step {
                 ScanStep::Restart(index) => {
                     bits.flush_to_byte();
@@ -508,11 +533,9 @@ impl SequentialFrame {
                 ScanStep::Block { slot, diff, block } => {
                     write_value(&mut bits, &tables.dc[slot].table, diff)?;
                     for_each_ac(block, |symbol, value, size| {
-                        tables.ac[slot].table.encode(symbol, &mut bits)?;
-                        if size > 0 {
-                            bits.write_bits(value, size)?;
-                        }
-                        Ok(())
+                        tables.ac[slot]
+                            .table
+                            .encode_with_suffix(symbol, value, size, &mut bits)
                     })
                 }
             },
@@ -523,10 +546,28 @@ impl SequentialFrame {
 
     fn load_block(&self, pooling: Pooling, block_x: usize, block_y: usize, block: &mut [i32; 64]) {
         let offset = 1 << (self.precision - 1);
+        let left = block_x * 8;
+        let top = block_y * 8;
+        if pooling.smoothing == 0
+            && pooling.step_x == 1
+            && pooling.step_y == 1
+            && left + 8 <= self.width
+            && top + 8 <= self.height
+        {
+            let stride = usize::from(self.components);
+            for (y, row) in block.chunks_exact_mut(8).enumerate() {
+                let start = ((top + y) * self.width + left) * stride;
+                let source = &self.samples[start..start + 8 * stride];
+                for (x, sample) in row.iter_mut().enumerate() {
+                    *sample = i32::from(source[x * stride + pooling.component]) - offset;
+                }
+            }
+            return;
+        }
         for y in 0..8 {
             for x in 0..8 {
-                let sample_x = block_x * 8 + x;
-                let sample_y = block_y * 8 + y;
+                let sample_x = left + x;
+                let sample_y = top + y;
                 let value = if pooling.smoothing == 0 {
                     self.cell_sample(pooling, sample_x, sample_y)
                 } else {
@@ -982,6 +1023,22 @@ fn decode_scan(
     let max = (1i32 << frame.precision) - 1;
     let interleaved = scan.len() > 1;
     let (hmax, vmax) = max_sampling(&frame.sampling, frame.components);
+    let mut geometry = [(0, 0, 0, 0); 3];
+    for &(component, _, _) in scan {
+        let c = usize::from(component);
+        let (h, v) = frame.sampling[c];
+        let (blocks_x, blocks_y) = if interleaved {
+            (usize::from(h), usize::from(v))
+        } else {
+            (1, 1)
+        };
+        geometry[c] = (
+            blocks_x,
+            blocks_y,
+            usize::from(hmax / h),
+            usize::from(vmax / v),
+        );
+    }
     let (mcu_w, mcu_h) = scan_grid(
         width,
         height,
@@ -1013,24 +1070,22 @@ fn decode_scan(
             mcu += 1;
             for &(component, dc_table, ac_table) in scan {
                 let c = usize::from(component);
-                let (h, v) = frame.sampling[c];
-                let (blocks_x, blocks_y) = if interleaved {
-                    (usize::from(h), usize::from(v))
-                } else {
-                    (1, 1)
-                };
-                let (step_x, step_y) = upsampling(&frame.sampling, frame.components, c);
+                let qtable = &q[usize::from(frame.qids[c])];
+                let (blocks_x, blocks_y, step_x, step_y) = geometry[c];
                 for local_y in 0..blocks_y {
                     for local_x in 0..blocks_x {
                         let block_x = mx * blocks_x + local_x;
                         let block_y = my * blocks_y + local_y;
-                        let mut quant = [0i32; 64];
+                        let mut coeff = [0i32; 64];
                         let dc = read_value(&mut bits, dc_table, frame.max_dc_category)?;
                         prev[c] = prev[c]
                             .checked_add(i64::from(dc))
                             .ok_or_else(|| "JPEG DC predictor overflows i64".to_owned())?;
-                        quant[0] = i32::try_from(prev[c]).map_err(|_| {
+                        let quant_dc = i32::try_from(prev[c]).map_err(|_| {
                             "JPEG DC coefficient is outside the i32 range".to_owned()
+                        })?;
+                        coeff[0] = quant_dc.checked_mul(i32::from(qtable[0])).ok_or_else(|| {
+                            "JPEG dequantized coefficient is outside the i32 range".to_owned()
                         })?;
                         let mut k = 1;
                         while k < 64 {
@@ -1053,19 +1108,47 @@ fn decode_scan(
                                 if k >= 64 {
                                     return Err("JPEG AC run exceeds block".into());
                                 }
-                                quant[ZIGZAG[k]] = decode_amplitude(bits.read_bits(size)?, size);
+                                let index = ZIGZAG[k];
+                                // The four-bit category and sixteen-bit quantizer give
+                                // a product bounded by 32767 * 65535.
+                                coeff[index] = decode_amplitude(bits.read_bits(size)?, size)
+                                    * i32::from(qtable[index]);
                                 k += 1;
                             }
                         }
-                        let mut coeff = [0i32; 64];
-                        for i in 0..64 {
+                        let left = block_x * 8;
+                        let top = block_y * 8;
+                        let full =
+                            step_x == 1 && step_y == 1 && left + 8 <= width && top + 8 <= height;
+                        if full && k == 1 {
                             let value =
-                                i64::from(quant[i]) * i64::from(q[usize::from(frame.qids[c])][i]);
-                            coeff[i] = i32::try_from(value).map_err(|_| {
-                                "JPEG dequantized coefficient is outside the i32 range".to_owned()
-                            })?;
+                                inverse_dc(coeff[0]).saturating_add(offset).clamp(0, max) as u16;
+                            let row_stride = width * stride;
+                            let start = top * row_stride + left * stride;
+                            for y in 0..8 {
+                                let row = start + y * row_stride;
+                                if stride == 1 {
+                                    samples[row..row + 8].fill(value);
+                                } else {
+                                    for pixel in samples[row..row + 24].chunks_exact_mut(3) {
+                                        pixel[c] = value;
+                                    }
+                                }
+                            }
+                            continue;
                         }
                         let block = inverse(&coeff);
+                        if full {
+                            for (dy, row) in block.chunks_exact(8).enumerate() {
+                                let start = ((top + dy) * width + left) * stride;
+                                let target = &mut samples[start..start + 8 * stride];
+                                for (dx, &sample) in row.iter().enumerate() {
+                                    target[dx * stride + c] =
+                                        sample.saturating_add(offset).clamp(0, max) as u16;
+                                }
+                            }
+                            continue;
+                        }
                         // ponytail: trailing blocks clamp out-of-plane samples onto
                         // the last visible column/row instead of dropping them, which
                         // keeps single-scan output byte-compatible with the original
@@ -1123,12 +1206,7 @@ fn decode_amplitude(v: u32, n: u8) -> i32 {
 }
 fn write_value(w: &mut BitWriter, h: &HuffmanTable, v: i32) -> Result<(), String> {
     let n = category(v);
-    h.encode(n, w)?;
-    if n > 0 {
-        w.write_bits(amplitude(v, n), n)
-    } else {
-        Ok(())
-    }
+    h.encode_with_suffix(n, amplitude(v, n), n, w)
 }
 /// Emits `(symbol, extra bits, bit count)` for every AC coefficient of a
 /// quantized block: runs of sixteen zeros as `0xF0`, the end of block as `0x00`,

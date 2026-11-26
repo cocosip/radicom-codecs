@@ -9,6 +9,7 @@ use super::sequential::FrameExpectation;
 /// One built lossless DC Huffman table: symbol counts, symbol values and the
 /// derived code table.
 type DcTable = (Vec<u8>, Vec<u8>, HuffmanTable);
+type ScanTable<'a> = (usize, &'a HuffmanTable, [u32; 1024]);
 
 /// One item of the scan walk: a coded difference (with its component) or a
 /// restart boundary.
@@ -192,7 +193,11 @@ impl LosslessFrame {
             }
         }
         let mut frequencies = [[0u32; 256]; 2];
-        let mut reconstructed = allocate_samples(self.samples.len())?;
+        let mut reconstructed = if predictor == 1 && restart_interval.is_none() {
+            Vec::new()
+        } else {
+            allocate_samples(self.samples.len())?
+        };
         for scan in scans {
             self.walk_scan(
                 scan,
@@ -266,12 +271,12 @@ impl LosslessFrame {
                             "JPEG lossless Huffman table was not built".to_owned()
                         })?;
                         let category = category(difference);
-                        huffman.encode(category, &mut entropy)?;
                         if category != 0 && category != 16 {
                             let amplitude = encode_amplitude(difference, category);
-                            entropy.write_bits(amplitude, category)?;
+                            huffman.encode_with_suffix(category, amplitude, category, &mut entropy)
+                        } else {
+                            huffman.encode(category, &mut entropy)
                         }
-                        Ok(())
                     }
                     ScanEvent::Restart(index) => {
                         entropy.flush_to_byte();
@@ -302,6 +307,28 @@ impl LosslessFrame {
         initial: i32,
         mut visit: impl FnMut(ScanEvent) -> Result<(), String>,
     ) -> Result<(), String> {
+        if predictor == 1 && restart_interval.is_none() {
+            let stride = usize::from(self.components);
+            let row_width = self.width * stride;
+            let mut previous_first = [initial; 3];
+            for row in self.samples.chunks_exact(row_width) {
+                let mut left = previous_first;
+                for &component in scan {
+                    let c = usize::from(component);
+                    previous_first[c] = i32::from(row[c] >> point_transform);
+                }
+                for pixel in row.chunks_exact(stride) {
+                    for &component in scan {
+                        let c = usize::from(component);
+                        let value = i32::from(pixel[c] >> point_transform);
+                        let diff = encode_difference(value - left[c], effective_precision);
+                        visit(ScanEvent::Difference(component, diff))?;
+                        left[c] = value;
+                    }
+                }
+            }
+            return Ok(());
+        }
         let mut restart_index = 0u8;
         // T.81 G.1.2: the first row of a scan or restart interval uses the
         // one-dimensional predictor (libjpeg's first-row undifferencer), so
@@ -324,10 +351,8 @@ impl LosslessFrame {
                     reconstructed,
                     index,
                     x,
-                    y,
                     self.width,
                     self.components,
-                    usize::from(component),
                     predictor,
                     initial,
                     y == interval_start_row,
@@ -389,7 +414,6 @@ impl LosslessFrame {
                     let count = usize::try_from(count)
                         .map_err(|_| "JPEG sample count overflows usize".to_owned())?;
                     samples = allocate_samples(count)?;
-                    shifted_samples = allocate_samples(count)?;
                     header = Some((width, height, precision, components, component_ids));
                 }
                 Marker::Dht => parse_dht(&payload, &mut tables)?,
@@ -404,6 +428,9 @@ impl LosslessFrame {
                         return Err("missing JPEG SOF3".to_owned());
                     };
                     let scan = parse_sos(&payload, precision, components, &component_ids)?;
+                    if scan.point_transform != 0 && shifted_samples.is_empty() {
+                        shifted_samples = allocate_samples(samples.len())?;
+                    }
                     if selection == Selection::Sv1
                         && (scan.predictor != 1 || scan.point_transform != 0)
                     {
@@ -479,91 +506,207 @@ fn decode_scan(
     let mut bits = BitReader::new(entropy);
     let effective_precision = precision - scan.point_transform;
     let initial = 1i32 << (effective_precision - 1);
-    let mcus = width
-        .checked_mul(height)
-        .ok_or_else(|| "JPEG sample count overflows usize".to_owned())?;
     let stride = usize::from(components);
     let mut restart_index = 0u8;
+    let mut next_restart = restart_interval.map_or(usize::MAX, usize::from);
+    let mut scan_tables = Vec::with_capacity(scan.components.len());
+    for &(component, table) in &scan.components {
+        let huffman = tables[usize::from(table)]
+            .as_ref()
+            .ok_or_else(|| format!("missing JPEG DC Huffman table {table}"))?;
+        scan_tables.push((
+            usize::from(component),
+            huffman,
+            huffman.short_amplitudes::<10, 1024>(),
+        ));
+    }
+    let max = (1i32 << effective_precision) - 1;
+    if scan.predictor == 1 && scan.point_transform == 0 && restart_interval.is_none() {
+        let decoded = match (components, scan_tables.as_slice()) {
+            (1, [first]) => {
+                decode_predictor_one(&mut bits, [first], samples, width, effective_precision)?;
+                true
+            }
+            (3, [first, second, third]) => {
+                decode_predictor_one(
+                    &mut bits,
+                    [first, second, third],
+                    samples,
+                    width,
+                    effective_precision,
+                )?;
+                true
+            }
+            _ => false,
+        };
+        if decoded {
+            bits.align_to_byte();
+            return Ok(bits.position());
+        }
+    }
+
     // Each interval gets its own first row: libjpeg restores the first-row
     // undifferencer in process_restart (jddiffct.c), so the one-dimensional
     // predictor covers the whole row after a restart marker.
     let mut interval_start_row = 0usize;
-    for mcu in 0..mcus {
-        let x = mcu % width;
-        let y = mcu / width;
-        let restart = restart_interval
-            .is_some_and(|interval| mcu != 0 && mcu.is_multiple_of(usize::from(interval)));
-        if restart {
-            bits.align_to_byte();
-            let marker = bits.take_marker()?.ok_or_else(|| {
-                "expected JPEG restart marker at restart interval boundary".to_owned()
-            })?;
-            let expected = 0xd0 + restart_index;
-            if marker != expected {
-                return Err(format!(
+    for y in 0..height {
+        for x in 0..width {
+            let mcu = y * width + x;
+            if mcu == next_restart {
+                bits.align_to_byte();
+                let marker = bits.take_marker()?.ok_or_else(|| {
+                    "expected JPEG restart marker at restart interval boundary".to_owned()
+                })?;
+                let expected = 0xd0 + restart_index;
+                if marker != expected {
+                    return Err(format!(
                     "unexpected JPEG restart marker 0xff{marker:02x}, expected 0xff{expected:02x}"
                 ));
+                }
+                restart_index = (restart_index + 1) & 7;
+                interval_start_row = y;
+                next_restart += usize::from(restart_interval.unwrap());
             }
-            restart_index = (restart_index + 1) & 7;
-            interval_start_row = y;
-        }
-        for &(component, table) in &scan.components {
-            let huffman = tables[usize::from(table)]
-                .as_ref()
-                .ok_or_else(|| format!("missing JPEG DC Huffman table {table}"))?;
-            let index = mcu * stride + usize::from(component);
-            let prediction = predict(
-                shifted_samples,
-                index,
-                x,
-                y,
-                width,
-                components,
-                usize::from(component),
-                scan.predictor,
-                initial,
-                y == interval_start_row,
-            );
-            let category = huffman.decode(&mut bits)?;
-            // A P-bit lossless prediction difference can need category P+1 (e.g.
-            // an 8-bit sample predicted from a 510-valued neighborhood leaves a
-            // -510 difference), so the bound is the effective precision plus one;
-            // category 16 is the 16-bit special case reachable only at precision
-            // 16. Tightening this to `effective_precision` rejects valid streams.
-            if category > effective_precision + 1 {
-                return Err(format!(
-                    "JPEG lossless category {category} exceeds effective precision {effective_precision}"
-                ));
-            }
-            let amplitude = if category == 0 {
-                0
-            } else if category == 16 {
-                -32768
-            } else {
-                let bits_value = bits.read_bits(category)?;
-                decode_amplitude(bits_value, category)
-            };
-            let shifted = prediction
-                .checked_add(amplitude)
-                .ok_or_else(|| "JPEG lossless reconstruction overflows i32".to_owned())?;
-            let max = (1i32 << effective_precision) - 1;
-            let shifted = if effective_precision == 16 {
-                shifted & max
-            } else {
-                shifted
-            };
-            if !(0..=max).contains(&shifted) {
-                return Err(format!(
+            for (component, huffman, amplitudes) in &scan_tables {
+                let index = mcu * stride + *component;
+                let reconstructed = if scan.point_transform == 0 {
+                    &*samples
+                } else {
+                    &*shifted_samples
+                };
+                let prediction = predict(
+                    reconstructed,
+                    index,
+                    x,
+                    width,
+                    components,
+                    scan.predictor,
+                    initial,
+                    y == interval_start_row,
+                );
+                let amplitude =
+                    read_difference(&mut bits, huffman, amplitudes, effective_precision)?;
+                let shifted = prediction
+                    .checked_add(amplitude)
+                    .ok_or_else(|| "JPEG lossless reconstruction overflows i32".to_owned())?;
+                let shifted = if effective_precision == 16 {
+                    shifted & max
+                } else {
+                    shifted
+                };
+                if !(0..=max).contains(&shifted) {
+                    return Err(format!(
                     "JPEG lossless sample is outside the declared precision at pixel {mcu}, component {component}: prediction={prediction}, amplitude={amplitude}, shifted={shifted}, max={max}"
                 ));
+                }
+                if scan.point_transform != 0 {
+                    shifted_samples[index] = shifted as u16;
+                }
+                samples[index] = u16::try_from(shifted << scan.point_transform)
+                    .map_err(|_| "JPEG lossless sample exceeds u16".to_owned())?;
             }
-            shifted_samples[index] = shifted as u16;
-            samples[index] = u16::try_from(shifted << scan.point_transform)
-                .map_err(|_| "JPEG lossless sample exceeds u16".to_owned())?;
         }
     }
     bits.align_to_byte();
     Ok(bits.position())
+}
+
+fn decode_predictor_one<const STRIDE: usize>(
+    bits: &mut BitReader<'_>,
+    tables: [&ScanTable<'_>; STRIDE],
+    samples: &mut [u16],
+    width: usize,
+    precision: u8,
+) -> Result<(), String> {
+    let max = (1i32 << precision) - 1;
+    let mut above = [1i32 << (precision - 1); STRIDE];
+    let components = tables.map(|table| table.0);
+    for (y, row) in samples.chunks_exact_mut(width * STRIDE).enumerate() {
+        let mut left = above;
+        for (x, pixel) in row.chunks_exact_mut(STRIDE).enumerate() {
+            for (scan_slot, &(_, huffman, ref amplitudes)) in tables.iter().copied().enumerate() {
+                let amplitude = if precision == 16 {
+                    read_difference_16(bits, huffman, amplitudes)?
+                } else {
+                    read_difference(bits, huffman, amplitudes, precision)?
+                };
+                let prediction = left[scan_slot];
+                let value = prediction + amplitude;
+                let value = if precision == 16 { value & max } else { value };
+                if !(0..=max).contains(&value) {
+                    let mcu = y * width + x;
+                    let component = components[scan_slot];
+                    return Err(format!("JPEG lossless sample is outside the declared precision at pixel {mcu}, component {component}: prediction={prediction}, amplitude={amplitude}, shifted={value}, max={max}"));
+                }
+                left[scan_slot] = value;
+                pixel[components[scan_slot]] = value as u16;
+            }
+        }
+        for (slot, &component) in above.iter_mut().zip(&components) {
+            *slot = i32::from(row[component]);
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn read_difference_16(
+    bits: &mut BitReader<'_>,
+    huffman: &HuffmanTable,
+    amplitudes: &[u32; 1024],
+) -> Result<i32, String> {
+    const PREFIX_BITS: u8 = 24;
+    if let Some(prefix) = bits.peek_prefix(PREFIX_BITS) {
+        let packed = huffman.short_code((prefix >> (PREFIX_BITS - 8)) as u8);
+        let width = (packed >> 8) as u8;
+        let category = packed as u8;
+        if width != 0 && category <= 16 {
+            if category == 16 {
+                bits.consume_prefix(width);
+                return Ok(-32768);
+            }
+            let total = width + category;
+            bits.consume_prefix(total);
+            if category == 0 {
+                return Ok(0);
+            }
+            let amplitude = (prefix >> (PREFIX_BITS - total)) as u32 & ((1 << category) - 1);
+            return Ok(decode_amplitude(amplitude, category));
+        }
+    }
+    read_difference(bits, huffman, amplitudes, 16)
+}
+
+#[inline]
+fn read_difference(
+    bits: &mut BitReader<'_>,
+    huffman: &HuffmanTable,
+    amplitudes: &[u32; 1024],
+    effective_precision: u8,
+) -> Result<i32, String> {
+    let packed = bits.peek_prefix(10).map_or(0, |prefix| amplitudes[prefix]);
+    let category = if packed != 0 {
+        (packed >> 8) as u8
+    } else {
+        huffman.decode(bits)?
+    };
+    // A P-bit prediction difference may need P+1 bits when the predictor
+    // produces an out-of-range value. Category 16 has no extra bits.
+    if category > effective_precision + 1 {
+        return Err(format!(
+            "JPEG lossless category {category} exceeds effective precision {effective_precision}"
+        ));
+    }
+    Ok(if packed != 0 {
+        bits.consume_prefix(packed as u8);
+        i32::from((packed >> 16) as i16)
+    } else if category == 0 {
+        0
+    } else if category == 16 {
+        -32768
+    } else {
+        decode_amplitude(bits.read_bits(category)?, category)
+    })
 }
 
 fn validate_predictor(predictor: u8) -> Result<(), String> {
@@ -838,10 +981,8 @@ fn predict(
     samples: &[u16],
     index: usize,
     x: usize,
-    y: usize,
     width: usize,
     components: u8,
-    component: usize,
     predictor: u8,
     initial: i32,
     first_row: bool,
@@ -857,30 +998,17 @@ fn predict(
     if x == 0 {
         return i32::from(samples[index - width * stride]);
     }
-    let left = if x == 0 {
-        initial
-    } else {
-        i32::from(samples[index - stride])
-    };
-    let above = if y == 0 {
-        initial
-    } else {
-        i32::from(samples[index - width * stride])
-    };
-    let upper_left = if x == 0 || y == 0 {
-        initial
-    } else {
-        i32::from(samples[index - (width + 1) * stride])
-    };
-    let _ = component;
+    let left = || i32::from(samples[index - stride]);
+    let above = || i32::from(samples[index - width * stride]);
+    let upper_left = || i32::from(samples[index - (width + 1) * stride]);
     match predictor {
-        1 => left,
-        2 => above,
-        3 => upper_left,
-        4 => left + above - upper_left,
-        5 => left + ((above - upper_left) >> 1),
-        6 => above + ((left - upper_left) >> 1),
-        7 => (left + above) >> 1,
+        1 => left(),
+        2 => above(),
+        3 => upper_left(),
+        4 => left() + above() - upper_left(),
+        5 => left() + ((above() - upper_left()) >> 1),
+        6 => above() + ((left() - upper_left()) >> 1),
+        7 => (left() + above()) >> 1,
         _ => initial,
     }
 }
@@ -1120,6 +1248,15 @@ mod tests {
             frame,
             "interleaved subset scan"
         );
+    }
+
+    #[test]
+    fn predictor_one_reconstructs_components_in_frame_order() {
+        for precision in [8, 16] {
+            let frame = sample_frame(precision, 3);
+            let stream = frame.encode_scans(1, 0, None, &[vec![2, 0, 1]]).unwrap();
+            assert_eq!(decode_any(&stream).unwrap(), frame);
+        }
     }
 
     #[test]

@@ -1,7 +1,6 @@
 //! JPEG 2000 MQ arithmetic coder (ISO/IEC 15444-1 Annex C).
 //!
-//! The decoder stores the probability index and most probable symbol in one
-//! byte. The encoder caches each context's probability and both transitions.
+//! Each context caches its probability and both transitions.
 
 const QE: [u16; 47] = [
     0x5601, 0x3401, 0x1801, 0x0AC1, 0x0521, 0x0221, 0x5601, 0x5401, 0x4801, 0x3801, 0x3001, 0x2401,
@@ -32,7 +31,7 @@ pub(crate) const CTX_ZC: usize = 0;
 pub(crate) const CTX_RUN: usize = 17;
 pub(crate) const CTX_UNIFORM: usize = 18;
 
-const ENCODE_STATES: [u32; 94] = {
+const PROBABILITY_STATES: [u32; 94] = {
     let mut table = [0; 94];
     let mut index = 0;
     while index < table.len() {
@@ -47,38 +46,30 @@ const ENCODE_STATES: [u32; 94] = {
     table
 };
 
-const INITIAL_ENCODE_CONTEXTS: [u32; CONTEXT_COUNT] = {
-    let mut states = [ENCODE_STATES[0]; CONTEXT_COUNT];
-    states[CTX_UNIFORM] = ENCODE_STATES[46 * 2];
-    states[CTX_RUN] = ENCODE_STATES[3 * 2];
-    states[CTX_ZC] = ENCODE_STATES[4 * 2];
+const INITIAL_CONTEXTS: [u32; CONTEXT_COUNT] = {
+    let mut states = [PROBABILITY_STATES[0]; CONTEXT_COUNT];
+    states[CTX_UNIFORM] = PROBABILITY_STATES[46 * 2];
+    states[CTX_RUN] = PROBABILITY_STATES[3 * 2];
+    states[CTX_ZC] = PROBABILITY_STATES[4 * 2];
     states
 };
 
 #[derive(Debug, Clone)]
 pub(crate) struct Contexts {
-    states: [u8; CONTEXT_COUNT],
+    states: [u32; CONTEXT_COUNT],
 }
 
 impl Default for Contexts {
     fn default() -> Self {
         Self {
-            states: [0; CONTEXT_COUNT],
+            states: INITIAL_CONTEXTS,
         }
     }
 }
 
 impl Contexts {
     pub(crate) fn reset(&mut self) {
-        self.states = [0; CONTEXT_COUNT];
-        self.states[CTX_UNIFORM] = 46;
-        self.states[CTX_RUN] = 3;
-        self.states[CTX_ZC] = 4;
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn set(&mut self, context: usize, state: u8) {
-        self.states[context] = state;
+        self.states = INITIAL_CONTEXTS;
     }
 }
 
@@ -98,7 +89,7 @@ impl MqEncoder {
             a: 0x8000,
             c: 0,
             ct: 12,
-            contexts: INITIAL_ENCODE_CONTEXTS,
+            contexts: INITIAL_CONTEXTS,
         }
     }
 
@@ -113,7 +104,7 @@ impl MqEncoder {
     }
 
     pub(crate) fn reset_contexts(&mut self) {
-        self.contexts = INITIAL_ENCODE_CONTEXTS;
+        self.contexts = INITIAL_CONTEXTS;
     }
 
     #[inline]
@@ -136,7 +127,7 @@ impl MqEncoder {
         } else {
             (state >> 17) & 0x7f
         };
-        self.contexts[context] = ENCODE_STATES[next as usize];
+        self.contexts[context] = PROBABILITY_STATES[next as usize];
         self.renorm();
     }
 
@@ -213,7 +204,6 @@ impl<'a> MqDecoder<'a> {
             ct: 0,
             contexts: Contexts::default(),
         };
-        decoder.contexts.reset();
         decoder.c = u32::from(decoder.byte_at(0)) << 16;
         decoder.byte_in();
         decoder.c <<= 7;
@@ -226,52 +216,42 @@ impl<'a> MqDecoder<'a> {
         &mut self.contexts
     }
 
+    #[inline]
     pub(crate) fn decode(&mut self, context: usize) -> bool {
-        let cx = self.contexts.states[context];
-        let state = usize::from(cx & 0x7F);
-        let mps = cx >> 7 != 0;
-        let qe = u32::from(QE[state]);
-        self.a -= qe;
-        if (self.c >> 16) < qe {
-            let bit;
-            if self.a < qe {
-                self.a = qe;
-                bit = mps;
-                self.contexts.states[context] = NMPS[state] | (u8::from(mps) << 7);
-            } else {
-                self.a = qe;
-                bit = !mps;
-                let next_mps = if SWITCH[state] { !mps } else { mps };
-                self.contexts.states[context] = NLPS[state] | (u8::from(next_mps) << 7);
+        let state = self.contexts.states[context];
+        let mps = state & 0x1_0000 != 0;
+        let qe = state & 0xffff;
+        let interval = self.a - qe;
+        let select_qe = (self.c >> 16) < qe;
+        self.a = if select_qe { qe } else { interval };
+        if !select_qe {
+            self.c -= qe << 16;
+            if interval >= 0x8000 {
+                return mps;
             }
-            self.renorm();
-            return bit;
         }
-        self.c -= qe << 16;
-        if self.a & 0x8000 != 0 {
-            return mps;
-        }
-        let bit;
-        if self.a < qe {
-            bit = !mps;
-            let next_mps = if SWITCH[state] { !mps } else { mps };
-            self.contexts.states[context] = NLPS[state] | (u8::from(next_mps) << 7);
+        let lps = select_qe ^ (interval < qe);
+        let next = if lps {
+            state >> 24
         } else {
-            bit = mps;
-            self.contexts.states[context] = NMPS[state] | (u8::from(mps) << 7);
-        }
+            (state >> 17) & 0x7f
+        };
+        self.contexts.states[context] = PROBABILITY_STATES[next as usize];
         self.renorm();
-        bit
+        mps ^ lps
     }
 
     fn renorm(&mut self) {
-        while self.a < 0x8000 {
+        let mut remaining = self.a.leading_zeros() - 16;
+        while remaining != 0 {
             if self.ct == 0 {
                 self.byte_in();
             }
-            self.a <<= 1;
-            self.c <<= 1;
-            self.ct -= 1;
+            let shift = remaining.min(self.ct as u32);
+            self.a <<= shift;
+            self.c <<= shift;
+            self.ct -= shift as i32;
+            remaining -= shift;
         }
     }
 
@@ -316,7 +296,7 @@ mod tests {
             encoder.encode(bit, 1);
             assert_eq!(encoder.a, expected_a);
             assert_eq!(encoder.c, expected_c);
-            assert_eq!(encoder.contexts[1], ENCODE_STATES[expected_state]);
+            assert_eq!(encoder.contexts[1], PROBABILITY_STATES[expected_state]);
         }
     }
 
@@ -352,8 +332,8 @@ mod tests {
     fn context_state_round_trips_through_packing() {
         let mut contexts = Contexts::default();
         contexts.reset();
-        assert_eq!(contexts.states[CTX_UNIFORM] & 0x7F, 46);
-        assert_eq!(contexts.states[CTX_RUN] & 0x7F, 3);
-        assert_eq!(contexts.states[CTX_ZC] & 0x7F, 4);
+        assert_eq!(contexts.states[CTX_UNIFORM], PROBABILITY_STATES[46 * 2]);
+        assert_eq!(contexts.states[CTX_RUN], PROBABILITY_STATES[3 * 2]);
+        assert_eq!(contexts.states[CTX_ZC], PROBABILITY_STATES[4 * 2]);
     }
 }
