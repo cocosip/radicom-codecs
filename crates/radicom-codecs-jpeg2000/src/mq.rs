@@ -1,8 +1,7 @@
 //! JPEG 2000 MQ arithmetic coder (ISO/IEC 15444-1 Annex C).
 //!
-//! Context state is packed into one byte: bits 0..6 are the probability state
-//! index and bit 7 is the most probable symbol. This mirrors the reference
-//! implementation and keeps the Tier-1 pass code compact.
+//! The decoder stores the probability index and most probable symbol in one
+//! byte. The encoder caches each context's probability and both transitions.
 
 const QE: [u16; 47] = [
     0x5601, 0x3401, 0x1801, 0x0AC1, 0x0521, 0x0221, 0x5601, 0x5401, 0x4801, 0x3801, 0x3001, 0x2401,
@@ -32,6 +31,29 @@ pub(crate) const CONTEXT_COUNT: usize = 19;
 pub(crate) const CTX_ZC: usize = 0;
 pub(crate) const CTX_RUN: usize = 17;
 pub(crate) const CTX_UNIFORM: usize = 18;
+
+const ENCODE_STATES: [u32; 94] = {
+    let mut table = [0; 94];
+    let mut index = 0;
+    while index < table.len() {
+        let state = index / 2;
+        let mps = (index & 1) as u32;
+        let next_mps = NMPS[state] as u32 * 2 + mps;
+        let next_lps = NLPS[state] as u32 * 2 + (mps ^ SWITCH[state] as u32);
+        // Qe in bits 0..15, MPS in bit 16, and two 7-bit transition indices.
+        table[index] = QE[state] as u32 | (mps << 16) | (next_mps << 17) | (next_lps << 24);
+        index += 1;
+    }
+    table
+};
+
+const INITIAL_ENCODE_CONTEXTS: [u32; CONTEXT_COUNT] = {
+    let mut states = [ENCODE_STATES[0]; CONTEXT_COUNT];
+    states[CTX_UNIFORM] = ENCODE_STATES[46 * 2];
+    states[CTX_RUN] = ENCODE_STATES[3 * 2];
+    states[CTX_ZC] = ENCODE_STATES[4 * 2];
+    states
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Contexts {
@@ -63,58 +85,62 @@ impl Contexts {
 #[derive(Debug)]
 pub(crate) struct MqEncoder {
     data: Vec<u8>,
-    bp: usize,
     a: u32,
     c: u32,
     ct: i32,
-    contexts: Contexts,
+    contexts: [u32; CONTEXT_COUNT],
 }
 
 impl MqEncoder {
     pub(crate) fn new() -> Self {
-        let mut contexts = Contexts::default();
-        contexts.reset();
         Self {
             data: vec![0],
-            bp: 0,
             a: 0x8000,
             c: 0,
             ct: 12,
-            contexts,
+            contexts: INITIAL_ENCODE_CONTEXTS,
         }
     }
 
-    pub(crate) fn reset_contexts(&mut self) {
-        self.contexts.reset();
+    pub(crate) fn restart(&mut self, capacity: usize) {
+        self.data.clear();
+        self.data.reserve(capacity + 1);
+        self.data.push(0);
+        self.a = 0x8000;
+        self.c = 0;
+        self.ct = 12;
+        self.reset_contexts();
     }
 
+    pub(crate) fn reset_contexts(&mut self) {
+        self.contexts = INITIAL_ENCODE_CONTEXTS;
+    }
+
+    #[inline]
     pub(crate) fn encode(&mut self, bit: bool, context: usize) {
-        let cx = self.contexts.states[context];
-        let state = usize::from(cx & 0x7F);
-        let mps = cx >> 7 != 0;
-        let qe = u32::from(QE[state]);
+        let cx = self.contexts[context];
+        let mps = cx & 0x1_0000 != 0;
+        let qe = cx & 0xFFFF;
+        self.a -= qe;
         if bit == mps {
-            self.a -= qe;
             if self.a & 0x8000 == 0 {
                 if self.a < qe {
                     self.a = qe;
                 } else {
                     self.c += qe;
                 }
-                self.contexts.states[context] = NMPS[state] | (u8::from(mps) << 7);
+                self.contexts[context] = ENCODE_STATES[((cx >> 17) & 0x7F) as usize];
                 self.renorm();
             } else {
                 self.c += qe;
             }
         } else {
-            self.a -= qe;
             if self.a < qe {
                 self.c += qe;
             } else {
                 self.a = qe;
             }
-            let next_mps = if SWITCH[state] { !mps } else { mps };
-            self.contexts.states[context] = NLPS[state] | (u8::from(next_mps) << 7);
+            self.contexts[context] = ENCODE_STATES[(cx >> 24) as usize];
             self.renorm();
         }
     }
@@ -131,59 +157,30 @@ impl MqEncoder {
     }
 
     fn byte_out(&mut self) {
-        self.ensure(self.bp);
-        if self.data[self.bp] == 0xFF {
-            self.bp += 1;
-            self.ensure(self.bp);
-            self.data[self.bp] = (self.c >> 20) as u8;
+        let previous = self.data.last_mut().expect("MQ sentinel or previous byte");
+        if *previous != 0xFF && self.c & 0x0800_0000 != 0 {
+            *previous += 1;
+            self.c &= 0x07FF_FFFF;
+        }
+        if *previous == 0xFF {
+            self.data.push((self.c >> 20) as u8);
             self.c &= 0xFFFFF;
             self.ct = 7;
-            return;
-        }
-        if self.c & 0x0800_0000 == 0 {
-            self.bp += 1;
-            self.ensure(self.bp);
-            self.data[self.bp] = (self.c >> 19) as u8;
+        } else {
+            self.data.push((self.c >> 19) as u8);
             self.c &= 0x7FFFF;
             self.ct = 8;
-            return;
-        }
-        self.data[self.bp] += 1;
-        if self.data[self.bp] == 0xFF {
-            self.c &= 0x07FF_FFFF;
-            self.bp += 1;
-            self.ensure(self.bp);
-            self.data[self.bp] = (self.c >> 20) as u8;
-            self.c &= 0xFFFFF;
-            self.ct = 7;
-            return;
-        }
-        self.bp += 1;
-        self.ensure(self.bp);
-        self.data[self.bp] = (self.c >> 19) as u8;
-        self.c &= 0x7FFFF;
-        self.ct = 8;
-    }
-
-    fn ensure(&mut self, index: usize) {
-        while self.data.len() <= index {
-            self.data.push(0);
         }
     }
 
     /// Bytes emitted so far, matching OpenJPEG's `opj_mqc_numbytes()`. The
-    /// encoder's `bp` points at the last emitted byte, while OpenJPEG starts
-    /// its pointer one before the buffer; both therefore report `bp - start`.
+    /// sentinel and the pending byte are excluded, with wrapping when only
+    /// the sentinel is present.
     pub(crate) fn numbytes(&self) -> u32 {
-        (self.bp as i64 - 1) as u32
+        (self.data.len() as u32).wrapping_sub(2)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn current_length(&self) -> usize {
-        self.bp.saturating_sub(1)
-    }
-
-    pub(crate) fn flush(mut self) -> Vec<u8> {
+    pub(crate) fn flush(&mut self) -> Vec<u8> {
         let temp = self.c + self.a;
         self.c |= 0xFFFF;
         if self.c >= temp {
@@ -193,14 +190,11 @@ impl MqEncoder {
         self.byte_out();
         self.c <<= self.ct;
         self.byte_out();
-        if self.data[self.bp] != 0xFF {
-            self.bp += 1;
+        if self.data.last() == Some(&0xFF) {
+            self.data.pop();
         }
-        let length = self.bp.saturating_sub(1);
-        if length == 0 {
-            return Vec::new();
-        }
-        self.data[1..1 + length].to_vec()
+        self.data.remove(0);
+        std::mem::take(&mut self.data)
     }
 }
 

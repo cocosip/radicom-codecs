@@ -154,61 +154,38 @@ pub(crate) const CTX_MAG: usize = 14;
 pub(crate) const CTX_RUN: usize = 17;
 pub(crate) const CTX_UNIFORM: usize = 18;
 
+const ZERO_CONTEXTS: [[u8; 256]; 4] = {
+    let mut table = [[0; 256]; 4];
+    let mut orientation = 0;
+    while orientation < 4 {
+        let mut neighbors = 0;
+        while neighbors < 256 {
+            table[orientation][neighbors] =
+                zero_context((neighbors as u32) << 4, orientation as u8) as u8;
+            neighbors += 1;
+        }
+        orientation += 1;
+    }
+    table
+};
+
+const SIGN_CONTEXTS: [(u8, bool); 256] = {
+    let mut table = [(0, false); 256];
+    let mut index = 0;
+    while index < 256 {
+        let flags = (((index as u32) & 0xf) << 4) | (((index as u32) >> 4) << 13);
+        table[index] = (sign_context(flags) as u8, sign_prediction(flags));
+        index += 1;
+    }
+    table
+};
+
 #[derive(Debug, Clone)]
 pub(crate) struct EncodedCodeBlock {
     pub(crate) data: Vec<u8>,
     pub(crate) pass_count: u32,
     pub(crate) max_bit_plane: i32,
     pub(crate) passes: Vec<CodeBlockPass>,
-}
-
-/// Encodes one code-block. `coefficients` must already be in the reference
-/// fixed-point domain (reversible values shifted left by six, irreversible
-/// quantized values multiplied by 64).
-pub(crate) fn encode_code_block(
-    coefficients: &[i32],
-    width: usize,
-    height: usize,
-    orientation: u8,
-    style: u8,
-    weight: &PassWeight,
-) -> Result<EncodedCodeBlock, String> {
-    if width == 0 || height == 0 || coefficients.len() != width * height {
-        return Err("invalid code-block dimensions".into());
-    }
-    let max = coefficients
-        .iter()
-        .map(|v| v.unsigned_abs())
-        .max()
-        .unwrap_or(0);
-    if max == 0 {
-        return Ok(EncodedCodeBlock {
-            data: Vec::new(),
-            pass_count: 0,
-            max_bit_plane: -1,
-            passes: Vec::new(),
-        });
-    }
-    let max_bit_plane = 32 - max.leading_zeros() as i32 - 1;
-    let bit_count = max_bit_plane - (FRACTIONAL_BITS - 1);
-    if bit_count <= 0 {
-        return Ok(EncodedCodeBlock {
-            data: Vec::new(),
-            pass_count: 0,
-            max_bit_plane,
-            passes: Vec::new(),
-        });
-    }
-    let pass_count = (bit_count * 3 - 2) as u32;
-    let mut encoder = Tier1Encoder::new(width, height, orientation, style);
-    encoder.load(coefficients);
-    let (data, passes) = encoder.run(pass_count as i32, weight);
-    Ok(EncodedCodeBlock {
-        data,
-        pass_count,
-        max_bit_plane,
-        passes,
-    })
 }
 
 /// Decodes one code-block from its (already concatenated) coding segments.
@@ -239,13 +216,13 @@ pub(crate) fn decode_code_block(
     Ok(decoder.finish())
 }
 
-struct Tier1Encoder {
+pub(crate) struct Tier1Encoder {
     width: usize,
     height: usize,
     stride: usize,
     data: Vec<i32>,
     flags: Vec<u32>,
-    orientation: u8,
+    zero_contexts: &'static [u8; 256],
     style: u8,
     mq: MqEncoder,
     bit_plane: i32,
@@ -253,59 +230,87 @@ struct Tier1Encoder {
 }
 
 impl Tier1Encoder {
-    fn new(width: usize, height: usize, orientation: u8, style: u8) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            width,
-            height,
-            stride: width + 2,
-            data: vec![0; (width + 2) * (height + 2)],
-            flags: vec![0; (width + 2) * (height + 2)],
-            orientation,
-            style,
+            width: 0,
+            height: 0,
+            stride: 0,
+            data: Vec::new(),
+            flags: Vec::new(),
+            zero_contexts: &ZERO_CONTEXTS[0],
+            style: 0,
             mq: MqEncoder::new(),
             bit_plane: 0,
             nmsedec: 0,
         }
     }
 
-    fn load(&mut self, coefficients: &[i32]) {
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let index = self.index(x, y);
-                self.data[index] = coefficients[y * self.width + x];
-            }
+    /// Coefficients are in the reference fixed-point domain with six
+    /// fractional bits.
+    pub(crate) fn encode(
+        &mut self,
+        coefficients: &[i32],
+        (width, height): (usize, usize),
+        orientation: u8,
+        style: u8,
+        weight: &PassWeight,
+    ) -> Result<EncodedCodeBlock, String> {
+        if width == 0 || height == 0 || coefficients.len() != width * height {
+            return Err("invalid code-block dimensions".into());
         }
+        let max = coefficients
+            .iter()
+            .map(|v| v.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        let max_bit_plane = 31 - max.leading_zeros() as i32;
+        let bit_count = max_bit_plane - (FRACTIONAL_BITS - 1);
+        if bit_count <= 0 {
+            return Ok(EncodedCodeBlock {
+                data: Vec::new(),
+                pass_count: 0,
+                max_bit_plane,
+                passes: Vec::new(),
+            });
+        }
+
+        self.width = width;
+        self.height = height;
+        self.stride = width + 2;
+        self.zero_contexts = &ZERO_CONTEXTS[usize::from(orientation)];
+        self.style = style;
+        self.bit_plane = max_bit_plane;
+        let padded_len = self.stride * (height + 2);
+        self.data.resize(padded_len, 0);
+        self.flags.resize(padded_len, 0);
+        self.flags.fill(0);
+        for (source, destination) in coefficients
+            .chunks_exact(width)
+            .zip(self.data.chunks_exact_mut(self.stride).skip(1))
+        {
+            destination[1..=width].copy_from_slice(source);
+        }
+        self.mq.restart(coefficients.len() * bit_count as usize / 8);
+        let pass_count = (bit_count * 3 - 2) as u32;
+        let (data, passes) = self.run(pass_count as i32, weight);
+        Ok(EncodedCodeBlock {
+            data,
+            pass_count,
+            max_bit_plane,
+            passes,
+        })
     }
 
     fn index(&self, x: usize, y: usize) -> usize {
         (y + 1) * self.stride + (x + 1)
     }
 
-    fn index_i(&self, x: i32, y: i32) -> usize {
-        ((y + 1) as usize) * self.stride + (x + 1) as usize
-    }
-
-    fn run(mut self, pass_count: i32, weight: &PassWeight) -> (Vec<u8>, Vec<CodeBlockPass>) {
-        let max = self
-            .data
-            .iter()
-            .map(|v| v.unsigned_abs())
-            .max()
-            .unwrap_or(0);
-        if max == 0 || pass_count <= 0 {
-            return (Vec::new(), Vec::new());
-        }
-        self.bit_plane = 32 - max.leading_zeros() as i32 - 1;
+    fn run(&mut self, pass_count: i32, weight: &PassWeight) -> (Vec<u8>, Vec<CodeBlockPass>) {
         let mut passes = Vec::with_capacity(pass_count as usize);
         let mut cumulative_distortion = 0.0f64;
         let mut pass = 0;
         let mut pass_type = 2;
         while self.bit_plane >= 0 && pass < pass_count {
-            if pass_type == 0 || (pass_type == 2 && pass == 0) {
-                for flag in &mut self.flags {
-                    *flag &= !VISITED;
-                }
-            }
             self.nmsedec = 0;
             match pass_type {
                 0 => self.encode_sigpass(),
@@ -366,23 +371,22 @@ impl Tier1Encoder {
 
     fn encode_sigpass(&mut self) {
         for stripe in (0..self.height).step_by(4) {
+            let rows = (self.height - stripe).min(4);
+            let first = self.index(0, stripe);
             for x in 0..self.width {
-                for dy in 0..4 {
-                    let y = stripe + dy;
-                    if y >= self.height {
-                        break;
-                    }
-                    let index = self.index(x, y);
+                let start = first + x;
+                for dy in 0..rows {
+                    let index = start + dy * self.stride;
                     let flags = self.flags[index];
                     if flags & SIG != 0 || flags & SIG_NEIGHBORS == 0 {
                         continue;
                     }
                     let significant = self.magnitude_bit(index);
-                    self.mq
-                        .encode(significant, zero_context(flags, self.orientation));
+                    let context = self.zero_contexts[((flags >> 4) & 0xff) as usize];
+                    self.mq.encode(significant, usize::from(context));
                     self.flags[index] |= VISITED;
                     if significant {
-                        self.set_significant(x, y, index, false);
+                        self.set_significant(dy, index, false);
                     }
                 }
             }
@@ -391,13 +395,12 @@ impl Tier1Encoder {
 
     fn encode_refpass(&mut self) {
         for stripe in (0..self.height).step_by(4) {
+            let rows = (self.height - stripe).min(4);
+            let first = self.index(0, stripe);
             for x in 0..self.width {
-                for dy in 0..4 {
-                    let y = stripe + dy;
-                    if y >= self.height {
-                        break;
-                    }
-                    let index = self.index(x, y);
+                let start = first + x;
+                for dy in 0..rows {
+                    let index = start + dy * self.stride;
                     let flags = self.flags[index];
                     if flags & SIG == 0 || flags & VISITED != 0 {
                         continue;
@@ -416,13 +419,15 @@ impl Tier1Encoder {
 
     fn encode_cleanup(&mut self) {
         for stripe in (0..self.height).step_by(4) {
+            let rows = (self.height - stripe).min(4);
+            let first = self.index(0, stripe);
             for x in 0..self.width {
-                let full_stripe = stripe + 3 < self.height;
-                let mut eligible = full_stripe;
+                let start = first + x;
+                let mut eligible = rows == 4;
                 let mut run_length = -1i32;
-                if full_stripe {
+                if eligible {
                     for dy in 0..4 {
-                        let flags = self.flags[self.index(x, stripe + dy)];
+                        let flags = self.flags[start + dy * self.stride];
                         if flags & (VISITED | SIG | SIG_NEIGHBORS) != 0 {
                             eligible = false;
                             break;
@@ -431,7 +436,7 @@ impl Tier1Encoder {
                 }
                 if eligible {
                     for dy in 0..4 {
-                        if self.magnitude_bit(self.index(x, stripe + dy)) {
+                        if self.magnitude_bit(start + dy * self.stride) {
                             run_length = dy as i32;
                             break;
                         }
@@ -443,15 +448,11 @@ impl Tier1Encoder {
                     self.mq.encode((run_length >> 1) & 1 != 0, CTX_UNIFORM);
                     self.mq.encode(run_length & 1 != 0, CTX_UNIFORM);
                 }
-                for dy in 0..4 {
-                    let y = stripe + dy;
-                    if y >= self.height {
-                        break;
-                    }
+                for dy in 0..rows {
                     if eligible && (dy as i32) < run_length {
                         continue;
                     }
-                    let index = self.index(x, y);
+                    let index = start + dy * self.stride;
                     let flags = self.flags[index];
                     if flags & VISITED != 0 || flags & SIG != 0 {
                         self.flags[index] &= !VISITED;
@@ -460,11 +461,11 @@ impl Tier1Encoder {
                     let mut significant = eligible && dy as i32 == run_length;
                     if !significant {
                         significant = self.magnitude_bit(index);
-                        self.mq
-                            .encode(significant, zero_context(flags, self.orientation));
+                        let context = self.zero_contexts[((flags >> 4) & 0xff) as usize];
+                        self.mq.encode(significant, usize::from(context));
                     }
                     if significant {
-                        self.set_significant(x, y, index, self.style & 0x20 != 0);
+                        self.set_significant(dy, index, self.style & 0x20 != 0);
                     }
                     self.flags[index] &= !VISITED;
                 }
@@ -472,7 +473,7 @@ impl Tier1Encoder {
         }
     }
 
-    fn set_significant(&mut self, x: usize, y: usize, index: usize, uniform_sign: bool) {
+    fn set_significant(&mut self, row_in_stripe: usize, index: usize, uniform_sign: bool) {
         self.nmsedec += nmsedec_sig(
             self.data[index].unsigned_abs(),
             self.bit_plane - FRACTIONAL_BITS,
@@ -483,45 +484,33 @@ impl Tier1Encoder {
             // cleanup pass use the uniform context, without prediction.
             self.mq.encode(sign, CTX_UNIFORM);
         } else {
-            let context = sign_context(self.flags[index]);
-            let prediction = sign_prediction(self.flags[index]);
-            self.mq.encode(sign ^ prediction, context);
-        }
-        if sign {
-            self.flags[index] |= SIGN;
+            let flags = self.flags[index];
+            let key = ((flags >> 4) & 0xf) | (((flags >> 13) & 0xf) << 4);
+            let (context, prediction) = SIGN_CONTEXTS[key as usize];
+            self.mq.encode(sign ^ prediction, usize::from(context));
         }
         self.flags[index] |= SIG;
-        self.update_neighbors(x, y);
+        self.update_neighbors(index, row_in_stripe, sign);
     }
 
     fn magnitude_bit(&self, index: usize) -> bool {
         (self.data[index].unsigned_abs() >> self.bit_plane) & 1 != 0
     }
 
-    fn update_neighbors(&mut self, x: usize, y: usize) {
-        let negative = self.flags[self.index(x, y)] & SIGN != 0;
-        if !(self.style & 0x08 != 0 && y & 3 == 0) {
-            self.mark(x as i32, y as i32 - 1, SIG_S, negative, SIGN_S);
-            let idx_nw = self.index_i(x as i32 - 1, y as i32 - 1);
-            let idx_ne = self.index_i(x as i32 + 1, y as i32 - 1);
-            self.flags[idx_nw] |= SIG_SE;
-            self.flags[idx_ne] |= SIG_SW;
+    fn update_neighbors(&mut self, index: usize, row_in_stripe: usize, negative: bool) {
+        let sign_mask = 0u32.wrapping_sub(u32::from(negative));
+        if !(self.style & 0x08 != 0 && row_in_stripe == 0) {
+            let north = index - self.stride;
+            self.flags[north] |= SIG_S | (sign_mask & SIGN_S);
+            self.flags[north - 1] |= SIG_SE;
+            self.flags[north + 1] |= SIG_SW;
         }
-        self.mark(x as i32, y as i32 + 1, SIG_N, negative, SIGN_N);
-        self.mark(x as i32 - 1, y as i32, SIG_E, negative, SIGN_E);
-        self.mark(x as i32 + 1, y as i32, SIG_W, negative, SIGN_W);
-        let idx_sw = self.index_i(x as i32 - 1, y as i32 + 1);
-        let idx_se = self.index_i(x as i32 + 1, y as i32 + 1);
-        self.flags[idx_sw] |= SIG_NE;
-        self.flags[idx_se] |= SIG_NW;
-    }
-
-    fn mark(&mut self, x: i32, y: i32, sig_flag: u32, negative: bool, sign_flag: u32) {
-        let index = self.index_i(x, y);
-        self.flags[index] |= sig_flag;
-        if negative {
-            self.flags[index] |= sign_flag;
-        }
+        let south = index + self.stride;
+        self.flags[south] |= SIG_N | (sign_mask & SIGN_N);
+        self.flags[south - 1] |= SIG_NE;
+        self.flags[south + 1] |= SIG_NW;
+        self.flags[index - 1] |= SIG_E | (sign_mask & SIGN_E);
+        self.flags[index + 1] |= SIG_W | (sign_mask & SIGN_W);
     }
 }
 
@@ -853,16 +842,15 @@ impl<'a> RawBitReader<'a> {
     }
 }
 
-fn zero_context(flags: u32, orientation: u8) -> usize {
-    let mut horizontal = u32::from(flags & SIG_W != 0) + u32::from(flags & SIG_E != 0);
-    let mut vertical = u32::from(flags & SIG_N != 0) + u32::from(flags & SIG_S != 0);
-    let diagonal = u32::from(flags & SIG_NW != 0)
-        + u32::from(flags & SIG_NE != 0)
-        + u32::from(flags & SIG_SW != 0)
-        + u32::from(flags & SIG_SE != 0);
-    if orientation == 1 {
-        std::mem::swap(&mut horizontal, &mut vertical);
-    }
+const fn zero_context(flags: u32, orientation: u8) -> usize {
+    let horizontal = (flags & (SIG_W | SIG_E)).count_ones();
+    let vertical = (flags & (SIG_N | SIG_S)).count_ones();
+    let diagonal = (flags & (SIG_NW | SIG_NE | SIG_SW | SIG_SE)).count_ones();
+    let (horizontal, vertical) = if orientation == 1 {
+        (vertical, horizontal)
+    } else {
+        (horizontal, vertical)
+    };
     let n = if orientation == 3 {
         let hv = horizontal + vertical;
         match diagonal {
@@ -912,7 +900,7 @@ fn zero_context(flags: u32, orientation: u8) -> usize {
     CTX_ZC + n
 }
 
-fn sign_context(flags: u32) -> usize {
+const fn sign_context(flags: u32) -> usize {
     let (mut horizontal, mut vertical) = sign_contributions(flags);
     if horizontal < 0 {
         horizontal = -horizontal;
@@ -934,34 +922,20 @@ fn sign_context(flags: u32) -> usize {
     CTX_SIGN + n
 }
 
-fn sign_prediction(flags: u32) -> bool {
+const fn sign_prediction(flags: u32) -> bool {
     let (horizontal, vertical) = sign_contributions(flags);
-    if horizontal == 0 && vertical == 0 {
-        return false;
-    }
-    !(horizontal > 0 || (horizontal == 0 && vertical > 0))
+    horizontal < 0 || (horizontal == 0 && vertical < 0)
 }
 
-fn sign_contributions(flags: u32) -> (i32, i32) {
-    let pos = |sig: u32, sign: u32| -> i32 {
-        if flags & sig != 0 && flags & sign == 0 {
-            1
-        } else {
-            0
-        }
-    };
-    let neg = |sig: u32, sign: u32| -> i32 {
-        if flags & sig != 0 && flags & sign != 0 {
-            1
-        } else {
-            0
-        }
-    };
-    let horizontal = (pos(SIG_E, SIGN_E) + pos(SIG_W, SIGN_W)).min(1)
-        - (neg(SIG_E, SIGN_E) + neg(SIG_W, SIGN_W)).min(1);
-    let vertical = (pos(SIG_N, SIGN_N) + pos(SIG_S, SIGN_S)).min(1)
-        - (neg(SIG_N, SIGN_N) + neg(SIG_S, SIGN_S)).min(1);
-    (horizontal, vertical)
+const fn sign_contributions(flags: u32) -> (i32, i32) {
+    // In both nibbles the cardinal neighbors are ordered N, S, W, E.
+    let significant = (flags >> 4) & 0xf;
+    let negative = significant & (flags >> 13);
+    let positive = significant & !negative;
+    (
+        (positive & 0xc != 0) as i32 - (negative & 0xc != 0) as i32,
+        (positive & 0x3 != 0) as i32 - (negative & 0x3 != 0) as i32,
+    )
 }
 
 fn magnitude_context(flags: u32) -> usize {
@@ -996,15 +970,15 @@ mod tests {
         ] {
             let values = pattern(width, height);
             let coefficients: Vec<i32> = values.iter().map(|v| v * 64).collect();
-            let encoded = encode_code_block(
-                &coefficients,
-                width,
-                height,
-                orientation,
-                0,
-                &PassWeight::default(),
-            )
-            .unwrap();
+            let encoded = Tier1Encoder::new()
+                .encode(
+                    &coefficients,
+                    (width, height),
+                    orientation,
+                    0,
+                    &PassWeight::default(),
+                )
+                .unwrap();
             let segment = crate::geometry::CodeBlockSegment {
                 data: encoded.data.clone(),
                 pass_count: encoded.pass_count,
@@ -1024,9 +998,47 @@ mod tests {
 
     #[test]
     fn all_zero_block_has_no_passes() {
-        let encoded = encode_code_block(&[0i32; 16], 4, 4, 0, 0, &PassWeight::default()).unwrap();
+        let encoded = Tier1Encoder::new()
+            .encode(&[0i32; 16], (4, 4), 0, 0, &PassWeight::default())
+            .unwrap();
         assert_eq!(encoded.pass_count, 0);
         assert!(encoded.data.is_empty());
+    }
+
+    #[test]
+    fn encoder_reuse_preserves_bytes_across_block_shapes_and_styles() {
+        let weight = PassWeight {
+            w1: 1.0,
+            w2: 1.0,
+            stepsize: 1.0,
+        };
+        let mut reused = Tier1Encoder::new();
+        for (width, height, orientation, style) in [
+            (64, 64, 0, 0),
+            (5, 9, 3, 0x08),
+            (1, 2, 2, 0x02),
+            (64, 64, 1, 0),
+        ] {
+            let coefficients: Vec<_> = pattern(width, height).into_iter().map(|v| v * 64).collect();
+            let args = (width, height);
+            let expected = Tier1Encoder::new()
+                .encode(&coefficients, args, orientation, style, &weight)
+                .unwrap();
+            let observed = reused
+                .encode(&coefficients, args, orientation, style, &weight)
+                .unwrap();
+            assert_eq!(observed.data, expected.data);
+            assert_eq!(observed.max_bit_plane, expected.max_bit_plane);
+            assert_eq!(observed.pass_count, expected.pass_count);
+            for (observed, expected) in observed.passes.iter().zip(&expected.passes) {
+                assert_eq!(observed.rate, expected.rate);
+                assert_eq!(
+                    observed.distortiondec.to_bits(),
+                    expected.distortiondec.to_bits()
+                );
+                assert_eq!(observed.term, expected.term);
+            }
+        }
     }
 
     #[test]
@@ -1035,15 +1047,15 @@ mod tests {
             for (width, height, orientation) in [(13, 9, 3), (32, 24, 1), (17, 17, 0)] {
                 let values = pattern(width, height);
                 let coefficients: Vec<i32> = values.iter().map(|v| v * 64).collect();
-                let encoded = encode_code_block(
-                    &coefficients,
-                    width,
-                    height,
-                    orientation,
-                    style,
-                    &PassWeight::default(),
-                )
-                .unwrap();
+                let encoded = Tier1Encoder::new()
+                    .encode(
+                        &coefficients,
+                        (width, height),
+                        orientation,
+                        style,
+                        &PassWeight::default(),
+                    )
+                    .unwrap();
                 let segment = crate::geometry::CodeBlockSegment {
                     data: encoded.data.clone(),
                     pass_count: encoded.pass_count,

@@ -25,6 +25,8 @@ pub(crate) fn forward_53(
     let mut current_height = height as i32;
     let mut current_x0 = x0;
     let mut current_y0 = y0;
+    let mut columns = Vec::new();
+    let mut row = Vec::new();
     for _ in 0..levels {
         if current_width <= 1 && current_height <= 1 {
             break;
@@ -36,6 +38,7 @@ pub(crate) fn forward_53(
             width,
             current_x0 & 1 == 0,
             current_y0 & 1 == 0,
+            (&mut columns, &mut row),
         );
         current_width = split_length(current_width, current_x0 & 1 == 0);
         current_height = split_length(current_height, current_y0 & 1 == 0);
@@ -152,25 +155,72 @@ fn forward_53_2d(
     stride: usize,
     even_row: bool,
     even_column: bool,
+    (columns, row): (&mut Vec<i32>, &mut Vec<i32>),
 ) {
     if height > 1 {
-        let mut column = vec![0i32; height];
-        for x in 0..width {
-            for y in 0..height {
-                column[y] = data[y * stride + x];
+        // Work on a contiguous group of columns so each plane access takes
+        // advantage of the cache line and each lifting step spans adjacent samples.
+        const COLUMN_GROUP: usize = 32;
+        let low_parity = usize::from(!even_column);
+        let high_parity = 1 - low_parity;
+        columns.resize(height * width.min(COLUMN_GROUP), 0);
+        for x in (0..width).step_by(COLUMN_GROUP) {
+            let count = (width - x).min(COLUMN_GROUP);
+            let group = &mut columns[..height * count];
+            for (destination, source) in
+                group.chunks_exact_mut(count).zip(data.chunks_exact(stride))
+            {
+                destination.copy_from_slice(&source[x..x + count]);
             }
-            forward_53_1d(&mut column, even_column);
-            for y in 0..height {
-                data[y * stride + x] = column[y];
+            lift_columns::<true>(group, count, high_parity);
+            lift_columns::<false>(group, count, low_parity);
+            let band_order = (low_parity..height)
+                .step_by(2)
+                .chain((high_parity..height).step_by(2));
+            for (destination, source_y) in data.chunks_exact_mut(stride).zip(band_order) {
+                destination[x..x + count]
+                    .copy_from_slice(&group[source_y * count..(source_y + 1) * count]);
             }
         }
     }
     if width > 1 {
-        let mut row = vec![0i32; width];
-        for y in 0..height {
-            row.copy_from_slice(&data[y * stride..y * stride + width]);
-            forward_53_1d(&mut row, even_row);
-            data[y * stride..y * stride + width].copy_from_slice(&row);
+        row.resize(width, 0);
+        for line in data.chunks_exact_mut(stride).take(height) {
+            let line = &mut line[..width];
+            forward_53_row(line, row, even_row);
+            line.copy_from_slice(row);
+        }
+    }
+}
+
+fn lift_columns<const PREDICT: bool>(group: &mut [i32], count: usize, parity: usize) {
+    let height = group.len() / count;
+    for y in (parity..height).step_by(2) {
+        let (before, current_and_after) = group.split_at_mut(y * count);
+        let (current, after) = current_and_after.split_at_mut(count);
+        // Symmetric extension at the first and last rows.
+        let above = if before.is_empty() {
+            &after[..count]
+        } else {
+            &before[before.len() - count..]
+        };
+        let below = if after.is_empty() {
+            above
+        } else {
+            &after[..count]
+        };
+        if PREDICT && (before.is_empty() || after.is_empty()) {
+            for (sample, &neighbor) in current.iter_mut().zip(above) {
+                *sample -= neighbor;
+            }
+        } else if PREDICT {
+            for ((sample, &above), &below) in current.iter_mut().zip(above).zip(below) {
+                *sample -= (above + below) >> 1;
+            }
+        } else {
+            for ((sample, &above), &below) in current.iter_mut().zip(above).zip(below) {
+                *sample += (above + below + 2) >> 2;
+            }
         }
     }
 }
@@ -205,15 +255,11 @@ fn inverse_53_2d(
     }
 }
 
-fn forward_53_1d(data: &mut [i32], even: bool) {
+fn forward_53_row(data: &[i32], output: &mut [i32], even: bool) {
     let length = data.len();
     if even {
-        if length <= 1 {
-            return;
-        }
         let sn = (length + 1) >> 1;
         let dn = length - sn;
-        let mut output = vec![0i32; length];
         let mut i = 0;
         while i < sn - 1 {
             output[sn + i] = data[2 * i + 1] - ((data[2 * i] + data[2 * (i + 1)]) >> 1);
@@ -231,38 +277,31 @@ fn forward_53_1d(data: &mut [i32], even: bool) {
         if length & 1 != 0 {
             output[i] = data[2 * i] + ((output[sn + i - 1] + output[sn + i - 1] + 2) >> 2);
         }
-        data.copy_from_slice(&output);
         return;
     }
 
-    if length == 1 {
-        data[0] *= 2;
-        return;
-    }
     let low_count = length >> 1;
     let high_count = length - low_count;
-    let mut result = vec![0i32; length];
-    result[low_count] = data[0] - data[1];
+    output[low_count] = data[0] - data[1];
     let mut index = 1;
     while index < low_count {
-        result[low_count + index] =
+        output[low_count + index] =
             data[2 * index] - ((data[2 * index + 1] + data[2 * (index - 1) + 1]) >> 1);
         index += 1;
     }
     if length & 1 != 0 {
-        result[low_count + index] = data[2 * index] - data[2 * (index - 1) + 1];
+        output[low_count + index] = data[2 * index] - data[2 * (index - 1) + 1];
     }
     let mut index = 0;
     while index < high_count - 1 {
-        result[index] = data[2 * index + 1]
-            + ((result[low_count + index] + result[low_count + index + 1] + 2) >> 2);
+        output[index] = data[2 * index + 1]
+            + ((output[low_count + index] + output[low_count + index + 1] + 2) >> 2);
         index += 1;
     }
     if length & 1 == 0 {
-        result[index] = data[2 * index + 1]
-            + ((result[low_count + index] + result[low_count + index] + 2) >> 2);
+        output[index] = data[2 * index + 1]
+            + ((output[low_count + index] + output[low_count + index] + 2) >> 2);
     }
-    data.copy_from_slice(&result);
 }
 
 fn inverse_53_1d(data: &mut [i32], even: bool) {
@@ -543,6 +582,19 @@ mod tests {
             forward_53(&mut plane, w, h, levels, 0, 0).unwrap();
             inverse_53(&mut plane, w, h, levels, 0, 0).unwrap();
             assert_eq!(plane, source, "{w}x{h} levels={levels}");
+        }
+    }
+
+    #[test]
+    fn reversible_53_preserves_odd_origins_and_partial_column_groups() {
+        for (width, height) in [(33, 32), (65, 49)] {
+            for (x0, y0) in [(0, 1), (1, 0), (1, 1)] {
+                let source = pattern(width, height);
+                let mut plane = source.clone();
+                forward_53(&mut plane, width, height, 3, x0, y0).unwrap();
+                inverse_53(&mut plane, width, height, 3, x0, y0).unwrap();
+                assert_eq!(plane, source, "{width}x{height} origin ({x0}, {y0})");
+            }
         }
     }
 

@@ -1,6 +1,6 @@
 //! JPEG 2000 codestream assembly and parsing (ISO/IEC 15444-1 Annex A).
 
-use crate::geometry::{CodeBlock, CodeBlockSegment, Component};
+use crate::geometry::{CodeBlock, Component};
 use crate::marker::{
     write_eoc, write_soc, write_sod, Cod, CodingStyle, MainHeader, QStep, Quantization, Siz,
     SizComp, Sot, COM, EOC, SOD, SOT,
@@ -9,7 +9,7 @@ use crate::quantization::{
     band_stepsize, bit_plane_depth, decode_step_size, dwt_norm_53, dwt_norm_97, encode_step_size,
     gain_bits, irreversible_steps, reversible_steps, subband_index, MCT_NORMS_ICT, MCT_NORMS_RCT,
 };
-use crate::tier1::{self, PassWeight};
+use crate::tier1::{self, PassWeight, Tier1Encoder};
 use crate::{tier2, wavelet};
 
 pub(crate) const DEFAULT_LEVELS: i32 = 5;
@@ -169,6 +169,8 @@ pub(crate) fn encode_with_precincts(
     let layer_count =
         u16::try_from(layer_rates.len()).map_err(|_| "too many quality layers".to_string())?;
 
+    let mut tier1 = Tier1Encoder::new();
+    let mut coefficients = Vec::new();
     for (component_index, component) in components.iter_mut().enumerate() {
         let plane_width = component.width as usize;
         let reversible_plane = std::mem::take(&mut component.coefficients);
@@ -225,7 +227,7 @@ pub(crate) fn encode_with_precincts(
                         if width == 0 || height == 0 {
                             continue;
                         }
-                        let mut coefficients = vec![0i32; width * height];
+                        coefficients.resize(width * height, 0);
                         if reversible {
                             for y in 0..height {
                                 for x in 0..width {
@@ -248,10 +250,9 @@ pub(crate) fn encode_with_precincts(
                                 }
                             }
                         }
-                        let encoded_block = tier1::encode_code_block(
+                        let encoded_block = tier1.encode(
                             &coefficients,
-                            width,
-                            height,
+                            (width, height),
                             orientation,
                             0,
                             &weight,
@@ -259,17 +260,8 @@ pub(crate) fn encode_with_precincts(
                         let bit_count = (encoded_block.max_bit_plane - 5).max(0);
                         block.zero_bitplanes = (subband_bits - bit_count).clamp(0, 31) as u8;
                         block.total_passes = encoded_block.pass_count;
-                        block.layer_passes = vec![0u16; layer_count as usize];
                         block.passes = encoded_block.passes;
-                        block.data = encoded_block.data.clone();
-                        block.segments = if encoded_block.pass_count == 0 {
-                            Vec::new()
-                        } else {
-                            vec![CodeBlockSegment {
-                                data: encoded_block.data,
-                                pass_count: encoded_block.pass_count,
-                            }]
-                        };
+                        block.data = encoded_block.data;
                     }
                 }
             }

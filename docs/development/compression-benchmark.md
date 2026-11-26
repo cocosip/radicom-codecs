@@ -156,6 +156,30 @@ Reading the table:
 - Sequential JPEG only accepts 8-bit Process 1 or 8/12-bit Process 2/4, so the
   16-bit rows report `unsupported`; that is the support matrix, not a failure.
 
+## Classic JPEG 2000 lossless encoder optimization
+
+Windows x86-64, Intel Core Ultra 9 185H, rustc 1.99.1. The table compares
+baseline `a4fd569` with the optimized encoder using the same release build
+settings and synthetic inputs. Six pairs of `radicom-bench --format
+j2k_lossless --runs 3` runs alternated order, with both binaries pinned to the
+same logical CPU. Values are the median of the six reported encode times for
+each build. The tool retains its adaptive sampling for slow cases.
+
+| Input | Baseline | Optimized | Time saved |
+|---|---:|---:|---:|
+| CT 512x512 | 59.6 ms | 55.0 ms | 7.8% |
+| CR 2048x2048 | 706.1 ms | 594.7 ms | 15.8% |
+| MG 3328x4096 | 2703.3 ms | 1991.4 ms | 26.3% |
+| US 640x480 RGB | 80.4 ms | 67.8 ms | 15.7% |
+| SC 1024x768 | 89.3 ms | 67.2 ms | 24.7% |
+
+OpenJPEG 2.5.4 produced identical codestream bytes for seven reversible cases
+and one irreversible case with matching parameters. Reversible cases covered
+the CT, CR and MG inputs plus odd-sized 8-bit monochrome, signed 12-bit
+monochrome, RGB without MCT and a constant image. Both decoders recovered the
+same samples on the reversible cases. The native timing boundary is separate
+from `radicom-bench` because `opj_compress` includes raw input and output I/O.
+
 ## Comparing with other implementations
 
 Give every implementation the same input and the same boundaries:
