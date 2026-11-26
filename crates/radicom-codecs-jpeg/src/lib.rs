@@ -303,6 +303,83 @@ mod tests {
     }
 
     #[test]
+    fn lossless_rgb_codestream_corrects_ybr422_metadata_across_frames() {
+        use crate::{color::JpegColorSpace, lossless::LosslessFrame};
+        use radicom::model::{tag::Tag, vr::Vr};
+
+        let mut compressed = dataset(
+            syntaxes::JPEG_LOSSLESS_PROCESS_14.clone(),
+            1,
+            2,
+            8,
+            3,
+            Some(0),
+        );
+        compressed.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "YBR_FULL_422");
+        let mut native = compressed.clone();
+        native.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+        let frames = [[1u8, 20, 32, 44, 56, 68], [90, 82, 74, 66, 58, 50]];
+        let params = CodecParams::Jpeg(JpegParams::default());
+        let mut pixels = PixelData::create_new(&mut compressed).unwrap();
+        for samples in frames {
+            let frame = LosslessFrame::new(2, 1, 8, 3, samples.map(u16::from).to_vec()).unwrap();
+            pixels
+                .add_frame(
+                    frame
+                        .encode_with_colorspace(1, 0, None, JpegColorSpace::Rgb)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let mut decoded = native.clone();
+        JpegLossless14Codec
+            .decode(
+                &PixelDataRef::from_dataset(&compressed).unwrap(),
+                &mut PixelData::create_new(&mut decoded).unwrap(),
+                &params,
+            )
+            .unwrap();
+        assert_eq!(
+            decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "RGB"
+        );
+        let pixels = PixelDataRef::from_dataset(&decoded).unwrap();
+        for (index, expected) in frames.iter().enumerate() {
+            assert_eq!(
+                pixels
+                    .get_frame(index as u32)
+                    .unwrap()
+                    .data()
+                    .unwrap()
+                    .as_ref(),
+                expected
+            );
+        }
+
+        let ybr = LosslessFrame::new(2, 1, 8, 3, vec![11, 22, 33, 44, 22, 33])
+            .unwrap()
+            .encode_with_colorspace(1, 0, None, JpegColorSpace::Ycbcr)
+            .unwrap();
+        PixelData::from_dataset(&mut compressed)
+            .unwrap()
+            .add_frame(ybr)
+            .unwrap();
+        let error = JpegLossless14Codec
+            .decode(
+                &PixelDataRef::from_dataset(&compressed).unwrap(),
+                &mut PixelData::create_new(&mut native).unwrap(),
+                &params,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("frame 2"), "{error}");
+        assert!(!native.contains(&Tag::PIXEL_DATA));
+        assert_eq!(
+            native.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+            "YBR_FULL_422"
+        );
+    }
+
+    #[test]
     fn process14_round_trips_native_8_bit_pixel_data() {
         let source_bytes: Vec<u8> = (0..20).map(|value| value * 7).collect();
         let mut source = dataset(

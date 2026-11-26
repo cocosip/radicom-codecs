@@ -1,7 +1,7 @@
 #[derive(Debug, Default)]
 pub(crate) struct BitWriter {
     bytes: Vec<u8>,
-    current: u8,
+    current: u64,
     used: u8,
 }
 
@@ -11,13 +11,20 @@ impl BitWriter {
         if count == 0 || count > 32 || (count < 32 && value >= (1u32 << count)) {
             return Err(format!("invalid bit value {value:#x} with width {count}"));
         }
-        let bits = (u64::from(self.current) << count) | u64::from(value);
+        self.current = (self.current << count) | u64::from(value);
         self.used += count;
-        while self.used >= 8 {
-            self.used -= 8;
-            self.push_byte((bits >> self.used) as u8);
+        if self.used >= 32 {
+            self.used -= 32;
+            let word = (self.current >> self.used) as u32;
+            let bytes = word.to_be_bytes();
+            if bytes.contains(&0xff) {
+                for byte in bytes {
+                    self.push_byte(byte);
+                }
+            } else {
+                self.bytes.extend_from_slice(&bytes);
+            }
         }
-        self.current = bits as u8 & ((1u8 << self.used) - 1);
         Ok(())
     }
 
@@ -27,10 +34,13 @@ impl BitWriter {
     }
 
     pub(crate) fn flush_to_byte(&mut self) {
+        while self.used >= 8 {
+            self.used -= 8;
+            self.push_byte((self.current >> self.used) as u8);
+        }
         if self.used != 0 {
-            self.current = (self.current << (8 - self.used)) | ((1u8 << (8 - self.used)) - 1);
-            self.push_byte(self.current);
-            self.current = 0;
+            let padding = 8 - self.used;
+            self.push_byte(((self.current as u8) << padding) | ((1u8 << padding) - 1));
             self.used = 0;
         }
     }
@@ -190,6 +200,17 @@ mod tests {
         assert_eq!(reader.read_bits(8).unwrap(), 0xff);
         assert_eq!(reader.read_bits(3).unwrap(), 0b101);
         assert!(reader.read_bits(1).is_ok());
+    }
+
+    #[test]
+    fn stuffs_bytes_across_word_and_restart_boundaries() {
+        let mut writer = BitWriter::default();
+        writer.write_bits(0x0f, 4).unwrap();
+        writer.write_bits(0xff00_0fff, 32).unwrap();
+        writer.flush_to_byte();
+        assert_eq!(writer.take_bytes(), [0xff, 0, 0xf0, 0, 0xff, 0, 0xff, 0]);
+        writer.write_bits(0x12, 8).unwrap();
+        assert_eq!(writer.finish().unwrap(), [0x12]);
     }
 
     #[test]

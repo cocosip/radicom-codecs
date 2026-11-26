@@ -73,16 +73,7 @@ pub(crate) fn decode_frame(layout: &RleLayout, rle: &[u8]) -> Result<Vec<u8>, St
         let encoded = rle
             .get(start..end)
             .ok_or_else(|| format!("segment {segment_index} is outside the frame"))?;
-        let decoded = match decode_segment(encoded, layout.pixel_count) {
-            Ok(decoded) => decoded,
-            Err(error) if encoded.last() == Some(&0) => {
-                let unpadded = encoded
-                    .get(..encoded.len() - 1)
-                    .ok_or_else(|| "invalid empty padded segment".to_owned())?;
-                decode_segment(unpadded, layout.pixel_count).map_err(|_| error)?
-            }
-            Err(error) => return Err(error),
-        };
+        let decoded = decode_segment(encoded, layout.pixel_count)?;
         if layout.bit_packed {
             pack_bits(layout, &mut raw, &decoded)?;
             continue;
@@ -213,10 +204,7 @@ mod tests {
         assert_eq!(header.offsets().len(), 1);
         let start = header.offsets()[0];
         let segment = &encoded[start..];
-        let decoded = match decode_segment(segment, layout.pixel_count) {
-            Ok(decoded) => decoded,
-            Err(_) => decode_segment(&segment[..segment.len() - 1], layout.pixel_count).unwrap(),
-        };
+        let decoded = decode_segment(segment, layout.pixel_count).unwrap();
         assert_eq!(decoded.len(), 14);
         assert!(decoded.iter().all(|&value| value <= 1));
         assert_eq!(decode_frame(&layout, &encoded).unwrap(), raw);

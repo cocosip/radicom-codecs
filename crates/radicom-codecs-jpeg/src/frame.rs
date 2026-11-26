@@ -659,6 +659,10 @@ pub(crate) fn decode_lossless(
         precision: layout.bits_stored,
     };
     let mut decoded_frames = Vec::new();
+    let ybr422_wrapper = src.photometric_interpretation()
+        == Some(PhotometricInterpretation::YbrFull422)
+        && layout.photometric == PhotometricInterpretation::YbrFull422;
+    let mut restore_rgb = false;
     for frame_index in 0..src.number_of_frames() {
         let buffer = src
             .get_frame(frame_index)
@@ -666,9 +670,10 @@ pub(crate) fn decode_lossless(
         let bytes = buffer
             .data()
             .map_err(|error| operation_error(codec, &format!("frame {frame_index}: {error}")))?;
-        let frame = LosslessFrame::decode(bytes.as_ref(), selection, Some(&expected)).map_err(
-            |message| operation_error(codec, &format!("frame {frame_index}: {message}")),
-        )?;
+        let (frame, colorspace) = LosslessFrame::decode(bytes.as_ref(), selection, Some(&expected))
+            .map_err(|message| {
+                operation_error(codec, &format!("frame {frame_index}: {message}"))
+            })?;
         if frame.width != layout.width
             || frame.height != layout.height
             || frame.precision != layout.bits_stored
@@ -679,9 +684,36 @@ pub(crate) fn decode_lossless(
                 &format!("frame {frame_index}: codestream layout does not match destination"),
             ));
         }
-        decoded_frames.push(layout.write_samples(&frame.samples).map_err(|message| {
-            operation_error(codec, &format!("frame {frame_index}: {message}"))
-        })?);
+        let frame_is_rgb = ybr422_wrapper && colorspace == Some(JpegColorSpace::Rgb);
+        if !decoded_frames.is_empty() && frame_is_rgb != restore_rgb {
+            return Err(operation_error(
+                codec,
+                &format!("frame {frame_index}: inconsistent lossless JPEG color spaces"),
+            ));
+        }
+        restore_rgb = frame_is_rgb;
+        // fo-dicom can label an Adobe RGB stream as YBR_FULL_422. Packing
+        // those RGB samples as shared chroma would lose one channel per pixel.
+        let output_layout = if restore_rgb {
+            Layout {
+                photometric: PhotometricInterpretation::Rgb,
+                frame_length: frame.samples.len(),
+                ..layout
+            }
+        } else {
+            layout
+        };
+        decoded_frames.push(
+            output_layout
+                .write_samples(&frame.samples)
+                .map_err(|message| {
+                    operation_error(codec, &format!("frame {frame_index}: {message}"))
+                })?,
+        );
+    }
+    if restore_rgb {
+        dst.dataset_mut()
+            .insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "RGB");
     }
     for frame in decoded_frames {
         dst.add_frame(frame)

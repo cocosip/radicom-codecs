@@ -256,6 +256,28 @@ impl LosslessFrame {
                 &sos_payload(scan, predictor, point_transform, colorspace)?,
             )?;
             let mut entropy = BitWriter::default();
+            // With 8-bit left prediction all differences fit in -255..=255.
+            // An interleaved RGB or grayscale scan uses a single DC table.
+            let cached = if self.precision == 8
+                && predictor == 1
+                && self.samples.len() >= 4096
+                && !used[1]
+            {
+                tables[0].as_ref().map(|(_, _, table)| {
+                    std::array::from_fn::<_, 512, _>(|index| {
+                        let difference = index as i32 - 255;
+                        let width = category(difference);
+                        table.codeword(width).map_or((0, 0), |(code, bits)| {
+                            (
+                                (u32::from(code) << width) | encode_amplitude(difference, width),
+                                bits + width,
+                            )
+                        })
+                    })
+                })
+            } else {
+                None
+            };
             self.walk_scan(
                 scan,
                 &mut reconstructed,
@@ -266,6 +288,10 @@ impl LosslessFrame {
                 initial,
                 |event| match event {
                     ScanEvent::Difference(component, difference) => {
+                        if let Some(codes) = &cached {
+                            let (value, bits) = codes[(difference + 255) as usize];
+                            return entropy.write_bits(value, bits);
+                        }
                         let id = usize::from(colorspace.table_id(usize::from(component)));
                         let (_, _, huffman) = tables[id].as_ref().ok_or_else(|| {
                             "JPEG lossless Huffman table was not built".to_owned()
@@ -310,6 +336,25 @@ impl LosslessFrame {
         if predictor == 1 && restart_interval.is_none() {
             let stride = usize::from(self.components);
             let row_width = self.width * stride;
+            match (stride, scan) {
+                (1, [0]) => {
+                    return self.walk_interleaved_left::<1>(
+                        point_transform,
+                        effective_precision,
+                        initial,
+                        visit,
+                    )
+                }
+                (3, [0, 1, 2]) => {
+                    return self.walk_interleaved_left::<3>(
+                        point_transform,
+                        effective_precision,
+                        initial,
+                        visit,
+                    )
+                }
+                _ => {}
+            }
             let mut previous_first = [initial; 3];
             for row in self.samples.chunks_exact(row_width) {
                 let mut left = previous_first;
@@ -368,17 +413,44 @@ impl LosslessFrame {
         Ok(())
     }
 
+    /// For column zero, predictor 1 uses the value immediately above.
+    /// The remaining columns use the preceding sample of the same component.
+    fn walk_interleaved_left<const N: usize>(
+        &self,
+        transform: u8,
+        precision: u8,
+        initial: i32,
+        mut visit: impl FnMut(ScanEvent) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut above = [initial; N];
+        for row in self.samples.chunks_exact(self.width * N) {
+            let mut left = above;
+            for pixel in row.as_chunks::<N>().0 {
+                for c in 0..N {
+                    let value = i32::from(pixel[c] >> transform);
+                    let difference = encode_difference(value - left[c], precision);
+                    visit(ScanEvent::Difference(c as u8, difference))?;
+                    left[c] = value;
+                }
+            }
+            for c in 0..N {
+                above[c] = i32::from(row[c] >> transform);
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn decode(
         data: &[u8],
         selection: Selection,
         expected: Option<&FrameExpectation>,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, Option<JpegColorSpace>), String> {
         let mut reader = MarkerReader::new(data);
         expect_marker(&mut reader, Marker::Soi)?;
         let mut tables: [Option<HuffmanTable>; 4] = [None, None, None, None];
         let mut restart_interval = None;
         let mut decoded = [false; 3];
         let mut header = None;
+        let mut adobe_untransformed = None;
         let mut samples = Vec::new();
         let mut shifted_samples = Vec::new();
         loop {
@@ -422,6 +494,10 @@ impl LosslessFrame {
                 // and DHT ahead of SOF), so a DQT is legal and unused here.
                 Marker::Dqt => {}
                 Marker::Dri => restart_interval = parse_restart_interval(&payload)?,
+                Marker::App(14) if payload.starts_with(b"Adobe") => {
+                    let untransformed = payload.get(11) == Some(&0);
+                    *adobe_untransformed.get_or_insert(true) &= untransformed;
+                }
                 Marker::App(_) | Marker::Com => {}
                 Marker::Sos => {
                     let Some((width, height, precision, components, component_ids)) = header else {
@@ -468,13 +544,26 @@ impl LosslessFrame {
             }
         }
         check_trailing(data, reader.position())?;
-        let Some((width, height, precision, components, _)) = header else {
+        let Some((width, height, precision, components, ids)) = header else {
             return Err("missing JPEG SOF3".to_owned());
         };
         if decoded[..usize::from(components)].iter().any(|&seen| !seen) {
             return Err("JPEG lossless stream does not decode every component".to_owned());
         }
-        Self::new(width, height, precision, components, samples)
+        // SOF validation and the scan reconstruction already checked the
+        // dimensions, sample count and range of every decoded component.
+        let colorspace =
+            (adobe_untransformed == Some(true) && &ids == b"RGB").then_some(JpegColorSpace::Rgb);
+        Ok((
+            Self {
+                width,
+                height,
+                precision,
+                components,
+                samples,
+            },
+            colorspace,
+        ))
     }
 }
 
@@ -1020,7 +1109,7 @@ mod tests {
     /// Process 14 accepts every predictor and point transform, so it is the
     /// widest policy for exercising the marker and entropy layers.
     fn decode_any(data: &[u8]) -> Result<LosslessFrame, String> {
-        LosslessFrame::decode(data, Selection::Process14, None)
+        LosslessFrame::decode(data, Selection::Process14, None).map(|(frame, _)| frame)
     }
 
     fn sample_frame(precision: u8, components: u8) -> LosslessFrame {
@@ -1073,6 +1162,42 @@ mod tests {
             .position(|window| window == [0xff, 0xda])
             .unwrap();
         assert_eq!(&encoded[sos + 4..sos + 10], &[3, b'R', 0, b'G', 0, b'B']);
+    }
+
+    #[test]
+    fn rgb_detection_requires_matching_adobe_transform_and_component_ids() {
+        let frame = sample_frame(8, 3);
+        let mut rgb = frame
+            .encode_with_colorspace(1, 0, None, JpegColorSpace::Rgb)
+            .unwrap();
+        let mut ybr = frame
+            .encode_with_colorspace(1, 0, None, JpegColorSpace::Ycbcr)
+            .unwrap();
+        let colorspace = |stream: &[u8]| {
+            LosslessFrame::decode(stream, Selection::Process14, None)
+                .unwrap()
+                .1
+        };
+        ybr.splice(2..2, rgb[2..18].iter().copied());
+        assert_eq!(colorspace(&ybr), None);
+        rgb[17] = 1;
+        assert_eq!(colorspace(&rgb), None);
+        rgb.drain(2..18);
+        assert_eq!(colorspace(&rgb), None);
+    }
+
+    #[test]
+    fn cached_eight_bit_differences_cover_both_extremes_and_restarts() {
+        let samples = (0..64 * 64 * 3)
+            .map(|i| if (i / 3 + i % 3) % 2 == 0 { 0 } else { 255 })
+            .collect();
+        let frame = LosslessFrame::new(64, 64, 8, 3, samples).unwrap();
+        for interval in [None, Some(128)] {
+            let stream = frame
+                .encode_with_colorspace(1, 0, interval, JpegColorSpace::Rgb)
+                .unwrap();
+            assert_eq!(decode_any(&stream).unwrap(), frame);
+        }
     }
 
     #[test]

@@ -371,7 +371,7 @@ pub(crate) fn encode(
     }
     let planes = layout.read(raw)?;
     let mut components = codestream::build_components(
-        &planes,
+        planes,
         layout.width as i32,
         layout.height as i32,
         layout.bits_stored,
@@ -406,7 +406,7 @@ pub(crate) fn encode_ht(
         }
     }
     let mut components = codestream::build_components(
-        &planes,
+        planes,
         layout.width as i32,
         layout.height as i32,
         precision,
@@ -603,7 +603,8 @@ mod tests {
         let height = 8;
         let centered: Vec<i32> = values.iter().map(|value| value - 32768).collect();
         let mut components =
-            crate::codestream::build_components(&[centered], width, height, 16, false, 2).unwrap();
+            crate::codestream::build_components(vec![centered], width, height, 16, false, 2)
+                .unwrap();
         crate::codestream::encode_with_mct(&mut components, true, false).unwrap()
     }
 
@@ -646,8 +647,7 @@ mod tests {
     fn signed_full_width_codestream_decodes_into_a_narrower_destination() {
         let values: Vec<i32> = (0..(32 * 8)).map(|i| (i * 53) % 4096 - 2048).collect();
         let mut components =
-            crate::codestream::build_components(std::slice::from_ref(&values), 32, 8, 16, true, 2)
-                .unwrap();
+            crate::codestream::build_components(vec![values.clone()], 32, 8, 16, true, 2).unwrap();
         let stream = crate::codestream::encode_with_mct(&mut components, true, false).unwrap();
         let layout = Layout {
             signed: true,
@@ -664,8 +664,7 @@ mod tests {
     fn signed_ht_full_width_codestream_decodes_into_a_narrower_destination() {
         let values: Vec<i32> = (0..(32 * 8)).map(|i| (i * 53) % 4096 - 2048).collect();
         let mut components =
-            crate::codestream::build_components(std::slice::from_ref(&values), 32, 8, 16, true, 2)
-                .unwrap();
+            crate::codestream::build_components(vec![values.clone()], 32, 8, 16, true, 2).unwrap();
         let options = ht_codestream::EncodeOptions {
             progression: 0,
             reversible: true,

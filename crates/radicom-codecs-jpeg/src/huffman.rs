@@ -25,6 +25,11 @@ pub(crate) struct HuffmanTable {
 }
 
 impl HuffmanTable {
+    pub(crate) fn codeword(&self, symbol: u8) -> Option<(u16, u8)> {
+        let code = self.codes[usize::from(symbol)];
+        (code.length != 0).then_some((code.value, code.length))
+    }
+
     /// Returns a short canonical code as its length and symbol, packed into a u16.
     #[inline]
     pub(crate) fn short_code(&self, prefix: u8) -> u16 {

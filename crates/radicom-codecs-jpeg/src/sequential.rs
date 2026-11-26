@@ -482,8 +482,15 @@ impl SequentialFrame {
                             } else {
                                 let mut block = [0i32; 64];
                                 self.load_block(pooling, block_x, block_y, &mut block);
-                                let coefficients = islow_forward(&block, self.precision);
-                                computed = quantizers[table].quantize(&coefficients);
+                                computed = if block.iter().all(|&sample| sample == block[0]) {
+                                    // A constant block has only one DCT coefficient, 64 * sample.
+                                    let mut quantized = [0; 64];
+                                    quantized[0] = quantizers[table].quantize_one(0, 64 * block[0]);
+                                    quantized
+                                } else {
+                                    let coefficients = islow_forward(&block, self.precision);
+                                    quantizers[table].quantize(&coefficients)
+                                };
                                 &computed
                             };
                             let dc = quant[0];
@@ -1046,6 +1053,24 @@ fn decode_scan(
         interleaved,
         frame.sampling[usize::from(scan[0].0)],
     );
+    // A full-resolution MCU whose components all repeat their previous DC and
+    // immediately emit EOB can be recognized from its exact Huffman prefix.
+    let repeat = if scan.len() == stride && frame.sampling == [(1, 1); 3] {
+        scan.iter()
+            .try_fold((0usize, 0u8), |(mut word, mut len), &(_, dc, ac)| {
+                for table in [dc, ac] {
+                    let (code, n) = table.codeword(0)?;
+                    len += n;
+                    if len > 32 {
+                        return None;
+                    }
+                    word = (word << n) | usize::from(code);
+                }
+                Some((word, len))
+            })
+    } else {
+        None
+    };
     let mut prev = [0i64; 3];
     let mut mcu = 0usize;
     let mut restart_index = 0u8;
@@ -1068,6 +1093,35 @@ fn decode_scan(
                 }
             }
             mcu += 1;
+            if let Some((word, len)) = repeat {
+                if (mx + 1) * 8 <= width
+                    && (my + 1) * 8 <= height
+                    && bits.peek_prefix(len) == Some(word)
+                {
+                    bits.consume_prefix(len);
+                    let mut pixel = [0u16; 3];
+                    for c in 0..stride {
+                        // A previous DC value already passed the dequantization check.
+                        let coefficient =
+                            (prev[c] * i64::from(q[usize::from(frame.qids[c])][0])) as i32;
+                        pixel[c] =
+                            inverse_dc(coefficient).saturating_add(offset).clamp(0, max) as u16;
+                    }
+                    if stride == 1 {
+                        for y in my * 8..my * 8 + 8 {
+                            let start = y * width + mx * 8;
+                            samples[start..start + 8].fill(pixel[0]);
+                        }
+                    } else {
+                        let row: [u16; 24] = std::array::from_fn(|i| pixel[i % 3]);
+                        for y in my * 8..my * 8 + 8 {
+                            let start = (y * width + mx * 8) * 3;
+                            samples[start..start + 24].copy_from_slice(&row);
+                        }
+                    }
+                    continue;
+                }
+            }
             for &(component, dc_table, ac_table) in scan {
                 let c = usize::from(component);
                 let qtable = &q[usize::from(frame.qids[c])];
@@ -1142,9 +1196,15 @@ fn decode_scan(
                             for (dy, row) in block.chunks_exact(8).enumerate() {
                                 let start = ((top + dy) * width + left) * stride;
                                 let target = &mut samples[start..start + 8 * stride];
-                                for (dx, &sample) in row.iter().enumerate() {
-                                    target[dx * stride + c] =
-                                        sample.saturating_add(offset).clamp(0, max) as u16;
+                                if stride == 1 {
+                                    for (dest, &value) in target.iter_mut().zip(row) {
+                                        *dest = value.saturating_add(offset).clamp(0, max) as u16;
+                                    }
+                                } else {
+                                    for (pixel, &value) in target.chunks_exact_mut(3).zip(row) {
+                                        pixel[c] =
+                                            value.saturating_add(offset).clamp(0, max) as u16;
+                                    }
                                 }
                             }
                             continue;
@@ -1217,6 +1277,9 @@ fn for_each_ac(
     quant: &[i32; 64],
     mut emit: impl FnMut(u8, u32, u8) -> Result<(), String>,
 ) -> Result<(), String> {
+    if quant[1..].iter().all(|&value| value == 0) {
+        return emit(0, 0, 0);
+    }
     let mut run = 0u32;
     for &index in ZIGZAG.iter().skip(1) {
         let value = quant[index];
@@ -1550,6 +1613,35 @@ mod tests {
             .max()
             .unwrap();
         assert!(max < 32, "max={max} first={:?}", &d.samples[..10]);
+    }
+
+    #[test]
+    fn repeated_dc_mcus_match_separate_color_scans_across_restarts_and_edges() {
+        let (width, height) = (65, 17);
+        let samples = (0..height)
+            .flat_map(|y| {
+                (0..width).flat_map(move |x| {
+                    if x < 32 {
+                        [15, 108, 201]
+                    } else if x < 56 {
+                        [191, 40, 30]
+                    } else {
+                        [(y * 5) as u16, 52, (x * 2) as u16]
+                    }
+                })
+            })
+            .collect();
+        let frame = SequentialFrame::new(width, height, 8, 3, samples).unwrap();
+        let encode = |scans: &[Vec<u8>]| {
+            let data = frame
+                .encode_scans(90, false, false, 0, Some(4), scans)
+                .unwrap();
+            SequentialFrame::decode(&data).unwrap().samples
+        };
+        assert_eq!(
+            encode(&[vec![2, 0, 1]]),
+            encode(&[vec![0], vec![1], vec![2]])
+        );
     }
 
     #[test]

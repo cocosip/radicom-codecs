@@ -210,43 +210,44 @@ impl ForwardQuantizer {
     }
 
     pub(crate) fn quantize(&self, coefficients: &[i32; 64]) -> [i32; 64] {
-        let mut output = [0i32; 64];
-        for (i, &coefficient) in coefficients.iter().enumerate() {
-            let value = if self.precision == 8 {
-                let mut temp = coefficient;
-                let reciprocal = u64::from(self.reciprocal[i]);
-                let correction = u64::from(self.correction[i]);
-                // `shift + sizeof(DCTELEM) * 8`; the negative shift used by the
-                // divisor <= 1 path (`-32`) turns into a zero shift.
-                let shift = (self.shift[i] + 32) as u32;
-                if temp < 0 {
-                    temp = -temp;
-                    let product = (temp as u64 + correction) * reciprocal;
-                    -((product >> shift) as i32)
-                } else {
-                    let product = (temp as u64 + correction) * reciprocal;
-                    (product >> shift) as i32
-                }
+        std::array::from_fn(|i| self.quantize_one(i, coefficients[i]))
+    }
+
+    #[inline]
+    pub(crate) fn quantize_one(&self, i: usize, coefficient: i32) -> i32 {
+        let value = if self.precision == 8 {
+            let mut temp = coefficient;
+            let reciprocal = u64::from(self.reciprocal[i]);
+            let correction = u64::from(self.correction[i]);
+            // `shift + sizeof(DCTELEM) * 8`; the negative shift used by the
+            // divisor <= 1 path (`-32`) turns into a zero shift.
+            let shift = (self.shift[i] + 32) as u32;
+            if temp < 0 {
+                temp = -temp;
+                let product = (temp as u64 + correction) * reciprocal;
+                -((product >> shift) as i32)
             } else {
-                let divisor = self.divisor[i];
-                let mut temp = coefficient;
-                if temp < 0 {
-                    temp = -temp;
-                    temp += divisor >> 1;
-                    temp = if temp >= divisor { temp / divisor } else { 0 };
-                    -temp
+                let product = (temp as u64 + correction) * reciprocal;
+                (product >> shift) as i32
+            }
+        } else {
+            let divisor = self.divisor[i];
+            let mut temp = coefficient;
+            if temp < 0 {
+                temp = -temp;
+                temp += divisor >> 1;
+                temp = if temp >= divisor { temp / divisor } else { 0 };
+                -temp
+            } else {
+                temp += divisor >> 1;
+                if temp >= divisor {
+                    temp / divisor
                 } else {
-                    temp += divisor >> 1;
-                    if temp >= divisor {
-                        temp / divisor
-                    } else {
-                        0
-                    }
+                    0
                 }
-            };
-            output[i] = i32::from(value as i16);
-        }
-        output
+            }
+        };
+        i32::from(value as i16)
     }
 }
 

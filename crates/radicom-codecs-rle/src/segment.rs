@@ -68,6 +68,10 @@ pub(crate) fn decode_segment(encoded: &[u8], expected_length: usize) -> Result<V
                 .checked_add(length)
                 .ok_or_else(|| "literal run length overflow".to_owned())?;
             if end > encoded.len() {
+                // DICOM pads a segment of odd length with a single zero.
+                if control == 0 && input == encoded.len() && output.len() == expected_length {
+                    break;
+                }
                 return Err("literal run exceeds segment input".to_owned());
             }
             if output
@@ -142,6 +146,14 @@ mod tests {
         assert_eq!(decode_segment(&[0x80, 0, 4], 1).unwrap(), [4]);
         assert!(decode_segment(&[2, 1, 2], 3).is_err());
         assert!(decode_segment(&[254, 7], 2).is_err());
+    }
+
+    #[test]
+    fn accepts_one_padding_byte_only_after_the_segment_is_complete() {
+        assert_eq!(decode_segment(&[254, 7, 0x80, 0], 3).unwrap(), [7; 3]);
+        assert!(decode_segment(&[254, 7, 0], 4).is_err());
+        assert!(decode_segment(&[254, 7, 0, 0], 3).is_err());
+        assert_eq!(decode_segment(&[0, 0], 1).unwrap(), [0]);
     }
 
     #[test]

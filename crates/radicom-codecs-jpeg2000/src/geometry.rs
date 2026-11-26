@@ -317,7 +317,7 @@ impl Component {
         signed: bool,
     ) -> Result<Self, String> {
         let area = checked_area(width.max(0) as u64, height.max(0) as u64)?;
-        Ok(Self {
+        Ok(Self::with_coefficients(
             index,
             x0,
             y0,
@@ -326,12 +326,37 @@ impl Component {
             levels,
             precision,
             signed,
-            coefficients: vec![0; area as usize],
+            vec![0; area as usize],
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_coefficients(
+        index: usize,
+        x0: i32,
+        y0: i32,
+        width: i32,
+        height: i32,
+        levels: i32,
+        precision: u8,
+        signed: bool,
+        coefficients: Vec<i32>,
+    ) -> Self {
+        Self {
+            index,
+            x0,
+            y0,
+            width,
+            height,
+            levels,
+            precision,
+            signed,
+            coefficients,
             irreversible: None,
             samples: Vec::new(),
             float_samples: None,
             bands: BTreeMap::new(),
-        })
+        }
     }
 
     #[cfg(test)]

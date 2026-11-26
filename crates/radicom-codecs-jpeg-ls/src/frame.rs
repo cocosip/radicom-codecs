@@ -129,23 +129,32 @@ impl Layout {
         let count = self.width * self.height * self.components as usize;
         let mask = self.maxval();
         let pixels = self.width * self.height;
-        let mut out = Vec::with_capacity(count);
-        for n in 0..count {
-            let pix = n / self.components as usize;
-            let c = n % self.components as usize;
-            let logical = if self.planar == 1 {
-                c * pixels + pix
+        let raw = &b[..self.frame_len];
+        let mut out: Vec<u16> = if self.planar == 0 {
+            if self.bits_allocated == 8 {
+                raw.iter().map(|&v| u16::from(v) & mask).collect()
             } else {
-                n
-            };
-            let off = logical * (self.bits_allocated / 8) as usize;
-            let raw = if self.bits_allocated == 8 {
-                u16::from(b[off])
-            } else {
-                u16::from_le_bytes([b[off], b[off + 1]])
-            };
-            out.push(raw & mask);
-        }
+                raw.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&v| u16::from_le_bytes(v) & mask)
+                    .collect()
+            }
+        } else {
+            let mut samples = Vec::with_capacity(count);
+            for pixel in 0..pixels {
+                for component in 0..usize::from(self.components) {
+                    let offset = component * pixels + pixel;
+                    let value = if self.bits_allocated == 8 {
+                        u16::from(raw[offset])
+                    } else {
+                        u16::from_le_bytes([raw[2 * offset], raw[2 * offset + 1]])
+                    };
+                    samples.push(value & mask);
+                }
+            }
+            samples
+        };
         if self.pi == PhotometricInterpretation::YbrFull {
             color::ybr_to_rgb(&mut out, self.bits_stored)
         }
@@ -156,29 +165,39 @@ impl Layout {
         if s.len() != count {
             return Err("decoded sample count mismatch".into());
         }
-        let mut b = vec![0u8; self.frame_len];
         let mask = self.maxval();
-        let pixels = self.width * self.height;
-        for n in 0..count {
-            let pix = n / self.components as usize;
-            let c = n % self.components as usize;
-            let logical = if self.planar == 1 {
-                c * pixels + pix
-            } else {
-                n
-            };
-            let off = logical * (self.bits_allocated / 8) as usize;
-            let value = s[n] & mask;
-            let v = if self.signed {
-                let sign = 1i32 << (self.bits_stored - 1);
-                ((i32::from(value) ^ sign) - sign) as i16 as u16
+        let stored = |sample: u16| {
+            let value = sample & mask;
+            if self.signed {
+                let shift = 16 - self.bits_stored;
+                (((value << shift) as i16) >> shift) as u16
             } else {
                 value
-            };
+            }
+        };
+        let mut b = vec![0u8; self.frame_len];
+        if self.planar == 0 {
             if self.bits_allocated == 8 {
-                b[off] = v as u8
+                for (byte, &sample) in b.iter_mut().zip(s) {
+                    *byte = stored(sample) as u8;
+                }
             } else {
-                b[off..off + 2].copy_from_slice(&v.to_le_bytes())
+                for (bytes, &sample) in b.as_chunks_mut::<2>().0.iter_mut().zip(s) {
+                    *bytes = stored(sample).to_le_bytes();
+                }
+            }
+        } else {
+            let pixels = self.width * self.height;
+            for (pixel, components) in s.chunks_exact(usize::from(self.components)).enumerate() {
+                for (component, &sample) in components.iter().enumerate() {
+                    let offset = component * pixels + pixel;
+                    if self.bits_allocated == 8 {
+                        b[offset] = stored(sample) as u8;
+                    } else {
+                        b[2 * offset..2 * offset + 2]
+                            .copy_from_slice(&stored(sample).to_le_bytes());
+                    }
+                }
             }
         }
         Ok(b)
@@ -398,12 +417,11 @@ pub(crate) fn decode(
     // Reject an oversized declared frame before any plane or sample buffer is
     // allocated (design §10).
     crate::checked_sample_count(layout.width, layout.height, layout.components as usize)?;
-    let DecodedPlanes {
-        planes,
-        geometry,
-        color_transformation,
-    } = decode_planes(layout, data, expected_near)?;
-    let mut samples = assemble_planes(layout, &planes, &geometry)?;
+    let (decoded, color_transformation) = decode_samples(layout, data, expected_near)?;
+    let mut samples = match decoded {
+        DecodedSamples::Interleaved(samples) => samples,
+        DecodedSamples::Planes(planes, geometry) => assemble_planes(layout, &planes, &geometry)?,
+    };
     if color_transformation != 0 {
         // Undo the CharLS colour transform before any colour-space conversion.
         color::inverse_transform(&mut samples, color_transformation, layout.bits_stored);
@@ -414,22 +432,16 @@ pub(crate) fn decode(
     layout.write(&samples)
 }
 
-/// One plane per component, each on its own sampling grid.
-struct DecodedPlanes {
-    planes: Vec<Vec<u16>>,
-    geometry: Vec<PlaneGeometry>,
-    /// CharLS colour transform carried by the APP8 `mrfx` segment.
-    color_transformation: u8,
+enum DecodedSamples {
+    Interleaved(Vec<u16>),
+    Planes(Vec<Vec<u16>>, Vec<PlaneGeometry>),
 }
 
-/// Decodes every scan of the image into one plane per component, without
-/// resampling: a sub-sampled frame keeps each plane on its own grid and
-/// `assemble_planes` maps it back onto the frame.
-fn decode_planes(
+fn decode_samples(
     layout: &Layout,
     data: &[u8],
     expected_near: Option<u16>,
-) -> Result<DecodedPlanes, String> {
+) -> Result<(DecodedSamples, u8), String> {
     let h = parse_header(data)?;
     if h.frame.width as usize != layout.width
         || h.frame.height as usize != layout.height
@@ -511,23 +523,26 @@ fn decode_planes(
             preset: entry.preset,
         };
         let samples = decode_scan(cfg, &data[entry.start..entry.end], entry.restart_interval)?;
-        let components = layout.components as usize;
-        (0..components)
+        if h.sampling.iter().all(|factor| *factor == h.sampling[0]) {
+            return Ok((DecodedSamples::Interleaved(samples), h.color_transformation));
+        }
+        // On a narrow frame, unequal sampling factors can still round up to equal
+        // plane dimensions. Map their sample positions using the original factors.
+        (0..usize::from(layout.components))
             .map(|index| {
                 samples
                     .iter()
                     .skip(index)
-                    .step_by(components)
+                    .step_by(usize::from(layout.components))
                     .copied()
                     .collect()
             })
             .collect()
     };
-    Ok(DecodedPlanes {
-        planes,
-        geometry,
-        color_transformation: h.color_transformation,
-    })
+    Ok((
+        DecodedSamples::Planes(planes, geometry),
+        h.color_transformation,
+    ))
 }
 pub(crate) fn update_color_metadata(dst: &mut PixelData<'_>, layout: &Layout) {
     if layout.components == 3 {
@@ -576,6 +591,28 @@ mod tests {
         )
         .unwrap();
         assert!(decode(&mono8(), &encoded, &JpegLsParams::default(), Some(0), false).is_err());
+    }
+
+    #[test]
+    fn sample_interleaving_preserves_sampling_positions_on_a_narrow_frame() {
+        let layout = Layout {
+            width: 2,
+            components: 3,
+            pi: PhotometricInterpretation::Rgb,
+            frame_len: 6,
+            ..mono8()
+        };
+        let params = JpegLsParams::default();
+        let mut stream = encode(&layout, &[1, 2, 3, 4, 5, 6], &params).unwrap();
+        // All components have two columns, but green's 3/4 sampling maps
+        // both output pixels to its first sample.
+        for (index, factors) in [0x41, 0x31, 0x41].into_iter().enumerate() {
+            stream[13 + 3 * index] = factors;
+        }
+        assert_eq!(
+            decode(&layout, &stream, &params, Some(0), false).unwrap(),
+            [1, 2, 3, 4, 2, 6]
+        );
     }
 
     #[test]
@@ -1426,9 +1463,11 @@ mod tests {
             return;
         };
         let layout = subsampled_layout();
-        let decoded = decode_planes(&layout, &jls, Some(0)).unwrap();
-        assert_eq!(decoded.color_transformation, 0);
-        let (planes, geometry) = (decoded.planes, decoded.geometry);
+        let (decoded, transform) = decode_samples(&layout, &jls, Some(0)).unwrap();
+        assert_eq!(transform, 0);
+        let DecodedSamples::Planes(planes, geometry) = decoded else {
+            panic!("expected sub-sampled planes")
+        };
         assert_eq!(planes.len(), 3);
         assert_eq!((geometry[0].columns, geometry[0].lines), (256, 256));
         assert_eq!((geometry[1].columns, geometry[1].lines), (256, 64));
@@ -1475,7 +1514,10 @@ mod tests {
             return;
         };
         let layout = subsampled_layout();
-        let planes = decode_planes(&layout, &jls, Some(3)).unwrap().planes;
+        let (decoded, _) = decode_samples(&layout, &jls, Some(3)).unwrap();
+        let DecodedSamples::Planes(planes, _) = decoded else {
+            panic!("expected sub-sampled planes")
+        };
         let mut worst = 0u16;
         for (plane, (_, _, samples)) in planes.iter().zip([&red, &green, &blue]) {
             for (reconstructed, source) in plane.iter().zip(samples) {

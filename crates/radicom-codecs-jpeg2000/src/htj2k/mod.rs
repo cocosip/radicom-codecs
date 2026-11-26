@@ -8,4 +8,3 @@ pub(crate) mod codestream;
 pub(crate) mod packet;
 pub(crate) mod quant;
 pub(crate) mod tables;
-pub(crate) mod wavelet;

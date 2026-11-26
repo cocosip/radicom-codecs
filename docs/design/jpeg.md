@@ -151,6 +151,12 @@ would violate exact sample preservation. The first Rust release preserves the
 decoded component color space; `convert_colorspace_to_rgb` is rejected on the
 lossless path because a lossless color conversion is outside this contract.
 
+Some fo-dicom lossless files label the encapsulated pixels `YBR_FULL_422`
+while SOF3 identifies the components as R, G and B and Adobe APP14 declares
+transform zero. In this case the decoder writes all three RGB samples per
+pixel and updates the native photometric interpretation to `RGB`. A
+multi-frame object must give a consistent color interpretation across frames.
+
 The adapter updates photometric interpretation and planar configuration only
 after the codestream reports its actual component color space. Metadata updates
 must be deterministic and must agree with the bytes written to the destination.

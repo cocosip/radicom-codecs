@@ -60,6 +60,42 @@ fn context_id(ra: i32, rb: i32, rc: i32, rd: i32, p: &Preset, near: i32) -> i32 
     (q1 * 9 + q2) * 9 + q3
 }
 
+/// The gradient range is bounded by MAXVAL in both encoding and reconstruction.
+struct GradientTable {
+    values: Vec<i8>,
+    center: i32,
+}
+
+impl GradientTable {
+    fn new(preset: Preset, near: u16) -> Self {
+        let center = usize::from(preset.maxval);
+        let mut values = vec![0; center * 2 + 1];
+        let starts = [
+            usize::from(near) + 1,
+            usize::from(preset.t1),
+            usize::from(preset.t2),
+            usize::from(preset.t3),
+            center + 1,
+        ];
+        for (level, pair) in starts.windows(2).enumerate() {
+            let level = level as i8 + 1;
+            let (start, end) = (pair[0], pair[1]);
+            values[center + start..center + end].fill(level);
+            values[center + 1 - end..center + 1 - start].fill(-level);
+        }
+        Self {
+            values,
+            center: center as i32,
+        }
+    }
+
+    #[inline]
+    fn context(&self, ra: i32, rb: i32, rc: i32, rd: i32) -> i32 {
+        let q = |d| i32::from(self.values[(self.center + d) as usize]);
+        (q(rd - rb) * 9 + q(rb - rc)) * 9 + q(rc - ra)
+    }
+}
+
 fn golomb_params(c: &ScanConfig) -> (i32, u32, u8) {
     (
         c.preset.range(c.near) as i32,
@@ -149,6 +185,9 @@ fn encode_regular(
     let mapped = map_error(error ^ correction);
     encode_mapped(w, k, mapped, limit, qbpp).expect("bounded Golomb parameters");
     ctx.update(error, c.near as i32, c.preset.reset as i32);
+    if c.near == 0 {
+        return x;
+    }
     reconstructed(
         corrected,
         error,
@@ -325,7 +364,21 @@ fn encode_scan_inner(
     if c.ilv == 1 {
         return encode_line_scan(c, input, restart_interval);
     }
+    match c.components {
+        1 => encode_interleaved::<1>(c, input, restart_interval),
+        2 => encode_interleaved::<2>(c, input, restart_interval),
+        3 => encode_interleaved::<3>(c, input, restart_interval),
+        _ => unreachable!("validated component count"),
+    }
+}
+
+fn encode_interleaved<const COMPONENTS: usize>(
+    c: ScanConfig,
+    input: &[u16],
+    restart_interval: u32,
+) -> Result<Vec<u8>, String> {
     let (range, limit, qbpp) = golomb_params(&c);
+    let gradients = GradientTable::new(c.preset, c.near);
     let interval = u64::from(restart_interval);
     let mut restart_index = 0u8;
     let mut output = Vec::new();
@@ -333,9 +386,9 @@ fn encode_scan_inner(
     let mut contexts = vec![RegularContext::new(range); 365];
     let mut run_contexts = [RunContext::new(0, range), RunContext::new(1, range)];
     let mut run_index = 0usize;
-    let mut previous = vec![0i32; c.width * c.components];
-    let mut current = vec![0i32; previous.len()];
-    let mut previous_left = vec![0i32; c.components];
+    let mut previous = vec![[0i32; COMPONENTS]; c.width + 2];
+    let mut current = vec![[0i32; COMPONENTS]; previous.len()];
+    let mut previous_left = [0i32; COMPONENTS];
     for y in 0..c.height {
         // T.87 B.4/D.4: an MCU is one image line, so a restart boundary always
         // falls between lines and never inside a run.
@@ -346,50 +399,29 @@ fn encode_scan_inner(
                 &mut contexts,
                 &mut run_contexts,
                 std::slice::from_mut(&mut run_index),
-                &mut previous,
+                previous.as_flattened_mut(),
                 &mut previous_left,
             );
         }
+        // T.87 A.2.1 defines the samples immediately outside both ends of each row.
+        previous[0] = previous_left;
+        previous[c.width + 1] = previous[c.width];
+        current[0] = previous[1];
         let mut x = 0usize;
         while x < c.width {
-            let mut ra = [0; 3];
-            let mut rb = [0; 3];
-            let mut rc = [0; 3];
-            let mut qs = [0; 3];
-            for i in 0..c.components {
-                ra[i] = if x == 0 {
-                    if y == 0 {
-                        0
-                    } else {
-                        previous[i]
-                    }
-                } else {
-                    current[(x - 1) * c.components + i]
-                };
-                rb[i] = previous[x * c.components + i];
-                rc[i] = if x == 0 {
-                    if y == 0 {
-                        0
-                    } else {
-                        previous_left[i]
-                    }
-                } else {
-                    previous[(x - 1) * c.components + i]
-                };
-                let rd = if x + 1 == c.width {
-                    rb[i]
-                } else {
-                    previous[(x + 1) * c.components + i]
-                };
-                qs[i] = context_id(ra[i], rb[i], rc[i], rd, &c.preset, c.near as i32);
-            }
-            let base = (y * c.width + x) * c.components;
+            let ra = current[x];
+            let rb = previous[x + 1];
+            let rc = previous[x];
+            let rd = previous[x + 2];
+            let qs: [i32; COMPONENTS] =
+                std::array::from_fn(|i| gradients.context(ra[i], rb[i], rc[i], rd[i]));
+            let base = (y * c.width + x) * COMPONENTS;
             if qs.iter().all(|&q| q == 0) {
                 let room = c.width - x;
                 let mut run = 0usize;
                 while run < room {
-                    let sample = (y * c.width + x + run) * c.components;
-                    if (0..c.components)
+                    let sample = (y * c.width + x + run) * COMPONENTS;
+                    if (0..COMPONENTS)
                         .any(|i| (input[sample + i] as i32 - ra[i]).abs() > c.near as i32)
                     {
                         break;
@@ -397,24 +429,20 @@ fn encode_scan_inner(
                     run += 1;
                 }
                 encode_run_length(&mut writer, run, &mut run_index, run == room)?;
-                for j in 0..run {
-                    for i in 0..c.components {
-                        current[(x + j) * c.components + i] = ra[i];
-                    }
-                }
+                current[x + 1..x + run + 1].fill(ra);
                 if run == room {
                     x += run;
                 } else {
                     let pos = x + run;
-                    let sample = (y * c.width + pos) * c.components;
-                    for i in 0..c.components {
-                        current[pos * c.components + i] = encode_run_interrupt(
+                    let sample = (y * c.width + pos) * COMPONENTS;
+                    for i in 0..COMPONENTS {
+                        current[pos + 1][i] = encode_run_interrupt(
                             &mut writer,
                             &mut run_contexts,
                             run_index,
                             input[sample + i] as i32,
                             ra[i],
-                            previous[pos * c.components + i],
+                            previous[pos + 1][i],
                             &c,
                             range,
                             limit,
@@ -425,10 +453,10 @@ fn encode_scan_inner(
                     x = pos + 1;
                 }
             } else {
-                for i in 0..c.components {
+                for i in 0..COMPONENTS {
                     let idx = qs[i].unsigned_abs() as usize;
                     let sample = input[base + i] as i32;
-                    current[x * c.components + i] = encode_regular(
+                    current[x + 1][i] = encode_regular(
                         &mut writer,
                         &mut contexts[idx],
                         qs[i],
@@ -445,7 +473,7 @@ fn encode_scan_inner(
                 x += 1;
             }
         }
-        previous_left.copy_from_slice(&previous[..c.components]);
+        previous_left = previous[1];
         std::mem::swap(&mut previous, &mut current);
     }
     output.extend(writer.finish());
@@ -592,19 +620,33 @@ pub(crate) fn decode_scan(
     if c.ilv == 1 {
         return decode_line_scan(c, scan, restart_interval);
     }
+    match c.components {
+        1 => decode_interleaved::<1>(c, scan, restart_interval),
+        2 => decode_interleaved::<2>(c, scan, restart_interval),
+        3 => decode_interleaved::<3>(c, scan, restart_interval),
+        _ => unreachable!("validated component count"),
+    }
+}
+
+fn decode_interleaved<const COMPONENTS: usize>(
+    c: ScanConfig,
+    scan: &[u8],
+    restart_interval: u32,
+) -> Result<Vec<u16>, String> {
     let (range, limit, qbpp) = golomb_params(&c);
     let expected = expected_segments(&c, restart_interval);
     let segments = split_restart_segments(scan, restart_interval, expected)?;
+    let gradients = GradientTable::new(c.preset, c.near);
     let interval = u64::from(restart_interval);
     let mut segment_index = 0usize;
     let mut reader = BitReader::new(segments[0]);
     let mut contexts = vec![RegularContext::new(range); 365];
     let mut run_contexts = [RunContext::new(0, range), RunContext::new(1, range)];
     let mut run_index = 0usize;
-    let mut previous = vec![0i32; c.width * c.components];
-    let mut current = vec![0i32; previous.len()];
-    let mut previous_left = vec![0i32; c.components];
-    let mut output = vec![0u16; c.width * c.height * c.components];
+    let mut previous = vec![[0i32; COMPONENTS]; c.width + 2];
+    let mut current = vec![[0i32; COMPONENTS]; previous.len()];
+    let mut previous_left = [0i32; COMPONENTS];
+    let mut output = vec![0u16; c.width * c.height * COMPONENTS];
     for y in 0..c.height {
         // T.87 B.4/D.4: the MCU is one image line, so boundaries fall between
         // lines and the restart reset applies to the prediction neighbourhood.
@@ -615,43 +657,22 @@ pub(crate) fn decode_scan(
                 &mut contexts,
                 &mut run_contexts,
                 std::slice::from_mut(&mut run_index),
-                &mut previous,
+                previous.as_flattened_mut(),
                 &mut previous_left,
             );
         }
+        // T.87 A.2.1 defines the samples immediately outside both ends of each row.
+        previous[0] = previous_left;
+        previous[c.width + 1] = previous[c.width];
+        current[0] = previous[1];
         let mut x = 0usize;
         while x < c.width {
-            let mut ra = [0; 3];
-            let mut rb = [0; 3];
-            let mut rc = [0; 3];
-            let mut qs = [0; 3];
-            for i in 0..c.components {
-                ra[i] = if x == 0 {
-                    if y == 0 {
-                        0
-                    } else {
-                        previous[i]
-                    }
-                } else {
-                    current[(x - 1) * c.components + i]
-                };
-                rb[i] = previous[x * c.components + i];
-                rc[i] = if x == 0 {
-                    if y == 0 {
-                        0
-                    } else {
-                        previous_left[i]
-                    }
-                } else {
-                    previous[(x - 1) * c.components + i]
-                };
-                let rd = if x + 1 == c.width {
-                    rb[i]
-                } else {
-                    previous[(x + 1) * c.components + i]
-                };
-                qs[i] = context_id(ra[i], rb[i], rc[i], rd, &c.preset, c.near as i32);
-            }
+            let ra = current[x];
+            let rb = previous[x + 1];
+            let rc = previous[x];
+            let rd = previous[x + 2];
+            let qs: [i32; COMPONENTS] =
+                std::array::from_fn(|i| gradients.context(ra[i], rb[i], rc[i], rd[i]));
             if qs.iter().all(|&q| q == 0) {
                 let mut run = 0usize;
                 while x + run < c.width && reader.read_bit()? {
@@ -676,23 +697,19 @@ pub(crate) fn decode_scan(
                 if run > c.width - x {
                     return Err("run exceeds line".into());
                 }
-                for j in 0..run {
-                    for i in 0..c.components {
-                        current[(x + j) * c.components + i] = ra[i];
-                    }
-                }
+                current[x + 1..x + run + 1].fill(ra);
                 if run == c.width - x {
                     x += run;
                     continue;
                 }
                 let pos = x + run;
-                for i in 0..c.components {
-                    current[pos * c.components + i] = decode_run_interrupt(
+                for i in 0..COMPONENTS {
+                    current[pos + 1][i] = decode_run_interrupt(
                         &mut reader,
                         &mut run_contexts,
                         run_index,
                         ra[i],
-                        previous[pos * c.components + i],
+                        previous[pos + 1][i],
                         &c,
                         range,
                         limit,
@@ -702,9 +719,9 @@ pub(crate) fn decode_scan(
                 run_index = run_index.saturating_sub(1);
                 x = pos + 1;
             } else {
-                for i in 0..c.components {
+                for i in 0..COMPONENTS {
                     let idx = qs[i].unsigned_abs() as usize;
-                    current[x * c.components + i] = decode_regular(
+                    current[x + 1][i] = decode_regular(
                         &mut reader,
                         &mut contexts[idx],
                         qs[i],
@@ -720,10 +737,12 @@ pub(crate) fn decode_scan(
                 x += 1;
             }
         }
-        for i in 0..current.len() {
-            output[y * c.width * c.components + i] = current[i] as u16;
+        let row = current[1..1 + c.width].as_flattened();
+        let start = y * row.len();
+        for (sample, &value) in output[start..start + row.len()].iter_mut().zip(row) {
+            *sample = value as u16;
         }
-        previous_left.copy_from_slice(&previous[..c.components]);
+        previous_left = previous[1];
         std::mem::swap(&mut previous, &mut current);
     }
     reader.finish()?;
@@ -944,6 +963,24 @@ fn decode_line_scan(c: ScanConfig, scan: &[u8], restart_interval: u32) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gradient_table_matches_thresholds_across_the_entire_sample_range() {
+        for (preset, near) in [
+            (Preset::defaults(255, 0).unwrap(), 0),
+            (Preset::defaults(65535, 3).unwrap(), 3),
+            (Preset::new(63, 5, 5, 63, 64).unwrap(), 4),
+        ] {
+            let table = GradientTable::new(preset, near);
+            for d in -i32::from(preset.maxval)..=i32::from(preset.maxval) {
+                assert_eq!(
+                    table.context(0, 0, 0, d),
+                    context_id(0, 0, 0, d, &preset, i32::from(near))
+                );
+            }
+        }
+    }
+
     #[test]
     fn gradient_quantization_addresses_all_regular_contexts() {
         let preset = Preset::defaults(255, 0).unwrap();

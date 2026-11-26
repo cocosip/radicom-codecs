@@ -18,7 +18,6 @@ use super::quant::{
     cap_ccap, create_openjph_steps, create_quality_steps, decode_delta, from_sign_magnitude,
     irrev_delta_inv_f32, kmax, openjph_reversible_exponents, to_sign_magnitude_f32,
 };
-use super::wavelet as ht_wavelet;
 
 const CODE_BLOCK: i32 = 64;
 const GUARD_BITS: u8 = 1;
@@ -106,12 +105,12 @@ pub(crate) fn encode(
             forward_ict_f32(&mut planes);
         }
         for (component, plane) in components.iter().zip(planes.iter_mut()) {
-            ht_wavelet::forward_97(
+            wavelet::forward_97_f32(
                 plane,
                 component.width as usize,
                 component.height as usize,
                 levels as u8,
-            );
+            )?;
         }
         irreversible_planes = planes;
     }
@@ -853,7 +852,7 @@ mod tests {
     #[test]
     fn reversible_codestream_round_trips() {
         let mut components =
-            build_components(&[vec![1, 2, 3, 4, 5, 6, 7, 8, 9]], 3, 3, 8, false, 0).unwrap();
+            build_components(vec![vec![1, 2, 3, 4, 5, 6, 7, 8, 9]], 3, 3, 8, false, 0).unwrap();
         let opts = options(&components, true);
         let encoded = encode(&mut components, &opts).unwrap();
         let decoded = decode(&encoded, None).unwrap();
@@ -877,7 +876,7 @@ mod tests {
             planes.push(plane);
         }
         let mut components =
-            build_components(&planes, width as i32, height as i32, 8, false, 5).unwrap();
+            build_components(planes.clone(), width as i32, height as i32, 8, false, 5).unwrap();
         let opts = options(&components, true);
         let encoded = encode(&mut components, &opts).unwrap();
         let decoded = decode(&encoded, None).unwrap();
@@ -897,8 +896,15 @@ mod tests {
                 plane[y * width + x] = (((x * 3 + y * 5) % 256) as i32) - 128;
             }
         }
-        let mut components =
-            build_components(&[plane.clone()], width as i32, height as i32, 8, false, 5).unwrap();
+        let mut components = build_components(
+            vec![plane.clone()],
+            width as i32,
+            height as i32,
+            8,
+            false,
+            5,
+        )
+        .unwrap();
         let opts = options(&components, false);
         let encoded = encode(&mut components, &opts).unwrap();
         let decoded = decode(&encoded, None).unwrap();
@@ -928,7 +934,7 @@ mod tests {
 
     #[test]
     fn tlm_marker_lists_one_tile_part_per_resolution() {
-        let mut components = build_components(&[vec![7i32; 64]], 8, 8, 8, false, 1).unwrap();
+        let mut components = build_components(vec![vec![7i32; 64]], 8, 8, 8, false, 1).unwrap();
         let opts = EncodeOptions {
             insert_tlm: true,
             ..options(&components, true)
@@ -970,7 +976,7 @@ mod tests {
 
     #[test]
     fn multi_layer_codestreams_are_rejected() {
-        let mut components = build_components(&[vec![3i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let mut components = build_components(vec![vec![3i32; 16]], 4, 4, 8, false, 0).unwrap();
         let opts = options(&components, true);
         let mut encoded = encode(&mut components, &opts).unwrap();
         let cod = encoded
@@ -993,9 +999,15 @@ mod tests {
             }
         }
         let error_for = |quality: u32| {
-            let mut components =
-                build_components(&[plane.clone()], width as i32, height as i32, 8, false, 3)
-                    .unwrap();
+            let mut components = build_components(
+                vec![plane.clone()],
+                width as i32,
+                height as i32,
+                8,
+                false,
+                3,
+            )
+            .unwrap();
             let opts = EncodeOptions {
                 quality,
                 ..options(&components, false)
@@ -1034,19 +1046,18 @@ mod tests {
     fn cap_ccap_follows_precision_and_transform() {
         // Ccap is the OpenJPH magnitude bound, so it needs the full default
         // decomposition count to reach the reference bucket.
-        let mut eight = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 5).unwrap();
+        let mut eight = build_components(vec![vec![0i32; 16]], 4, 4, 8, false, 5).unwrap();
         let opts = options(&eight, true);
         let encoded = encode(&mut eight, &opts).unwrap();
         assert_eq!(cap_ccap_of(&encoded), 0x0002);
 
         let sixteen_bit: Vec<i32> = (0..16).map(|i| i * 1000 - 8000).collect();
-        let mut sixteen =
-            build_components(std::slice::from_ref(&sixteen_bit), 4, 4, 16, false, 5).unwrap();
+        let mut sixteen = build_components(vec![sixteen_bit.clone()], 4, 4, 16, false, 5).unwrap();
         let opts = options(&sixteen, true);
         let encoded = encode(&mut sixteen, &opts).unwrap();
         assert_eq!(cap_ccap_of(&encoded), 0x000A);
 
-        let mut lossy = build_components(&[sixteen_bit], 4, 4, 16, false, 5).unwrap();
+        let mut lossy = build_components(vec![sixteen_bit], 4, 4, 16, false, 5).unwrap();
         let opts = options(&lossy, false);
         let encoded = encode(&mut lossy, &opts).unwrap();
         assert_eq!(cap_ccap_of(&encoded), 0x002A);
@@ -1054,7 +1065,7 @@ mod tests {
 
     #[test]
     fn pcrl_and_cprl_are_rejected() {
-        let mut components = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let mut components = build_components(vec![vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
         for progression in [3u8, 4] {
             let opts = EncodeOptions {
                 progression,
@@ -1064,7 +1075,7 @@ mod tests {
             assert!(error.contains("PCRL"), "{error}");
         }
 
-        let mut components = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let mut components = build_components(vec![vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
         let opts = options(&components, true);
         let mut encoded = encode(&mut components, &opts).unwrap();
         let cod = cod_position(&encoded);
@@ -1075,7 +1086,7 @@ mod tests {
 
     #[test]
     fn multi_precinct_codestreams_are_rejected() {
-        let mut components = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let mut components = build_components(vec![vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
         let opts = options(&components, true);
         let encoded = encode(&mut components, &opts).unwrap();
         let (header, offset) = MainHeader::parse(&encoded).unwrap();
@@ -1094,7 +1105,7 @@ mod tests {
 
     #[test]
     fn unsupported_code_block_style_bits_are_rejected() {
-        let mut components = build_components(&[vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let mut components = build_components(vec![vec![0i32; 16]], 4, 4, 8, false, 0).unwrap();
         let opts = options(&components, true);
         let encoded = encode(&mut components, &opts).unwrap();
         let (header, offset) = MainHeader::parse(&encoded).unwrap();
@@ -1114,7 +1125,7 @@ mod tests {
     fn trailing_bytes_after_eoc_are_tolerated() {
         // fo-dicom/OpenJPH appends stale pooled-buffer bytes after EOC, so a
         // decoder must ignore everything after a present EOC to read real files.
-        let mut components = build_components(&[vec![3i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let mut components = build_components(vec![vec![3i32; 16]], 4, 4, 8, false, 0).unwrap();
         let opts = options(&components, true);
         let encoded = encode(&mut components, &opts).unwrap();
         let expected = decode(&encoded, None).unwrap();
@@ -1131,7 +1142,7 @@ mod tests {
 
     #[test]
     fn trailing_tile_data_is_rejected() {
-        let mut components = build_components(&[vec![1i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let mut components = build_components(vec![vec![1i32; 16]], 4, 4, 8, false, 0).unwrap();
         let opts = options(&components, true);
         let mut encoded = encode(&mut components, &opts).unwrap();
         let sot = encoded
@@ -1152,7 +1163,7 @@ mod tests {
 
     #[test]
     fn multi_tile_codestreams_are_rejected() {
-        let mut components = build_components(&[vec![5i32; 64]], 8, 8, 8, false, 0).unwrap();
+        let mut components = build_components(vec![vec![5i32; 64]], 8, 8, 8, false, 0).unwrap();
         let opts = options(&components, true);
         let mut encoded = encode(&mut components, &opts).unwrap();
         let siz = encoded
@@ -1173,7 +1184,7 @@ mod tests {
 
     #[test]
     fn coc_without_ht_bit_is_rejected() {
-        let mut components = build_components(&[vec![7i32; 16]], 4, 4, 8, false, 0).unwrap();
+        let mut components = build_components(vec![vec![7i32; 16]], 4, 4, 8, false, 0).unwrap();
         let opts = options(&components, true);
         let encoded = encode(&mut components, &opts).unwrap();
         let (header, _) = MainHeader::parse(&encoded).unwrap();

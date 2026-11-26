@@ -74,6 +74,8 @@ pub(crate) fn inverse_53(
         xs[level] = (xs[level - 1] + 1) >> 1;
         ys[level] = (ys[level - 1] + 1) >> 1;
     }
+    let mut row = Vec::new();
+    let mut columns = Vec::new();
     for level in (0..levels).rev() {
         inverse_53_2d(
             data,
@@ -82,15 +84,68 @@ pub(crate) fn inverse_53(
             width,
             xs[level] & 1 == 0,
             ys[level] & 1 == 0,
+            (&mut columns, &mut row),
         );
     }
     Ok(())
 }
 
-/// Forward 9/7 transform over `f64` planes. The classic encoder now uses the
-/// OpenJPEG-compatible `f32` path (see `codestream::forward_97_f32`) so its
-/// coefficient rounding matches the reference bit for bit; this variant remains
-/// for the wavelet unit tests and decoder-side experiments.
+/// OpenJPEG and OpenJPH round these lifting constants and gains to the same
+/// single-precision values.
+pub(crate) fn forward_97_f32(
+    data: &mut [f32],
+    width: usize,
+    height: usize,
+    levels: u8,
+) -> Result<(), String> {
+    if width == 0 || height == 0 || width * height != data.len() {
+        return Err("invalid irreversible wavelet plane".into());
+    }
+    let mut w = width;
+    let mut h = height;
+    let mut columns = Vec::new();
+    let mut row = Vec::new();
+    for _ in 0..levels {
+        if w <= 1 && h <= 1 {
+            break;
+        }
+        if h > 1 {
+            for (parity, coeff) in [(1, ALPHA), (0, BETA), (1, GAMMA), (0, DELTA)] {
+                lift_97_columns(data, w, h, width, parity, coeff as f32);
+            }
+            for (y, line) in data.chunks_exact_mut(width).take(h).enumerate() {
+                let scale = if y & 1 == 0 { INV_K as f32 } else { K as f32 };
+                for sample in &mut line[..w] {
+                    *sample *= scale;
+                }
+            }
+            reorder_columns::<false, _>(data, w, h, width, 0, &mut columns);
+        }
+        if w > 1 {
+            row.resize(w, 0.0);
+            let sn = w.div_ceil(2);
+            for line in data.chunks_exact_mut(width).take(h) {
+                let line = &mut line[..w];
+                for (parity, coeff) in [(1, ALPHA), (0, BETA), (1, GAMMA), (0, DELTA)] {
+                    lift_97_line(line, parity, coeff as f32);
+                }
+                let (low, high) = row.split_at_mut(sn);
+                for (sample, &value) in low.iter_mut().zip(line.iter().step_by(2)) {
+                    *sample = value * INV_K as f32;
+                }
+                for (sample, &value) in high.iter_mut().zip(line[1..].iter().step_by(2)) {
+                    *sample = value * K as f32;
+                }
+                line.copy_from_slice(&row);
+            }
+        }
+        w = w.div_ceil(2);
+        h = h.div_ceil(2);
+    }
+    Ok(())
+}
+
+/// Double-precision reference analysis transform used by the wavelet tests.
 #[allow(dead_code)]
 pub(crate) fn forward_97(
     data: &mut [f64],
@@ -134,8 +189,16 @@ pub(crate) fn inverse_97(
         widths[level] = (widths[level - 1] + 1) >> 1;
         heights[level] = (heights[level - 1] + 1) >> 1;
     }
+    let mut row = Vec::new();
+    let mut columns = Vec::new();
     for level in (0..levels).rev() {
-        inverse_97_2d(data, widths[level], heights[level], width, INV_K);
+        inverse_97_2d(
+            data,
+            widths[level],
+            heights[level],
+            width,
+            (&mut columns, &mut row),
+        );
     }
     Ok(())
 }
@@ -232,26 +295,119 @@ fn inverse_53_2d(
     stride: usize,
     even_row: bool,
     even_column: bool,
+    (columns, row): (&mut Vec<i32>, &mut Vec<i32>),
 ) {
     if width > 1 {
-        let mut row = vec![0i32; width];
-        for y in 0..height {
-            row.copy_from_slice(&data[y * stride..y * stride + width]);
-            inverse_53_1d(&mut row, even_row);
-            data[y * stride..y * stride + width].copy_from_slice(&row);
+        row.resize(width, 0);
+        for line in data.chunks_exact_mut(stride).take(height) {
+            let line = &mut line[..width];
+            inverse_53_row(line, row, even_row);
+            line.copy_from_slice(row);
         }
     }
     if height > 1 {
-        let mut column = vec![0i32; height];
-        for x in 0..width {
-            for y in 0..height {
-                column[y] = data[y * stride + x];
-            }
-            inverse_53_1d(&mut column, even_column);
-            for y in 0..height {
-                data[y * stride + x] = column[y];
-            }
+        let low = usize::from(!even_column);
+        reorder_columns::<true, _>(data, width, height, stride, low, columns);
+        for_each_lifting_row(
+            data,
+            width,
+            height,
+            stride,
+            low,
+            |curr, above, below, edge| {
+                if edge {
+                    for (sample, &neighbor) in curr.iter_mut().zip(above) {
+                        *sample -= (neighbor + 1) >> 1;
+                    }
+                } else {
+                    for ((sample, &a), &b) in curr.iter_mut().zip(above).zip(below) {
+                        *sample -= (a + b + 2) >> 2;
+                    }
+                }
+            },
+        );
+        for_each_lifting_row(
+            data,
+            width,
+            height,
+            stride,
+            1 - low,
+            |curr, above, below, edge| {
+                if edge {
+                    for (sample, &neighbor) in curr.iter_mut().zip(above) {
+                        *sample += neighbor;
+                    }
+                } else {
+                    for ((sample, &a), &b) in curr.iter_mut().zip(above).zip(below) {
+                        *sample += (a + b) >> 1;
+                    }
+                }
+            },
+        );
+    }
+}
+
+// Gather and scatter short runs so both the band and spatial layouts are
+// traversed by cache line, even on a plane with a large stride.
+fn reorder_columns<const INVERSE: bool, T: Copy + Default>(
+    data: &mut [T],
+    width: usize,
+    height: usize,
+    stride: usize,
+    low_parity: usize,
+    scratch: &mut Vec<T>,
+) {
+    const GROUP: usize = 32;
+    scratch.resize(height * width.min(GROUP), T::default());
+    for x in (0..width).step_by(GROUP) {
+        let count = (width - x).min(GROUP);
+        let group = &mut scratch[..height * count];
+        for (dst, src) in group.chunks_exact_mut(count).zip(data.chunks_exact(stride)) {
+            dst.copy_from_slice(&src[x..x + count]);
         }
+        let spatial_rows = (low_parity..height)
+            .step_by(2)
+            .chain((1 - low_parity..height).step_by(2));
+        for (band_row, spatial_row) in spatial_rows.enumerate() {
+            let (src, dst) = if INVERSE {
+                (band_row, spatial_row)
+            } else {
+                (spatial_row, band_row)
+            };
+            data[dst * stride + x..dst * stride + x + count]
+                .copy_from_slice(&group[src * count..(src + 1) * count]);
+        }
+    }
+}
+
+fn for_each_lifting_row<T>(
+    data: &mut [T],
+    width: usize,
+    height: usize,
+    stride: usize,
+    parity: usize,
+    mut lift: impl FnMut(&mut [T], &[T], &[T], bool),
+) {
+    debug_assert!(height > 1);
+    for y in (parity..height).step_by(2) {
+        let (before, rest) = data.split_at_mut(y * stride);
+        let (current, after) = rest.split_at_mut(stride);
+        let above = if y == 0 {
+            &after[..width]
+        } else {
+            &before[before.len() - stride..][..width]
+        };
+        let below = if y + 1 == height {
+            above
+        } else {
+            &after[..width]
+        };
+        lift(
+            &mut current[..width],
+            above,
+            below,
+            y == 0 || y + 1 == height,
+        );
     }
 }
 
@@ -304,14 +460,11 @@ fn forward_53_row(data: &[i32], output: &mut [i32], even: bool) {
     }
 }
 
-fn inverse_53_1d(data: &mut [i32], even: bool) {
+fn inverse_53_row(data: &[i32], output: &mut [i32], even: bool) {
     let length = data.len();
+    debug_assert!(length > 1);
     if even {
-        if length <= 1 {
-            return;
-        }
         let sn = (length + 1) >> 1;
-        let mut output = vec![0i32; length];
         let mut s1n = data[0];
         let mut d1n = data[sn];
         let mut s0n = s1n - ((d1n + 1) >> 1);
@@ -335,48 +488,41 @@ fn inverse_53_1d(data: &mut [i32], even: bool) {
         } else {
             output[length - 1] = d1n + s0n;
         }
-        data.copy_from_slice(&output);
         return;
     }
 
-    if length == 1 {
-        data[0] /= 2;
-        return;
-    }
     if length == 2 {
         let out1 = data[0] - ((data[1] + 1) >> 1);
         let out0 = data[1] + out1;
-        data[0] = out0;
-        data[1] = out1;
+        output[0] = out0;
+        output[1] = out1;
         return;
     }
     let low_count = length >> 1;
-    let mut result = vec![0i32; length];
     let mut s1 = data[low_count + 1];
     let mut dc = data[0] - ((data[low_count] + s1 + 2) >> 2);
-    result[0] = data[low_count] + dc;
+    output[0] = data[low_count] + dc;
     let limit = length - 2 - if length & 1 == 0 { 1 } else { 0 };
     let mut output_index = 1;
     let mut low_index = 1;
     while output_index < limit {
         let s2 = data[low_count + low_index + 1];
         let dn = data[low_index] - ((s1 + s2 + 2) >> 2);
-        result[output_index] = dc;
-        result[output_index + 1] = s1 + ((dn + dc) >> 1);
+        output[output_index] = dc;
+        output[output_index + 1] = s1 + ((dn + dc) >> 1);
         dc = dn;
         s1 = s2;
         output_index += 2;
         low_index += 1;
     }
-    result[output_index] = dc;
+    output[output_index] = dc;
     if length & 1 == 0 {
         let dn = data[(length >> 1) - 1] - ((s1 + 1) >> 1);
-        result[length - 2] = s1 + ((dn + dc) >> 1);
-        result[length - 1] = dn;
+        output[length - 2] = s1 + ((dn + dc) >> 1);
+        output[length - 1] = dn;
     } else {
-        result[length - 1] = s1 + dc;
+        output[length - 1] = s1 + dc;
     }
-    data.copy_from_slice(&result);
 }
 
 fn forward_97_2d(data: &mut [f64], width: usize, height: usize, stride: usize) {
@@ -402,26 +548,82 @@ fn forward_97_2d(data: &mut [f64], width: usize, height: usize, stride: usize) {
     }
 }
 
-fn inverse_97_2d(data: &mut [f64], width: usize, height: usize, stride: usize, high_scale: f64) {
+fn inverse_97_2d(
+    data: &mut [f64],
+    width: usize,
+    height: usize,
+    stride: usize,
+    (columns, row): (&mut Vec<f64>, &mut Vec<f64>),
+) {
     if width > 1 {
-        let mut row = vec![0f64; width];
-        for y in 0..height {
-            row.copy_from_slice(&data[y * stride..y * stride + width]);
-            inverse_97_1d(&mut row, high_scale);
-            data[y * stride..y * stride + width].copy_from_slice(&row);
+        row.resize(width, 0.0);
+        for line in data.chunks_exact_mut(stride).take(height) {
+            let line = &mut line[..width];
+            let (low, high) = line.split_at(width.div_ceil(2));
+            for (sample, &value) in row.iter_mut().step_by(2).zip(low) {
+                *sample = value * K;
+            }
+            for (sample, &value) in row[1..].iter_mut().step_by(2).zip(high) {
+                *sample = value * INV_K;
+            }
+            for (parity, coeff) in [(0, -DELTA), (1, -GAMMA), (0, -BETA), (1, -ALPHA)] {
+                lift_97_line(row, parity, coeff);
+            }
+            line.copy_from_slice(row);
         }
     }
     if height > 1 {
-        let mut column = vec![0f64; height];
-        for x in 0..width {
-            for y in 0..height {
-                column[y] = data[y * stride + x];
-            }
-            inverse_97_1d(&mut column, high_scale);
-            for y in 0..height {
-                data[y * stride + x] = column[y];
+        let low = height.div_ceil(2);
+        for (y, line) in data.chunks_exact_mut(stride).take(height).enumerate() {
+            let scale = if y < low { K } else { INV_K };
+            for value in &mut line[..width] {
+                *value *= scale;
             }
         }
+        reorder_columns::<true, _>(data, width, height, stride, 0, columns);
+        for (parity, coeff) in [(0, -DELTA), (1, -GAMMA), (0, -BETA), (1, -ALPHA)] {
+            lift_97_columns(data, width, height, stride, parity, coeff);
+        }
+    }
+}
+
+fn lift_97_columns<T>(
+    data: &mut [T],
+    width: usize,
+    height: usize,
+    stride: usize,
+    parity: usize,
+    coefficient: T,
+) where
+    T: Copy + std::ops::Add<Output = T> + std::ops::Mul<Output = T> + std::ops::AddAssign,
+{
+    for_each_lifting_row(
+        data,
+        width,
+        height,
+        stride,
+        parity,
+        |current, above, below, _| {
+            for ((sample, &a), &b) in current.iter_mut().zip(above).zip(below) {
+                *sample += (a + b) * coefficient;
+            }
+        },
+    );
+}
+
+fn lift_97_line<T>(data: &mut [T], parity: usize, coefficient: T)
+where
+    T: Copy + std::ops::Add<Output = T> + std::ops::Mul<Output = T> + std::ops::AddAssign,
+{
+    let length = data.len();
+    if parity == 0 {
+        data[0] += (data[1] + data[1]) * coefficient;
+    }
+    for i in (2 - parity..length - 1).step_by(2) {
+        data[i] += (data[i - 1] + data[i + 1]) * coefficient;
+    }
+    if (length - 1) & 1 == parity {
+        data[length - 1] += (data[length - 2] + data[length - 2]) * coefficient;
     }
 }
 
@@ -467,73 +669,7 @@ fn forward_97_1d(data: &mut [f64]) {
     data.copy_from_slice(&workspace);
 }
 
-fn inverse_97_1d(data: &mut [f64], high_scale: f64) {
-    let width = data.len();
-    if width <= 1 {
-        return;
-    }
-    let low_count = (width + 1) >> 1;
-    let high_count = width - low_count;
-    let mut temp = vec![0f64; width];
-    for i in 0..low_count {
-        temp[2 * i] = data[i];
-    }
-    for i in 0..high_count {
-        temp[2 * i + 1] = data[low_count + i];
-    }
-    data.copy_from_slice(&temp);
-    for i in 0..low_count.min(high_count) {
-        data[2 * i] *= K;
-        data[2 * i + 1] *= high_scale;
-    }
-    if low_count > high_count {
-        data[(low_count - 1) * 2] *= K;
-    }
-    encode_step_97_inverse(data, 1, 1, low_count, low_count.min(high_count), -DELTA);
-    encode_step_97_inverse(
-        data,
-        0,
-        2,
-        high_count,
-        high_count.min(low_count.saturating_sub(1)),
-        -GAMMA,
-    );
-    encode_step_97_inverse(data, 1, 1, low_count, low_count.min(high_count), -BETA);
-    encode_step_97_inverse(
-        data,
-        0,
-        2,
-        high_count,
-        high_count.min(low_count.saturating_sub(1)),
-        -ALPHA,
-    );
-}
-
 fn encode_step_97(
-    data: &mut [f64],
-    fl_start: usize,
-    fw_start: usize,
-    end: usize,
-    middle: usize,
-    coefficient: f64,
-) {
-    if middle > 0 {
-        let mut fw = fw_start;
-        let fl = fl_start;
-        data[fw - 1] += (data[fl] + data[fw]) * coefficient;
-        fw += 2;
-        for _ in 1..middle {
-            data[fw - 1] += (data[fw - 2] + data[fw]) * coefficient;
-            fw += 2;
-        }
-    }
-    if middle < end {
-        let fw = fw_start + 2 * middle;
-        data[fw - 1] += (2.0 * data[fw - 2]) * coefficient;
-    }
-}
-
-fn encode_step_97_inverse(
     data: &mut [f64],
     fl_start: usize,
     fw_start: usize,
@@ -599,6 +735,25 @@ mod tests {
     }
 
     #[test]
+    fn irreversible_analysis_and_synthesis_handle_short_axes_and_partial_groups() {
+        for (width, height) in [(1, 17), (18, 1), (2, 3), (33, 35)] {
+            let source = pattern(width, height);
+            let mut single: Vec<f32> = source.iter().map(|&value| value as f32).collect();
+            let mut reference: Vec<f64> = source.iter().map(|&value| f64::from(value)).collect();
+            forward_97_f32(&mut single, width, height, 3).unwrap();
+            forward_97(&mut reference, width, height, 3).unwrap();
+            for (&single, &double) in single.iter().zip(&reference) {
+                assert!((f64::from(single) - double).abs() < 0.001);
+            }
+            let mut reconstructed: Vec<f64> = single.into_iter().map(f64::from).collect();
+            inverse_97(&mut reconstructed, width, height, 3).unwrap();
+            for (&pixel, &value) in source.iter().zip(&reconstructed) {
+                assert!((f64::from(pixel) - value).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
     fn irreversible_97_round_trips_through_the_classic_inverse() {
         // The classic 2000 codec decodes with `inverse_97`; it must be the
         // exact inverse of `forward_97` or detail bands are mis-scaled.
@@ -623,7 +778,7 @@ mod tests {
                 .collect();
             let mut plane = source.clone();
             forward_97_1d(&mut plane);
-            inverse_97_1d(&mut plane, INV_K);
+            inverse_97(&mut plane, length, 1, 1).unwrap();
             for (a, b) in source.iter().zip(&plane) {
                 assert!((a - b).abs() < 0.05, "length={length}: {a} vs {b}");
             }

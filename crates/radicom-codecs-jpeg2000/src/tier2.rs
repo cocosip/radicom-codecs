@@ -819,7 +819,7 @@ mod tests {
         // is ~39M packets, far above the cap, so the Vec must not be built.
         let planes: Vec<Vec<i32>> = (0..100).map(|_| vec![0i32; 4]).collect();
         let mut components =
-            crate::codestream::build_components(&planes, 2, 2, 8, false, 5).unwrap();
+            crate::codestream::build_components(planes, 2, 2, 8, false, 5).unwrap();
         for component in &mut components {
             component.build_code_blocks(64, 64, None).unwrap();
         }

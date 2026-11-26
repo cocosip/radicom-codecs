@@ -19,7 +19,7 @@ const GUARD_BITS: u8 = 2;
 /// Builds one component per image component, with `samples` already level
 /// shifted for unsigned data.
 pub(crate) fn build_components(
-    samples: &[Vec<i32>],
+    samples: Vec<Vec<i32>>,
     width: i32,
     height: i32,
     precision: u8,
@@ -31,13 +31,13 @@ pub(crate) fn build_components(
     }
     let area = crate::geometry::checked_total(width as u64, height as u64, samples.len())? as usize;
     let mut components = Vec::with_capacity(samples.len());
-    for (index, plane) in samples.iter().enumerate() {
+    for (index, plane) in samples.into_iter().enumerate() {
         if plane.len() != area {
             return Err("component sample count does not match the image size".into());
         }
-        let mut component = Component::new(index, 0, 0, width, height, levels, precision, signed)?;
-        component.coefficients = plane.clone();
-        components.push(component);
+        components.push(Component::with_coefficients(
+            index, 0, 0, width, height, levels, precision, signed, plane,
+        ));
     }
     Ok(components)
 }
@@ -114,7 +114,7 @@ pub(crate) fn encode_with_precincts(
                 Some(planes) => planes[index].clone(),
                 None => component.coefficients.iter().map(|&v| v as f32).collect(),
             };
-            forward_97_f32(
+            wavelet::forward_97_f32(
                 &mut plane,
                 component.width as usize,
                 component.height as usize,
@@ -579,128 +579,6 @@ fn allocate_layers(components: &mut [Component], targets: &[f64]) -> Result<(), 
     Ok(())
 }
 
-/// OpenJPEG's irreversible 9/7 lifting constants (f32, from Table F.4). They
-/// are copied verbatim so the compiler rounds them to the same `f32` as the C
-/// build.
-#[allow(clippy::excessive_precision)]
-const DWT_ALPHA_F32: f32 = -1.586134342;
-#[allow(clippy::excessive_precision)]
-const DWT_BETA_F32: f32 = -0.052980118;
-#[allow(clippy::excessive_precision)]
-const DWT_GAMMA_F32: f32 = 0.882911075;
-#[allow(clippy::excessive_precision)]
-const DWT_DELTA_F32: f32 = 0.443506852;
-#[allow(clippy::excessive_precision)]
-const DWT_K_F32: f32 = 1.230174105;
-const DWT_INV_K_F32: f32 = (1.0f64 / 1.230174105) as f32;
-
-/// OpenJPEG `opj_dwt_encode_step2` on an interleaved f32 line.
-fn dwt_step2_f32(
-    data: &mut [f32],
-    fl: usize,
-    mut fw: usize,
-    end: usize,
-    middle: usize,
-    coefficient: f32,
-) {
-    let imax = end.min(middle);
-    if imax > 0 {
-        data[fw - 1] += (data[fl] + data[fw]) * coefficient;
-        fw += 2;
-        for _ in 1..imax {
-            data[fw - 1] += (data[fw - 2] + data[fw]) * coefficient;
-            fw += 2;
-        }
-    }
-    if middle < end {
-        data[fw - 1] += (2.0f32 * data[fw - 2]) * coefficient;
-    }
-}
-
-fn dwt_step1_combined_f32(data: &mut [f32], iters_c1: usize, iters_c2: usize, c1: f32, c2: f32) {
-    let common = iters_c1.min(iters_c2);
-    let mut i = 0;
-    while i < common {
-        data[2 * i] *= c1;
-        data[2 * i + 1] *= c2;
-        i += 1;
-    }
-    if i < iters_c1 {
-        data[2 * i] *= c1;
-    } else if i < iters_c2 {
-        data[2 * i + 1] *= c2;
-    }
-}
-
-/// OpenJPEG `opj_dwt_encode_1_real` on one f32 line.
-fn dwt_encode_1d_f32(data: &mut [f32], dn: usize, sn: usize, cas: usize) {
-    let (a, b) = if cas == 0 {
-        (0usize, 1usize)
-    } else {
-        (1usize, 0usize)
-    };
-    let alpha_m = dn.min(sn.saturating_sub(b));
-    dwt_step2_f32(data, a, b + 1, dn, alpha_m, DWT_ALPHA_F32);
-    let beta_m = sn.min(dn.saturating_sub(a));
-    dwt_step2_f32(data, b, a + 1, sn, beta_m, DWT_BETA_F32);
-    dwt_step2_f32(data, a, b + 1, dn, alpha_m, DWT_GAMMA_F32);
-    dwt_step2_f32(data, b, a + 1, sn, beta_m, DWT_DELTA_F32);
-    if a == 0 {
-        dwt_step1_combined_f32(data, sn, dn, DWT_INV_K_F32, DWT_K_F32);
-    } else {
-        dwt_step1_combined_f32(data, dn, sn, DWT_K_F32, DWT_INV_K_F32);
-    }
-}
-
-/// OpenJPEG's f32 forward 9/7 transform (`opj_dwt_encode_real`). The tile
-/// always starts at (0, 0) in this encoder, so every level uses the even
-/// (non-inverted) lifting order.
-fn forward_97_f32(data: &mut [f32], width: usize, height: usize, levels: u8) -> Result<(), String> {
-    if width == 0 || height == 0 || data.len() != width * height {
-        return Err("invalid irreversible wavelet plane".into());
-    }
-    let mut current_width = width;
-    let mut current_height = height;
-    for _ in 0..levels {
-        if current_width <= 1 && current_height <= 1 {
-            break;
-        }
-        let low_width = current_width.div_ceil(2);
-        let low_height = current_height.div_ceil(2);
-        if current_height > 1 {
-            let mut column = vec![0f32; current_height];
-            for x in 0..current_width {
-                for y in 0..current_height {
-                    column[y] = data[y * width + x];
-                }
-                dwt_encode_1d_f32(&mut column, current_height - low_height, low_height, 0);
-                for y in 0..low_height {
-                    data[y * width + x] = column[2 * y];
-                }
-                for y in 0..(current_height - low_height) {
-                    data[(low_height + y) * width + x] = column[2 * y + 1];
-                }
-            }
-        }
-        if current_width > 1 {
-            let mut row = vec![0f32; current_width];
-            for y in 0..current_height {
-                row.copy_from_slice(&data[y * width..y * width + current_width]);
-                dwt_encode_1d_f32(&mut row, current_width - low_width, low_width, 0);
-                for x in 0..low_width {
-                    data[y * width + x] = row[2 * x];
-                }
-                for x in 0..(current_width - low_width) {
-                    data[y * width + low_width + x] = row[2 * x + 1];
-                }
-            }
-        }
-        current_width = low_width;
-        current_height = low_height;
-    }
-    Ok(())
-}
-
 /// OpenJPEG's irreversible multiple-component transform, in f32 and with its
 /// exact constants (`opj_mct_encode_real`).
 fn forward_ict_planes_f32(planes: &mut [Vec<f32>]) {
@@ -1093,7 +971,7 @@ mod tests {
         let height = 40usize;
         let samples = vec![pattern(width, height, 11)];
         let mut components =
-            build_components(&samples, width as i32, height as i32, 8, false, 5).unwrap();
+            build_components(samples.clone(), width as i32, height as i32, 8, false, 5).unwrap();
         let codestream = encode_with_mct(&mut components, true, false).unwrap();
         let decoded = decode(&codestream).unwrap();
         assert_eq!(decoded.len(), 1);
@@ -1107,7 +985,7 @@ mod tests {
         let samples = vec![pattern(width, height, 17)];
         let precincts = vec![(2u8, 2u8); 6];
         let mut components =
-            build_components(&samples, width as i32, height as i32, 8, false, 5).unwrap();
+            build_components(samples.clone(), width as i32, height as i32, 8, false, 5).unwrap();
         let codestream =
             encode_with_precincts(&mut components, true, Some(&precincts), false, &[0.0]).unwrap();
         let decoded = decode(&codestream).unwrap();
@@ -1197,7 +1075,7 @@ mod tests {
             .collect();
         let samples = vec![pattern];
         let mut components =
-            build_components(&samples, width as i32, height as i32, 8, false, 2).unwrap();
+            build_components(samples.clone(), width as i32, height as i32, 8, false, 2).unwrap();
         let codestream = encode_with_mct(&mut components, false, false).unwrap();
         let decoded = decode(&codestream).unwrap();
         let max = samples[0]
@@ -1215,8 +1093,15 @@ mod tests {
             let width = 48usize;
             let height = 40usize;
             let samples = vec![pattern(width, height, 3)];
-            let mut components =
-                build_components(&samples, width as i32, height as i32, 8, false, levels).unwrap();
+            let mut components = build_components(
+                samples.clone(),
+                width as i32,
+                height as i32,
+                8,
+                false,
+                levels,
+            )
+            .unwrap();
             let codestream = encode_with_mct(&mut components, false, false).unwrap();
             let decoded = decode(&codestream).unwrap();
             let mut total = 0i64;
@@ -1259,7 +1144,7 @@ mod tests {
             })
             .collect();
         let mut components =
-            build_components(&samples, width as i32, height as i32, 8, false, 5).unwrap();
+            build_components(samples, width as i32, height as i32, 8, false, 5).unwrap();
         encode_with_mct(&mut components, reversible, mct).unwrap()
     }
 
@@ -1275,7 +1160,7 @@ mod tests {
             })
             .collect();
         let mut components =
-            build_components(&samples, width as i32, height as i32, 8, false, 5).unwrap();
+            build_components(samples.clone(), width as i32, height as i32, 8, false, 5).unwrap();
         let codestream = encode_with_mct(&mut components, true, true).unwrap();
         let (header, _) = MainHeader::parse(&codestream).unwrap();
         assert_eq!(header.cod.mct, 1);
@@ -1297,7 +1182,7 @@ mod tests {
             })
             .collect();
         let mut components =
-            build_components(&samples, width as i32, height as i32, 8, false, 3).unwrap();
+            build_components(samples.clone(), width as i32, height as i32, 8, false, 3).unwrap();
         let codestream = encode_with_mct(&mut components, false, true).unwrap();
         let (header, _) = MainHeader::parse(&codestream).unwrap();
         assert_eq!(header.cod.mct, 1);
@@ -1324,7 +1209,7 @@ mod tests {
         let mut mono = {
             let width = 16usize;
             let samples = vec![pattern(width, 16, 1)];
-            let mut components = build_components(&samples, width as i32, 16, 8, false, 2).unwrap();
+            let mut components = build_components(samples, width as i32, 16, 8, false, 2).unwrap();
             encode_with_mct(&mut components, true, false).unwrap()
         };
         let (mono_cod, _) = main_segment(&mono, COD).unwrap();
@@ -1454,7 +1339,7 @@ mod tests {
     #[test]
     fn tile_part_coc_and_qcc_are_applied() {
         let samples = vec![pattern(24, 20, 3)];
-        let mut components = build_components(&samples, 24, 20, 8, false, 2).unwrap();
+        let mut components = build_components(samples.clone(), 24, 20, 8, false, 2).unwrap();
         let stream = encode_with_mct(&mut components, true, false).unwrap();
         let marker = |code| {
             stream
@@ -1502,7 +1387,7 @@ mod tests {
     #[test]
     fn scalar_derived_quantization_decodes_end_to_end() {
         let samples = vec![pattern(16, 16, 5)];
-        let mut components = build_components(&samples, 16, 16, 8, false, 0).unwrap();
+        let mut components = build_components(samples.clone(), 16, 16, 8, false, 0).unwrap();
         let stream = encode_with_mct(&mut components, true, false).unwrap();
         let (header, _) = MainHeader::parse(&stream).unwrap();
         let marker = stream
@@ -1539,7 +1424,7 @@ mod tests {
     fn lossless_multi_layer_codestream_matches_openjpeg() {
         const EXPECTED: &str = "
             ff4fff510029000000000020000000200000000000000000000000200000002000000000000000000001070101ff52000c00000008000504040001ff5c00134040484850484850484850484850484850ff640025000143726561746564206279204f70656e4a5045472076657273696f6e20322e352e34ff90000a0000000002820001ff93808080a31418256e7c8180808080808080808080808080a5d30013b168c0d8abf756abe19cf5d27449b7aea1a86faead115cb1531481dfe1afb819481a28c3fe80808080808080808080a716221f601829c5becbf6e6e1b0a8214240778c265ed47ffa2cbd71379f2b3954c87f9e80808080c5401e740e38614a45278080808090e180114f14ecde5dc290a2a4e1c6504780c02103c07c20c010c03e1040030704c1f3848074381f384007779bcf0c1b3f04e65bdfc3ea0efac2bea0a02198e719d0b9e1ee97369029aedf041b766b2f791fc58ee7a551dfd220cdd74b48a3fd631fb0da3f0440b57c19881bd895e4dda5ba9801e9f122778e12895f7a2ae40debbb34d4d8e5d888573ddf8bcd867f51f44c5b925a915e4f583fb5226262b1d12784c212d19647c1bdadc4f1ce91d49e158fe70d1f4dd329e789e0d063c92d27f1123122caf7d753a0b5f69e4c2915da5c445bd96ee2b582da0367f51884c30c87e16d197218dfe220c95155be87a5f5e90e3e96c52a82fccebcdba03000192b9300bca3386cde5ef44fd06949aca22ffcd8c7dac1f68438fc0d801f5907a00d978a0d50b2eccc2933c55b06cf62879fc583eff20f36410e15e00b6bd7cbfdaede5f901ba350afd38bd4624f760b192b67c05d9f603edd0c21e0ded6f13eb4fda386f860ccf8bb1e39b901ff4730409f989ca8ec06b278687ddd86fd33497e458db4ba2b20008263876afc3393316f4126958568368595a838bf691671f1eba2925f590b38514beb21670a297d66155ea1782778936f11779907f40737c70f374f945c2f6533b2abb143e2372347e590aa47d6e7a02fb2df70fe2bf282be060f5eb1ee7518d63250376f5bd5ff7fff7fff7fff7fffd9";
-        let mut components = build_components(&[golden_samples()], 32, 32, 8, false, 5).unwrap();
+        let mut components = build_components(vec![golden_samples()], 32, 32, 8, false, 5).unwrap();
         let rates = [1280.0, 640.0, 320.0, 160.0, 80.0, 40.0, 20.0, 0.0];
         let stream = encode_with_precincts(&mut components, true, None, false, &rates).unwrap();
         assert_eq!(stream, hex_bytes(EXPECTED));
@@ -1551,7 +1436,7 @@ mod tests {
     fn irreversible_multi_layer_codestream_matches_openjpeg() {
         const EXPECTED: &str = "
             ff4fff510029000000000020000000200000000000000000000000200000002000000000000000000001070101ff52000c00000008000504040000ff5c002342772076f076f076c06f006f006ee067506750676850055005504757d357d35762ff640025000143726561746564206279204f70656e4a5045472076657273696f6e20322e352e34ff90000a0000000000b50001ff938080808080a2e98013b168c0d8abf756abe19cf5d27449b7aea1a86faead115cb1531481dfe1afb81650862d5f758080808080808080808080808080808080b0909023f9ea5388ccdad0544a57fc3b01ccbb6380808080a2a40f4ea56d0116076d778080808080c74a8c36a41e23465d575920750b2daf4414a58080808090708012771e1fa0c6587f2f7f58165a0f1f8bf6fde980808080a0480e85feb198c015a780c8689380ffd9";
-        let mut components = build_components(&[golden_samples()], 32, 32, 8, false, 5).unwrap();
+        let mut components = build_components(vec![golden_samples()], 32, 32, 8, false, 5).unwrap();
         let rates = [1280.0, 640.0, 320.0, 160.0, 80.0, 40.0, 20.0, 16.0];
         let stream = encode_with_precincts(&mut components, false, None, false, &rates).unwrap();
         assert_eq!(stream, hex_bytes(EXPECTED));
@@ -1562,7 +1447,7 @@ mod tests {
     #[test]
     fn layer_allocations_are_monotonic_and_end_lossless() {
         let samples = vec![pattern(48, 40, 23)];
-        let mut components = build_components(&samples, 48, 40, 8, false, 5).unwrap();
+        let mut components = build_components(samples.clone(), 48, 40, 8, false, 5).unwrap();
         let rates = [1280.0, 640.0, 320.0, 160.0, 80.0, 40.0, 20.0, 0.0];
         let codestream = encode_with_precincts(&mut components, true, None, false, &rates).unwrap();
         // The decoder consumes the same layered packets, so the lossless path

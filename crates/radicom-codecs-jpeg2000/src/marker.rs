@@ -982,7 +982,7 @@ mod tests {
             })
             .collect();
         let mut components =
-            crate::codestream::build_components(&samples, width as i32, height as i32, 8, false, 2)
+            crate::codestream::build_components(samples, width as i32, height as i32, 8, false, 2)
                 .unwrap();
         crate::codestream::encode_with_mct(&mut components, true, false).unwrap()
     }
