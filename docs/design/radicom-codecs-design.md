@@ -332,34 +332,20 @@ Acceptance rules are:
 - all registry rows: both `can_transcode(raw, compressed)` and
   `can_transcode(compressed, raw)` are true after registration.
 
-### 10.1 Interop harnesses (development-only, git-ignored)
+### 10.1 External-reference validation
 
-The C# oracles and the Rust harness live under `.interop/` and are not part of
-the published crates. Any harness must pin the same `radicom = "0.3.1"` registry
-version as the workspace; pointing it at a local `radicom` checkout gives the
-dependency graph two incompatible `radicom` versions and breaks the `Codec`
-trait impls.
+Follow [DICOM Codec Performance and Validation](../development/codec-performance-validation.md)
+for shared Pixel Data, independent timing processes, byte comparisons, and
+public DICOM interoperability. Native reference libraries, harnesses, and
+private corpora require local setup and remain outside version control.
+Use the workspace's published `radicom` version in any Rust harness so its
+codec traits match the registered implementations.
+
+The tracked JPEG 2000 inspection example can be built with:
 
 ```powershell
-dotnet build .interop/dicomref/dicomref.csproj
-dotnet build -c Release .interop/j2k-oracle/j2k-oracle.csproj
-cargo build --manifest-path .interop/rustharness/Cargo.toml
 cargo build -p radicom-codecs-jpeg2000 --example j2k_tool
-bash .interop/run_matrix.sh
-bash .interop/run_extra.sh
-pwsh .interop/run-j2k-interop.ps1
-pwsh .interop/run-ht-interop.ps1
 ```
-
-`run_matrix.sh` and `run_extra.sh` drive `.interop/rustharness` against
-`.interop/dicomref`; the two `pwsh` scripts drive the J2K/HT examples against
-`.interop/j2k-oracle`. Both shell scripts read some fixtures from an external
-`fo-dicom.Codecs/Tests/Acceptance` checkout (`$FIX` at the top of the script);
-when that tree is absent those entries are skipped, not silently passed.
-
-Older family-document revisions quote `node .interop/matrix.js` or
-`node .interop/dicom-matrix.js`. Those JavaScript matrices are not part of this
-repository; the commands above are the supported way to reproduce the matrices.
 
 ## 11. Implementation order and release boundary
 
@@ -372,12 +358,12 @@ The implementation order is part of the design, not a suggestion:
 5. three HTJ2K registrations;
 6. full cross-family compatibility matrix and package validation.
 
-The development document records the checklist and current status for these
-stages. A stage is complete only when its family tests, registry tests, and
-reference interoperability tests pass without weakening an earlier stage.
+The family contracts describe supported behavior and limitations. A stage is
+complete only when its family tests, registry tests, and reference
+interoperability tests pass without weakening an earlier stage.
 
 JPEG 2000 and HTJ2K encode/decode are implemented in the shared Rust crate, with
 unit, integration, and historical interop coverage. Unsupported profiles and
-remaining coverage gaps are listed in the family documents and development
-status. Publishing is not a substitute for verification of those boundaries.
+remaining coverage gaps are listed in the family documents. Performance
+acceptance follows the validation workflow linked above.
 

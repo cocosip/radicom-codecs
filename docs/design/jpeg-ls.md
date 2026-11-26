@@ -606,9 +606,8 @@ Each stage ends with its own focused tests and keeps earlier stages passing.
 - Lossless comparisons are byte/sample exact after DICOM native byte order and
   planar rules. Near-lossless comparisons report maximum absolute sample error,
   not only visual similarity.
-- The DICOM-level fo-dicom.Codecs 5.16.7 matrix (`.interop/dicomref` driven by
-  `.interop/run_matrix.sh`) is sample-exact in both directions for `.80` at 8 and
-  12 bits and for `.81`.
+- Earlier DICOM-level fo-dicom.Codecs 5.16.7 checks were sample-exact in both
+  directions for `.80` at 8 and 12 bits and for `.81`.
 - The acceptance matrix records external file fixtures separately from
   local unit and property checks; a successful Rust round trip alone is not
   claimed as cross-implementation proof.
@@ -668,10 +667,9 @@ successfully decodes Rust output in both directions for the supported layouts.
 - The facade integration test uses the real registry/Transcoder for both UIDs,
   two frames, a Basic Offset Table with multiple fragments per frame, signed
   8/12/16-bit samples and planar 8/16-bit RGB.
-- The ignored `.interop/run_conformance.sh` (T.87 conformance streams against
-  the ITU reference tools) and `.interop/run_extra.sh` (synthetic layouts:
-  16/12-bit, signed, planar, multi-frame, restart markers) harnesses run the
-  bidirectional CharLS cases. They pass the original signed two's-complement
+- External checks using T.87 conformance streams and synthetic layouts
+  (16/12-bit, signed, planar, multi-frame, restart markers) exercised
+  bidirectional CharLS cases. They passed the original signed two's-complement
   bytes directly to the native encoder; comparisons apply only DICOM planar
   ordering and sign extension, never a sample offset. Lossless samples are
   exact; each near-lossless error is <= the requested NEAR. Rust and native
@@ -730,8 +728,8 @@ successfully decodes Rust output in both directions for the supported layouts.
   differences). That confirms the line-based interval and the D.4 reset (model
   plus neighbourhood) against an independent decoder.
 - Remaining restart limitations: the vendored CharLS encoder has no restart
-  support (only `scan.h`'s decoder reads `RSTm`) and none of the 27 JPEG-LS
-  codestreams under `.interop/` carries a DRI segment, so the direction
+  support (only `scan.h`'s decoder reads `RSTm`) and the tested native
+  codestreams carried no DRI segment, so the direction
   "CharLS-encoded restart stream decoded by Rust" cannot be produced locally.
   The T.87 reference decoder (locod V.1.00) accepts the DRI segment but does not
   implement restart intervals: it decodes the first interval of an interval-3

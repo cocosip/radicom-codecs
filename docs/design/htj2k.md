@@ -144,8 +144,8 @@ a mean-absolute-error tolerance and require a decodable codestream.
    explicit precinct codestreams, multi-layer codestreams, TLM layout, and
    Ccap values; signed 12-in-16 decode and multi-frame transcoding are covered
    through the DICOM adapter.
-6. The fo-dicom.Codecs 5.16.7 DICOM-level matrix (`.interop/dicomref`, C#)
-   passes in both directions for mono `.201`/`.202`/`.203` at 8 bits and `.201`
+6. Earlier fo-dicom.Codecs 5.16.7 DICOM-level checks passed
+   in both directions for mono `.201`/`.202`/`.203` at 8 bits and `.201`
    at 12 bits stored in 16: each codec's decode of the other's codestream is
    sample-exact, and both decoders agree exactly on the same codestream. That
    run replaces the earlier fo-dicom fixture pass, which predated the 9/7 gain
@@ -159,4 +159,8 @@ assignments.
 The native matrix results above predate the `radicom 0.3` upgrades. These upgrades
 re-run the portable workspace tests, including HTJ2K boundary checks, without
 claiming a new native-reference matrix run.
+
+Fresh performance and interoperability acceptance uses the dedicated
+[HTJ2K workflow](../development/codec-performance-validation.md#htj2k-workflow),
+including structural inspection of padding and a shared decode input.
 

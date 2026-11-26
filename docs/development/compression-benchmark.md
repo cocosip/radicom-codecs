@@ -1,6 +1,7 @@
 # Compression-speed benchmark
 
-For the real-DICOM comparison against fo-dicom.Codecs and the current optimization checkpoint, see [DICOM 编解码器性能测试与续跑记录](codec-performance-handoff.md).
+For the real-DICOM Pixel Data benchmark and acceptance rules, see
+[DICOM Codec Performance and Validation](codec-performance-validation.md).
 
 `radicom-bench` reports how fast each transfer syntax encodes and decodes. It is
 a development tool shipped in the internal `radicom-codecs-tool` crate; it is not
@@ -32,7 +33,7 @@ cargo run --release -p radicom-codecs-tool --bin radicom-bench
   the median is reported. A warm-up of 500 ms or more reduces the count to three,
   and 2 s or more to one run, so the 3328x4096 image does not turn a run into a
   coffee break.
-- Single-threaded. Both the codecs and the driver run on one core.
+- Single-threaded codec calls. Set CPU affinity externally when comparing runs.
 - Release builds only. The binary refuses to run with `debug_assertions`, where
   the numbers are meaningless.
 - Absolute numbers are machine-specific. The relative ordering between syntaxes
@@ -64,15 +65,16 @@ clinical realism.
   `radicom-compress`.
 - `--runs <n>` overrides the maximum timed runs (default 5).
 
-No `.dcm` file is committed. The generator is the source of truth, and real
-corpora stay in the git-ignored `.interop/bench/corpus/` directory.
+Supply real DICOM files locally. The synthetic generator is tracked in
+[radicom-bench.rs](../../crates/radicom-codecs-tool/src/bin/radicom-bench.rs).
+Keep private corpora and generated results outside version control.
 
 ## Reference run
 
 Machine: Intel Core Ultra 9 185H (16 cores, 22 threads), Windows 11
 10.0.26300, rustc 1.99.1, release build. Commit `216a565` plus the uncommitted
-benchmark change, 2026-11-26. Raw output:
-`.interop/bench/results/2026-11-26-216a565.txt` (git-ignored).
+benchmark change, 2026-11-26. The output below is retained as a historical
+snapshot. Re-run the tracked tool to measure the current implementation.
 
 ```
 machine: windows x86_64, 22 logical cores, release
@@ -158,112 +160,24 @@ Reading the table:
 - Sequential JPEG only accepts 8-bit Process 1 or 8/12-bit Process 2/4, so the
   16-bit rows report `unsupported`; that is the support matrix, not a failure.
 
-## Classic JPEG 2000 lossless encoder optimization
-
-Windows x86-64, Intel Core Ultra 9 185H, rustc 1.99.1. The table compares
-baseline `a4fd569` with the optimized encoder using the same release build
-settings and synthetic inputs. Six pairs of `radicom-bench --format
-j2k_lossless --runs 3` runs alternated order, with both binaries pinned to the
-same logical CPU. Values are the median of the six reported encode times for
-each build. The tool retains its adaptive sampling for slow cases.
-
-| Input | Baseline | Optimized | Time saved |
-|---|---:|---:|---:|
-| CT 512x512 | 59.6 ms | 55.0 ms | 7.8% |
-| CR 2048x2048 | 706.1 ms | 594.7 ms | 15.8% |
-| MG 3328x4096 | 2703.3 ms | 1991.4 ms | 26.3% |
-| US 640x480 RGB | 80.4 ms | 67.8 ms | 15.7% |
-| SC 1024x768 | 89.3 ms | 67.2 ms | 24.7% |
-
-OpenJPEG 2.5.4 produced identical codestream bytes for seven reversible cases
-and one irreversible case with matching parameters. Reversible cases covered
-the CT, CR and MG inputs plus odd-sized 8-bit monochrome, signed 12-bit
-monochrome, RGB without MCT and a constant image. Both decoders recovered the
-same samples on the reversible cases. The native timing boundary is separate
-from `radicom-bench` because `opj_compress` includes raw input and output I/O.
-
-### Tier-1 stripe traversal
-
-The follow-up specializes complete four-row stripes in the significance and
-magnitude-refinement passes. A column without candidates skips all four
-samples. Edge stripes retain the same scan order with one to three rows.
-
-The memory-to-memory comparison uses the same Windows machine and CPU affinity,
-with six timed samples per encoder and input after warmup. Both codecs use one
-thread, reversible 5/3, 64×64 code blocks, six resolutions, and eight LRCP
-quality layers. Times are medians in milliseconds.
-
-| Synthetic input | Rust `ae78a46` | Rust with stripe traversal | OpenJPEG 2.5.4 DLL |
-|---|---:|---:|---:|
-| CT 512×512 | 53.20 | 49.24 | 41.72 |
-| CR 2048×2048 | 582.33 | 543.01 | 482.32 |
-| MG 3328×4096 | 1944.46 | 1787.96 | 1654.67 |
-
-All three codestreams matched byte for byte. In a locally instrumented MSVC
-build of the OpenJPEG source, the largest difference was Tier-1, including
-coefficient preparation and pass coding. Layer allocation, including trial
-packet measurement, was the next largest difference. Rust's 5/3 DWT took
-0.29, 7.63, and 30.11 ms against 0.42, 10.43, and 68.03 ms in that build.
-The locally compiled build has different total times from the DLL. The raw
-timings are in `.interop/bench/j2k-optimization/timing-round2.txt`. These
-measurements cover synthetic images and the native library entry point.
-
-### Packed stripe flags and MQ probability exchange
-
-The encoder stores each stripe column's significance neighborhood, visited
-flags, and refinement flags in one word. It uses the packed masks to skip
-ineligible samples and writes MQ decisions in codestream order. The MQ encoder
-uses a shared interval selection for the most and least probable symbols.
-
-Two independent runs used the same single-thread, in-memory comparison above,
-without stage timers. This table reports the second run's medians.
-
-| Synthetic input | Rust | OpenJPEG 2.5.4 DLL | Rust time saved |
-|---|---:|---:|---:|
-| CT 512×512 | 37.45 ms | 42.28 ms | 11.4% |
-| CR 2048×2048 | 445.08 ms | 484.60 ms | 8.2% |
-| MG 3328×4096 | 1400.62 ms | 1727.95 ms | 18.9% |
-
-Rust used less time on all three inputs in both runs. Seven reversible cases
-and one irreversible case matched the OpenJPEG 2.5.4 codestreams byte for byte.
-Both decoders reproduced every input sample in the reversible cases. The
-timing and interop logs are in `.interop/bench/j2k-optimization/` as
-`timing-packed-mq-final.txt`, `timing-packed-mq-repeat.txt`, and
-`interop-packed-mq.txt`.
-
-The fo-dicom.Codecs 5.16.7 DICOM transcoder check used a replacement harness
-because the original local scripts were unavailable. Across 21 synthetic
-inputs and transfer syntax combinations, the optimized Rust encoder matched
-`ae78a46` byte for byte. All successful Rust decodes also matched that
-baseline sample for sample. The 64×48 HTJ2K cases matched the reference
-decoder in both directions. The expanded cases reproduced two existing
-limitations: one signed 12-bit fo-dicom lossless JPEG 2000 codestream yields
-8,796 of 17,685 samples differing from the source by one, and three
-197×151 fo-dicom HTJ2K codestreams lack an EOC marker. Both Rust builds reject
-those three codestreams. On the Rust-produced 197×151 lossy HTJ2K codestream,
-Rust and fo-dicom differ by at most one sample value. The details are in
-`.interop/bench/j2k-optimization/dicom-check/`.
-
 ## Comparing with other implementations
 
-Give every implementation the same input and the same boundaries:
+Follow [DICOM Codec Performance and Validation](codec-performance-validation.md)
+for native-reference acceptance. It specifies raw frame extraction, matching
+codec parameters, serial single-thread execution, shared codestreams, byte
+comparisons, and the 5% performance limit.
 
-1. `--dump <dir>` the raw frames once, or use your own real `.dcm` corpus.
-2. Feed those bytes to the reference tool's dataset-to-codestream path (for
-   fo-dicom, `TranscodeDataset`; for OpenJPEG, `opj_compress` on a PGM/PPM built
-   from the same frame).
-3. Measure encode only, not process startup, file parsing or I/O. If a reference
-   tool only offers a CLI, time it end to end and subtract a baseline run on an
-   empty input of the same size, or compare throughput per pixel rather than
-   wall-clock milliseconds.
-
-The `.interop` interop matrices already drive the reference implementations for
-correctness; reuse their harnesses when speed and output must be compared on the
-same codestream.
+The dataset benchmark includes dataset copying and Pixel Data assembly.
+A direct frame comparison must use matching operation boundaries and record
+allocation and color-processing costs for both implementations. Use codec
+library calls on preloaded buffers to exclude process startup and file I/O.
 
 ## Updating these numbers
 
-Rerun before a release, save the console output under
-`.interop/bench/results/<date>-<commit>.txt`, and update the table above and the
-summary in the root README. Do not add timing assertions to CI: shared runners
-and debug test builds make those either flaky or meaningless.
+Re-run the tracked tool and record the source revision, machine, parameters,
+and timing method alongside any published measurements. Keep local logs and
+private inputs outside version control. Reference results included in this
+document should be understandable from the document itself.
+
+The current acceptance procedure is defined in the validation document linked
+above. Timing assertions are unsuitable for shared CI runners.

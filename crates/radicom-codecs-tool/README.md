@@ -46,28 +46,30 @@ in a directory named:
 Example:
 
 ```text
-D:\dicom\study1.dcm
-D:\dicom\study1_compressed\
+input/study1.dcm
+input/study1_compressed/
 ```
 
 ## Examples
 
 Compress one file to all formats using the default output directory:
 
+The examples use a local input file supplied at `input/study1.dcm`.
+
 ```powershell
-cargo run -p radicom-codecs-tool --bin radicom-compress -- "D:\dicom\study1.dcm"
+cargo run -p radicom-codecs-tool --bin radicom-compress -- "input/study1.dcm"
 ```
 
 Compress one file into an explicit output directory:
 
 ```powershell
-cargo run -p radicom-codecs-tool --bin radicom-compress -- "D:\dicom\study1.dcm" --output-dir "D:\dicom\study1-compressed"
+cargo run -p radicom-codecs-tool --bin radicom-compress -- "input/study1.dcm" --output-dir "output/study1"
 ```
 
 Compress only to JPEG-LS Lossless:
 
 ```powershell
-cargo run -p radicom-codecs-tool --bin radicom-compress -- "D:\dicom\study1.dcm" -o "D:\dicom\out" --format jpegls_lossless
+cargo run -p radicom-codecs-tool --bin radicom-compress -- "input/study1.dcm" -o "output" --format jpegls_lossless
 ```
 
 Print help:

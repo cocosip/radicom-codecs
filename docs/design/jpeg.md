@@ -126,6 +126,8 @@ round-trips through the same path as unsigned input. `YBR_ICT`, `YBR_RCT`, CMYK,
 and YCCK are rejected for classic JPEG.
 
 For lossy RGB encoding, the implementation converts RGB to full-range YCbCr.
+The codec's default parameters select 4:2:2 for color encoding and RGB
+output on decoding, matching the fo-dicom TurboJPEG wrapper.
 `sample_factor = Full` emits `YBR_FULL`; `sample_factor = Half` emits
 `YBR_FULL_422`. Decoding accepts every sampling factor set that T.81 allows
 (`H_i`,`V_i` in `1..=4`, each dividing the frame maximum) because such streams
@@ -169,7 +171,7 @@ must be deterministic and must agree with the bytes written to the destination.
 | --- | --- | --- |
 | `quality` | Quantization quality for Process 1/2/4 | `0..=100`; ignored by Process 14 |
 | `smoothing_factor` | Pre-encoding input smoothing | `0..=100`; ignored by Process 14. Ported bit for bit from libjpeg-turbo `jcsample.c`: `fullsize_smooth_downsample` for undownsampled components and `h2v2_smooth_downsample` for 2×2 chroma. Those are the only two smoothing kernels libjpeg has — for 2×1 and other integer ratios it sets `smoothok = FALSE` and logs `JTRC_SMOOTH_NOTIMPL`, so a 4:2:2 encode smooths luma only, exactly like libjpeg/fo-dicom |
-| `convert_colorspace_to_rgb` | Decode YCbCr/RGB as RGB | reject for signed samples |
+| `convert_colorspace_to_rgb` | Decode YCbCr as RGB | Same stored-bit color arithmetic as TurboJPEG |
 | `sample_factor` | Chroma sampling on encode | `Full` = 4:4:4, `Half` = 4:2:2; lossless forces 4:4:4. Decode additionally accepts any T.81 factor set (4:2:0, 4:1:1, 4:4:0, …) |
 | `predictor` | Process 14 predictor selection | `1..=7`; SV1 requires `1` and rejects anything else |
 | `point_transform` | Right shift before predictive coding | must be smaller than the sample precision; SV1 (`.70`) requires `0` |
@@ -271,20 +273,25 @@ operations exactly. Restart intervals reset the predictor state at MCU
 boundaries. No DCT, quantization, smoothing, or chroma subsampling is permitted
 on this path.
 
-The encoder sizes its Huffman tables from the image itself: it walks the
-prediction differences or DCT symbols first, builds the optimal canonical tables
-with the T.81 K.2 merge algorithm (the same procedure libjpeg runs under
-`optimize_coding = TRUE`), and writes each table as its own DHT segment in
-libjpeg order (`DC0`, `AC0`, then any chroma tables). The fixed Annex K table
-costs about 50% more on real images, which is why the encoder always optimizes;
-the decoder is unchanged because it already accepts any DHT. The marker layout
+The public 8-bit sequential encoder uses the T.81 Annex K Huffman tables like
+TurboJPEG. Higher-precision sequential frames and lossless frames collect
+frequencies and use the T.81 K.2 merge algorithm. Each table is written as its own
+DHT segment in libjpeg order (`DC0`, `AC0`, then any chroma tables).
+The marker layout
 also follows libjpeg byte for byte: SOF0 for 8-bit data and SOF1 for 12-bit,
 only the DQT tables a component references, the JFIF APP0 segment for gray and
 YCbCr streams (Adobe APP14 for RGB, none for an unknown colour space), and the
 component identifiers and table selectors `jccolor.c`/`jcmarker.c` derive for
-that colour space. The forward transform is `jfdctint.c`'s integer ISLOW
-algorithm and quantization is `jcdctmgr.c`'s reciprocal/`DESCALE` path, not an
-ideal floating-point DCT, because the reference encoder is libjpeg-turbo.
+that colour space. The encoder uses `jfdctint.c`'s integer ISLOW transform and
+`jcdctmgr.c`'s reciprocal quantization. The decoder uses `jidctint.c`'s integer
+ISLOW inverse transform with the corresponding 8- and 12-bit pass shifts.
+The decoder writes only visible samples from partially visible edge blocks.
+On x86-64, the transform and RGB conversion select AVX2 at run time. The
+specialized entropy loop also checks for BMI2. Other CPUs use the scalar
+transforms and entropy loop. Contiguous native Pixel Data can be decoded
+directly into byte samples or little-endian word samples. Planar destinations,
+packed 4:2:2, and RGB conversion use the decoded component samples to build
+their destination layout.
 
 ## 7. Error and resource rules
 
@@ -375,9 +382,8 @@ without updating this document first.
 - The built fo-dicom native decoder accepts Rust output for all four transfer
   syntaxes. Process 1 and Process 2/4 decode with lossy sample deltas bounded by
   the fixtures, and Process 14/SV1 are byte-exact, including 16-bit SV1.
-- A Baseline fixture carrying DRI/RST restart markers decodes to the same
-  samples as the reference decoder; the residual differences are `±1` IDCT
-  rounding on 48 of 3,072 samples, not restart-state errors.
+- Baseline DRI/RST restart markers are covered by portable regression tests.
+  The integer inverse transform uses libjpeg's ISLOW rounding.
 - `PALETTE COLOR` round-trips byte-exactly through `.57`, `.70`, and `.80` in
   both directions, and the sequential syntaxes code the index plane with the
   Photometric Interpretation preserved.
@@ -388,16 +394,12 @@ without updating this document first.
   upsampling (`h2v1`) during its RGB conversion; the decoder follows libjpeg-turbo
   `jdsample.c` (even columns `(3*c[j] + c[j-1] + 1) >> 2`, odd columns
   `(3*c[j] + c[j+1] + 2) >> 2`, edges clamped), which brings the RGB comparison to
-  `max=4` on the `PM5644` fixture — the same residual the 4:4:4 control shows
-  without any upsampling, i.e. remaining deltas come from the IDCT and the
-  fixed-point colour conversion, not from the filter. Before the filter the same
-  comparison was `max=78`. The packed `YBR_FULL_422` decode path (no RGB
-  conversion) is unchanged and byte-exact.
-- The DICOM-level fo-dicom.Codecs matrix (`.interop/run_matrix.sh` driving
-  `.interop/dicomref`) agrees in both directions: `.57` (16-bit) and `.70`
-  (12 bits stored in 16) are sample-exact, and `.50` (8-bit) and `.51`
-  (12 bits stored in 16) stay within one sample of fo-dicom's own decode of the
-  same codestream.
+  the reference pixel values. Color conversion uses the fixed-point
+  coefficients and rounding of libjpeg's `jdcolor.c`.
+- Native-reference acceptance for `.50`, `.51`, `.57`, and `.70` follows
+  [DICOM Codec Performance and Validation](../development/codec-performance-validation.md).
+  Check encoded bytes before using the shared stream to compare decoded
+  Pixel Data and timing through both implementations.
 - `smoothing_factor` parity with libjpeg is sample-exact: at `quality=100` a
   monochrome encode with `smoothing=50` decodes (DCMTK) within `max=1` of the
   unsmoothed stream — the same bound as `smoothing=0` — while the codestream
