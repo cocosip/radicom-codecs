@@ -73,6 +73,33 @@ global state, use `radicom_codecs::codec_registry()`.
 | HTJ2K Lossless RPCL | `1.2.840.10008.1.2.4.202` | `radicom-codecs-jpeg2000` |
 | HTJ2K Lossy | `1.2.840.10008.1.2.4.203` | `radicom-codecs-jpeg2000` |
 
+## Performance
+
+`radicom-bench` measures encode/decode speed per transfer syntax on
+deterministic synthetic images (`--corpus` switches to real `.dcm` files).
+Median encode and decode on the 512x512 signed 16-bit CT image, on one Intel
+Core Ultra 9 185H / Windows 11 machine, release build, 2026-11-26:
+
+| Transfer syntax | Encode MB/s | Ratio | Decode MB/s |
+|---|---|---|---|
+| RLE Lossless | 210.1 | 0.84 | 371.4 |
+| JPEG Lossless Process 14 | 56.1 | 0.71 | 45.0 |
+| JPEG Lossless Process 14 SV1 | 57.9 | 0.71 | 42.0 |
+| JPEG-LS Lossless | 12.2 | 0.64 | 12.4 |
+| JPEG-LS Near-Lossless | 11.6 | 0.50 | 12.2 |
+| JPEG 2000 Lossless | 9.2 | 0.64 | 8.7 |
+| JPEG 2000 Lossy | 8.4 | 0.06 | 46.5 |
+| HTJ2K Lossless | 81.8 | 0.65 | 114.6 |
+| HTJ2K Lossless RPCL | 82.9 | 0.65 | 116.5 |
+| HTJ2K Lossy | 71.2 | 0.67 | 92.7 |
+
+Sequential JPEG needs 8-bit (Process 1) or 8/12-bit (Process 2/4) samples, so it
+does not apply to this 16-bit image. MB/s is raw pixel bytes per second;
+`ratio` is compressed bytes over raw bytes. These are machine-specific snapshot
+numbers, not guarantees: see
+[docs/development/compression-benchmark.md](docs/development/compression-benchmark.md)
+for the full matrix, the method and the caveats.
+
 ## Workspace layout
 
 | Crate | Contents |

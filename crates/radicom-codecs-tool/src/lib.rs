@@ -183,7 +183,7 @@ pub fn compress(
             });
             continue;
         }
-        let params = effective_params(&target);
+        let params = params_for(&target);
         let (status, output_size, message) = match transcode_one(
             file,
             &source_uid,
@@ -274,7 +274,10 @@ fn unsupported_reason(target: &TargetFormat, pixel: &PixelDataRef<'_>) -> Option
 /// Parameters that make the tool's output match the fo-dicom reference: the
 /// codec defaults for sequential JPEG (4:4:4, quality 90), and the component
 /// transform plus rate levels for JPEG 2000.
-fn effective_params(target: &TargetFormat) -> Option<CodecParams> {
+///
+/// Public so the benchmark binary measures the same parameter policy the CLI
+/// ships instead of duplicating it.
+pub fn params_for(target: &TargetFormat) -> Option<CodecParams> {
     if target.params.is_some() {
         return target.params.clone();
     }
@@ -314,7 +317,7 @@ fn transcode_one(
 }
 
 /// Every target, or the one whose suffix matches `format` (case-insensitive).
-fn select_formats(format: Option<&str>) -> Result<Vec<TargetFormat>, Error> {
+pub fn select_formats(format: Option<&str>) -> Result<Vec<TargetFormat>, Error> {
     let all = target_formats();
     let Some(suffix) = format else {
         return Ok(all);
@@ -347,5 +350,30 @@ fn resolve_output_dir(input: &Path, output_dir: Option<&Path>) -> PathBuf {
     match input.parent() {
         Some(parent) => parent.join(format!("{stem}_compressed")),
         None => PathBuf::from(format!("{stem}_compressed")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_a_single_format_case_insensitively() {
+        let selected = select_formats(Some("J2K_LOSSLESS")).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].suffix, "j2k_lossless");
+        assert!(select_formats(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn jpeg2000_lossy_uses_rate_sixteen() {
+        let target = target_formats()
+            .into_iter()
+            .find(|target| target.suffix == "j2k_lossy")
+            .expect("j2k_lossy target");
+        match params_for(&target) {
+            Some(CodecParams::Jpeg2000(params)) => assert_eq!(params.rate, 16),
+            other => panic!("expected J2K params, got {other:?}"),
+        }
     }
 }

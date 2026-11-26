@@ -145,6 +145,26 @@ For input file `study1.dcm`, output names include:
 - The SOP Class UID and SOP Instance UID are preserved from the source, like
   the `fo-dicom.PureCodecs.Tools` reference tool.
 
+## Benchmarking
+
+`radicom-bench` measures encode and decode speed for the same twelve transfer
+syntaxes:
+
+```powershell
+cargo run --release -p radicom-codecs-tool --bin radicom-bench
+```
+
+It times `Dataset::clone_with_syntax` (dataset to codestream, plus the matching
+decode) on deterministic synthetic images, and reports the median milliseconds,
+throughput in MB/s of raw pixel data and the compression ratio. `--corpus <dir>`
+runs on uncompressed `.dcm` files instead, `--dump <dir>` exports the raw frames
+for comparison with other codecs, and `--format <suffix>` limits the run to one
+target.
+
+The binary refuses debug builds and is not part of CI: the numbers are
+machine-specific. Methodology, caveats and a reference run are in
+[the benchmark document](../../docs/development/compression-benchmark.md).
+
 ## Exit Codes
 
 | Exit code | Meaning |

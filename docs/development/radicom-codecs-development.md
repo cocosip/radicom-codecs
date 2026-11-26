@@ -186,6 +186,14 @@ syntaxes must also reproduce the source exactly. Results
 in both directions. `.50` and `.51` (12 stored in 16) agree within one sample,
 and `.91` (8 and 12) within two.
 
+### Compression-speed benchmark
+
+`cargo run --release -p radicom-codecs-tool --bin radicom-bench` times encode
+and decode for every transfer syntax on deterministic synthetic images;
+`--corpus <dir>` uses uncompressed DICOM files instead. The method, caveats and
+the reference matrix are in
+[compression-benchmark.md](compression-benchmark.md).
+
 ## Next implementation stages
 
 1. **Broader JPEG 2000/HTJ2K coverage:** HTJ2K refinement passes/quality layers
