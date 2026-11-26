@@ -118,31 +118,26 @@ impl MqEncoder {
 
     #[inline]
     pub(crate) fn encode(&mut self, bit: bool, context: usize) {
-        let cx = self.contexts[context];
-        let mps = cx & 0x1_0000 != 0;
-        let qe = cx & 0xFFFF;
-        self.a -= qe;
-        if bit == mps {
-            if self.a & 0x8000 == 0 {
-                if self.a < qe {
-                    self.a = qe;
-                } else {
-                    self.c += qe;
-                }
-                self.contexts[context] = ENCODE_STATES[((cx >> 17) & 0x7F) as usize];
-                self.renorm();
-            } else {
-                self.c += qe;
-            }
-        } else {
-            if self.a < qe {
-                self.c += qe;
-            } else {
-                self.a = qe;
-            }
-            self.contexts[context] = ENCODE_STATES[(cx >> 24) as usize];
-            self.renorm();
+        let state = self.contexts[context];
+        let lps = bit != (state & 0x1_0000 != 0);
+        let qe = state & 0xffff;
+        let interval = self.a - qe;
+        self.a = interval;
+        if !lps && interval >= 0x8000 {
+            self.c += qe;
+            return;
         }
+        // With a reduced interval below Qe, MPS and LPS exchange subintervals.
+        let select_qe = lps ^ (interval < qe);
+        self.a = if select_qe { qe } else { interval };
+        self.c += if select_qe { 0 } else { qe };
+        let next = if lps {
+            state >> 24
+        } else {
+            (state >> 17) & 0x7f
+        };
+        self.contexts[context] = ENCODE_STATES[next as usize];
+        self.renorm();
     }
 
     fn renorm(&mut self) {
@@ -306,6 +301,24 @@ impl<'a> MqDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probability_exchange_preserves_interval_and_context_transition() {
+        for (initial_a, bit, expected_a, expected_c, expected_state) in [
+            (0x8000, false, 0xac02, 0, 2),
+            (0x8000, true, 0xa7fc, 0x15804, 3),
+            (0xc000, false, 0xd3fe, 0xac02, 2),
+            (0xc000, true, 0xac02, 0, 3),
+            (0xd601, false, 0x8000, 0x5601, 0),
+        ] {
+            let mut encoder = MqEncoder::new();
+            encoder.a = initial_a;
+            encoder.encode(bit, 1);
+            assert_eq!(encoder.a, expected_a);
+            assert_eq!(encoder.c, expected_c);
+            assert_eq!(encoder.contexts[1], ENCODE_STATES[expected_state]);
+        }
+    }
 
     #[test]
     fn round_trips_a_mixed_decision_stream() {

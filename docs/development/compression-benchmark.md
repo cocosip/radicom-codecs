@@ -180,6 +180,68 @@ monochrome, RGB without MCT and a constant image. Both decoders recovered the
 same samples on the reversible cases. The native timing boundary is separate
 from `radicom-bench` because `opj_compress` includes raw input and output I/O.
 
+### Tier-1 stripe traversal
+
+The follow-up specializes complete four-row stripes in the significance and
+magnitude-refinement passes. A column without candidates skips all four
+samples. Edge stripes retain the same scan order with one to three rows.
+
+The memory-to-memory comparison uses the same Windows machine and CPU affinity,
+with six timed samples per encoder and input after warmup. Both codecs use one
+thread, reversible 5/3, 64×64 code blocks, six resolutions, and eight LRCP
+quality layers. Times are medians in milliseconds.
+
+| Synthetic input | Rust `ae78a46` | Rust with stripe traversal | OpenJPEG 2.5.4 DLL |
+|---|---:|---:|---:|
+| CT 512×512 | 53.20 | 49.24 | 41.72 |
+| CR 2048×2048 | 582.33 | 543.01 | 482.32 |
+| MG 3328×4096 | 1944.46 | 1787.96 | 1654.67 |
+
+All three codestreams matched byte for byte. In a locally instrumented MSVC
+build of the OpenJPEG source, the largest difference was Tier-1, including
+coefficient preparation and pass coding. Layer allocation, including trial
+packet measurement, was the next largest difference. Rust's 5/3 DWT took
+0.29, 7.63, and 30.11 ms against 0.42, 10.43, and 68.03 ms in that build.
+The locally compiled build has different total times from the DLL. The raw
+timings are in `.interop/bench/j2k-optimization/timing-round2.txt`. These
+measurements cover synthetic images and the native library entry point.
+
+### Packed stripe flags and MQ probability exchange
+
+The encoder stores each stripe column's significance neighborhood, visited
+flags, and refinement flags in one word. It uses the packed masks to skip
+ineligible samples and writes MQ decisions in codestream order. The MQ encoder
+uses a shared interval selection for the most and least probable symbols.
+
+Two independent runs used the same single-thread, in-memory comparison above,
+without stage timers. This table reports the second run's medians.
+
+| Synthetic input | Rust | OpenJPEG 2.5.4 DLL | Rust time saved |
+|---|---:|---:|---:|
+| CT 512×512 | 37.45 ms | 42.28 ms | 11.4% |
+| CR 2048×2048 | 445.08 ms | 484.60 ms | 8.2% |
+| MG 3328×4096 | 1400.62 ms | 1727.95 ms | 18.9% |
+
+Rust used less time on all three inputs in both runs. Seven reversible cases
+and one irreversible case matched the OpenJPEG 2.5.4 codestreams byte for byte.
+Both decoders reproduced every input sample in the reversible cases. The
+timing and interop logs are in `.interop/bench/j2k-optimization/` as
+`timing-packed-mq-final.txt`, `timing-packed-mq-repeat.txt`, and
+`interop-packed-mq.txt`.
+
+The fo-dicom.Codecs 5.16.7 DICOM transcoder check used a replacement harness
+because the original local scripts were unavailable. Across 21 synthetic
+inputs and transfer syntax combinations, the optimized Rust encoder matched
+`ae78a46` byte for byte. All successful Rust decodes also matched that
+baseline sample for sample. The 64×48 HTJ2K cases matched the reference
+decoder in both directions. The expanded cases reproduced two existing
+limitations: one signed 12-bit fo-dicom lossless JPEG 2000 codestream yields
+8,796 of 17,685 samples differing from the source by one, and three
+197×151 fo-dicom HTJ2K codestreams lack an EOC marker. Both Rust builds reject
+those three codestreams. On the Rust-produced 197×151 lossy HTJ2K codestream,
+Rust and fo-dicom differ by at most one sample value. The details are in
+`.interop/bench/j2k-optimization/dicom-check/`.
+
 ## Comparing with other implementations
 
 Give every implementation the same input and the same boundaries:

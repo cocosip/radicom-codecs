@@ -1,9 +1,8 @@
 //! Classic JPEG 2000 EBCOT Tier-1 coding (ISO/IEC 15444-1 Annex D).
 //!
-//! The implementation follows the pure C# reference implementation's flag
-//! layout and context derivation. Coefficients are carried in a fixed-point
-//! representation with six fractional bits, exactly as the reference decoder
-//! expects; the public entry points return plain integer coefficients.
+//! The encoder stores flags in four-row stripes. The decoder uses per-sample
+//! flags. Both use coefficients with six fractional bits internally and
+//! derive MQ contexts from the same significance and sign rules.
 
 use crate::geometry::CodeBlockPass;
 use crate::mq::{MqDecoder, MqEncoder};
@@ -122,14 +121,6 @@ fn nmsedec_sig(value: u32, bitpos: i32) -> i32 {
     }
 }
 
-fn nmsedec_ref(value: u32, bitpos: i32) -> i32 {
-    if bitpos > 0 {
-        i32::from(LUT_NMSEDEC_REF[((value >> bitpos) & 0x7F) as usize])
-    } else {
-        i32::from(LUT_NMSEDEC_REF0[(value & 0x7F) as usize])
-    }
-}
-
 const SIG: u32 = 0x0001;
 const REFINED: u32 = 0x0002;
 const VISITED: u32 = 0x0004;
@@ -154,14 +145,14 @@ pub(crate) const CTX_MAG: usize = 14;
 pub(crate) const CTX_RUN: usize = 17;
 pub(crate) const CTX_UNIFORM: usize = 18;
 
-const ZERO_CONTEXTS: [[u8; 256]; 4] = {
-    let mut table = [[0; 256]; 4];
+const ZERO_CONTEXTS: [[u8; 512]; 4] = {
+    let mut table = [[0; 512]; 4];
     let mut orientation = 0;
     while orientation < 4 {
         let mut neighbors = 0;
-        while neighbors < 256 {
+        while neighbors < 512 {
             table[orientation][neighbors] =
-                zero_context((neighbors as u32) << 4, orientation as u8) as u8;
+                zero_context(stripe_neighbors(neighbors as u32) << 4, orientation as u8) as u8;
             neighbors += 1;
         }
         orientation += 1;
@@ -216,13 +207,33 @@ pub(crate) fn decode_code_block(
     Ok(decoder.finish())
 }
 
+// One word tracks a four-sample column of a stripe. Bits 0..18 store a
+// 3-column by 6-row significance grid in row-major order, with one border row
+// above and below. The four interior center bits are the samples themselves.
+// Visited and refined flags mirror those center bits 14 and 15 bits higher.
+const STRIPE_SIG: u32 = 0b10010010010000;
+const STRIPE_VIS: u32 = STRIPE_SIG << 14;
+const NEIGHBORS: u32 = 0x1ef;
+
+const fn stripe_cardinal(flags: u32) -> u32 {
+    ((flags >> 1) & 1) | ((flags >> 6) & 2) | ((flags >> 1) & 4) | ((flags >> 2) & 8)
+}
+
+const fn stripe_neighbors(flags: u32) -> u32 {
+    stripe_cardinal(flags)
+        | ((flags & 1) << 4)
+        | ((flags & 4) << 3)
+        | (flags & 0x40)
+        | ((flags >> 1) & 0x80)
+}
+
 pub(crate) struct Tier1Encoder {
     width: usize,
     height: usize,
     stride: usize,
-    data: Vec<i32>,
+    data: Vec<[i32; 4]>,
     flags: Vec<u32>,
-    zero_contexts: &'static [u8; 256],
+    zero_contexts: &'static [u8; 512],
     style: u8,
     mq: MqEncoder,
     bit_plane: i32,
@@ -280,15 +291,18 @@ impl Tier1Encoder {
         self.zero_contexts = &ZERO_CONTEXTS[usize::from(orientation)];
         self.style = style;
         self.bit_plane = max_bit_plane;
-        let padded_len = self.stride * (height + 2);
-        self.data.resize(padded_len, 0);
+        let padded_len = self.stride * (height.div_ceil(4) + 2);
+        self.data.resize(padded_len, [0; 4]);
         self.flags.resize(padded_len, 0);
         self.flags.fill(0);
-        for (source, destination) in coefficients
-            .chunks_exact(width)
-            .zip(self.data.chunks_exact_mut(self.stride).skip(1))
-        {
-            destination[1..=width].copy_from_slice(source);
+        for (stripe, source) in coefficients.chunks(width * 4).enumerate() {
+            let first = self.index(0, stripe);
+            let destination = &mut self.data[first..first + width];
+            for (row, source) in source.chunks_exact(width).enumerate() {
+                for (column, &value) in destination.iter_mut().zip(source) {
+                    column[row] = value;
+                }
+            }
         }
         self.mq.restart(coefficients.len() * bit_count as usize / 8);
         let pass_count = (bit_count * 3 - 2) as u32;
@@ -370,147 +384,174 @@ impl Tier1Encoder {
     }
 
     fn encode_sigpass(&mut self) {
-        for stripe in (0..self.height).step_by(4) {
-            let rows = (self.height - stripe).min(4);
+        for stripe in 0..self.height.div_ceil(4) {
+            let rows = (self.height - stripe * 4).min(4);
             let first = self.index(0, stripe);
-            for x in 0..self.width {
-                let start = first + x;
-                for dy in 0..rows {
-                    let index = start + dy * self.stride;
-                    let flags = self.flags[index];
-                    if flags & SIG != 0 || flags & SIG_NEIGHBORS == 0 {
+            if rows == 4 {
+                for index in first..first + self.width {
+                    if self.flags[index] == 0 {
                         continue;
                     }
-                    let significant = self.magnitude_bit(index);
-                    let context = self.zero_contexts[((flags >> 4) & 0xff) as usize];
-                    self.mq.encode(significant, usize::from(context));
-                    self.flags[index] |= VISITED;
-                    if significant {
-                        self.set_significant(dy, index, false);
+                    self.sig_sample(index, 0);
+                    self.sig_sample(index, 1);
+                    self.sig_sample(index, 2);
+                    self.sig_sample(index, 3);
+                }
+            } else {
+                for index in first..first + self.width {
+                    for row in 0..rows {
+                        self.sig_sample(index, row);
                     }
                 }
             }
+        }
+    }
+
+    #[inline(always)]
+    fn sig_sample(&mut self, index: usize, row: usize) {
+        let shift = row * 3;
+        let neighbors = self.flags[index] >> shift;
+        if neighbors & 0x10 != 0 || neighbors & NEIGHBORS == 0 {
+            return;
+        }
+        let significant = self.magnitude_bit(index, row);
+        self.mq.encode(
+            significant,
+            usize::from(self.zero_contexts[(neighbors & 511) as usize]),
+        );
+        self.flags[index] |= 1 << (18 + shift);
+        if significant {
+            self.set_significant(index, row, false);
         }
     }
 
     fn encode_refpass(&mut self) {
-        for stripe in (0..self.height).step_by(4) {
-            let rows = (self.height - stripe).min(4);
-            let first = self.index(0, stripe);
-            for x in 0..self.width {
-                let start = first + x;
-                for dy in 0..rows {
-                    let index = start + dy * self.stride;
-                    let flags = self.flags[index];
-                    if flags & SIG == 0 || flags & VISITED != 0 {
-                        continue;
-                    }
-                    self.nmsedec += nmsedec_ref(
-                        self.data[index].unsigned_abs(),
-                        self.bit_plane - FRACTIONAL_BITS,
-                    );
-                    self.mq
-                        .encode(self.magnitude_bit(index), magnitude_context(flags));
-                    self.flags[index] |= REFINED;
-                }
+        let bpno = self.bit_plane - FRACTIONAL_BITS;
+        let nmsedec = if bpno == 0 {
+            &LUT_NMSEDEC_REF0
+        } else {
+            &LUT_NMSEDEC_REF
+        };
+        let shift = self.bit_plane;
+        let end = self.index(0, self.height.div_ceil(4)) - self.stride + self.width;
+        let first = self.index(0, 0);
+        for (flags, data) in self.flags[first..end]
+            .iter_mut()
+            .zip(&self.data[first..end])
+        {
+            let mut candidates = *flags & !(*flags >> 14) & STRIPE_SIG;
+            if candidates == 0 {
+                continue;
             }
+            let refined = candidates << 15;
+            while candidates != 0 {
+                let row = (candidates.trailing_zeros() - 4) as usize / 3;
+                candidates &= candidates - 1;
+                let value = data[row].unsigned_abs();
+                let row_flags = *flags >> (row * 3);
+                let context = if row_flags & (1 << 19) != 0 {
+                    CTX_MAG + 2
+                } else {
+                    CTX_MAG + usize::from(row_flags & NEIGHBORS != 0)
+                };
+                self.nmsedec += i32::from(nmsedec[((value >> bpno) & 127) as usize]);
+                self.mq.encode(value & (1 << shift) != 0, context);
+            }
+            *flags |= refined;
         }
     }
 
     fn encode_cleanup(&mut self) {
-        for stripe in (0..self.height).step_by(4) {
-            let rows = (self.height - stripe).min(4);
+        for stripe in 0..self.height.div_ceil(4) {
+            let rows = (self.height - stripe * 4).min(4);
+            let valid = STRIPE_SIG & ((1 << (rows * 3 + 2)) - 1);
+            let full = rows == 4;
             let first = self.index(0, stripe);
-            for x in 0..self.width {
-                let start = first + x;
-                let mut eligible = rows == 4;
-                let mut run_length = -1i32;
-                if eligible {
-                    for dy in 0..4 {
-                        let flags = self.flags[start + dy * self.stride];
-                        if flags & (VISITED | SIG | SIG_NEIGHBORS) != 0 {
-                            eligible = false;
-                            break;
-                        }
-                    }
+            for index in first..first + self.width {
+                let flags = self.flags[index];
+                let mut candidates = !(flags | (flags >> 14)) & valid;
+                if candidates == 0 {
+                    self.flags[index] = flags & !STRIPE_VIS;
+                    continue;
                 }
-                if eligible {
-                    for dy in 0..4 {
-                        if self.magnitude_bit(start + dy * self.stride) {
-                            run_length = dy as i32;
-                            break;
-                        }
-                    }
-                    self.mq.encode(run_length >= 0, CTX_RUN);
-                    if run_length < 0 {
+                if full && flags == 0 {
+                    let column = self.data[index];
+                    let run = column
+                        .iter()
+                        .position(|v| v.unsigned_abs() & (1 << self.bit_plane) != 0);
+                    self.mq.encode(run.is_some(), CTX_RUN);
+                    let Some(row) = run else {
                         continue;
-                    }
-                    self.mq.encode((run_length >> 1) & 1 != 0, CTX_UNIFORM);
-                    self.mq.encode(run_length & 1 != 0, CTX_UNIFORM);
+                    };
+                    self.mq.encode(row & 2 != 0, CTX_UNIFORM);
+                    self.mq.encode(row & 1 != 0, CTX_UNIFORM);
+                    self.set_significant(index, row, self.style & 0x20 != 0);
+                    candidates &= valid << ((row + 1) * 3);
                 }
-                for dy in 0..rows {
-                    if eligible && (dy as i32) < run_length {
-                        continue;
-                    }
-                    let index = start + dy * self.stride;
-                    let flags = self.flags[index];
-                    if flags & VISITED != 0 || flags & SIG != 0 {
-                        self.flags[index] &= !VISITED;
-                        continue;
-                    }
-                    let mut significant = eligible && dy as i32 == run_length;
-                    if !significant {
-                        significant = self.magnitude_bit(index);
-                        let context = self.zero_contexts[((flags >> 4) & 0xff) as usize];
-                        self.mq.encode(significant, usize::from(context));
-                    }
+                while candidates != 0 {
+                    let offset = candidates.trailing_zeros() as usize - 4;
+                    let row = offset / 3;
+                    candidates &= candidates - 1;
+                    let significant = self.magnitude_bit(index, row);
+                    let pattern = ((self.flags[index] >> offset) & 511) as usize;
+                    self.mq
+                        .encode(significant, usize::from(self.zero_contexts[pattern]));
                     if significant {
-                        self.set_significant(dy, index, self.style & 0x20 != 0);
+                        self.set_significant(index, row, self.style & 0x20 != 0);
                     }
-                    self.flags[index] &= !VISITED;
                 }
+                self.flags[index] &= !STRIPE_VIS;
             }
         }
     }
 
-    fn set_significant(&mut self, row_in_stripe: usize, index: usize, uniform_sign: bool) {
-        self.nmsedec += nmsedec_sig(
-            self.data[index].unsigned_abs(),
-            self.bit_plane - FRACTIONAL_BITS,
-        );
-        let sign = self.data[index] < 0;
+    fn set_significant(&mut self, index: usize, row: usize, uniform_sign: bool) {
+        let data = self.data[index][row];
+        self.nmsedec += nmsedec_sig(data.unsigned_abs(), self.bit_plane - FRACTIONAL_BITS);
+        let negative = data < 0;
+        let shift = row * 3;
+        let flags = self.flags[index] >> shift;
         if uniform_sign {
-            // SEGSYM: signs of coefficients that become significant in the
-            // cleanup pass use the uniform context, without prediction.
-            self.mq.encode(sign, CTX_UNIFORM);
+            self.mq.encode(negative, CTX_UNIFORM);
         } else {
-            let flags = self.flags[index];
-            let key = ((flags >> 4) & 0xf) | (((flags >> 13) & 0xf) << 4);
+            let significance = stripe_cardinal(flags);
+            let north = if row == 0 {
+                self.data[index - self.stride][3]
+            } else {
+                self.data[index][row - 1]
+            };
+            let south = if row == 3 {
+                self.data[index + self.stride][0]
+            } else {
+                self.data[index][row + 1]
+            };
+            let signs = u32::from(north < 0)
+                | (u32::from(south < 0) << 1)
+                | (u32::from(self.data[index - 1][row] < 0) << 2)
+                | (u32::from(self.data[index + 1][row] < 0) << 3);
+            let key = significance | ((signs & significance) << 4);
             let (context, prediction) = SIGN_CONTEXTS[key as usize];
-            self.mq.encode(sign ^ prediction, usize::from(context));
+            self.mq.encode(negative ^ prediction, usize::from(context));
         }
-        self.flags[index] |= SIG;
-        self.update_neighbors(index, row_in_stripe, sign);
-    }
-
-    fn magnitude_bit(&self, index: usize) -> bool {
-        (self.data[index].unsigned_abs() >> self.bit_plane) & 1 != 0
-    }
-
-    fn update_neighbors(&mut self, index: usize, row_in_stripe: usize, negative: bool) {
-        let sign_mask = 0u32.wrapping_sub(u32::from(negative));
-        if !(self.style & 0x08 != 0 && row_in_stripe == 0) {
+        self.flags[index] |= 0x10 << shift;
+        self.flags[index - 1] |= 0x20 << shift;
+        self.flags[index + 1] |= 0x08 << shift;
+        if row == 0 && self.style & 0x08 == 0 {
             let north = index - self.stride;
-            self.flags[north] |= SIG_S | (sign_mask & SIGN_S);
-            self.flags[north - 1] |= SIG_SE;
-            self.flags[north + 1] |= SIG_SW;
+            self.flags[north - 1] |= 1 << 17;
+            self.flags[north] |= 1 << 16;
+            self.flags[north + 1] |= 1 << 15;
         }
-        let south = index + self.stride;
-        self.flags[south] |= SIG_N | (sign_mask & SIGN_N);
-        self.flags[south - 1] |= SIG_NE;
-        self.flags[south + 1] |= SIG_NW;
-        self.flags[index - 1] |= SIG_E | (sign_mask & SIGN_E);
-        self.flags[index + 1] |= SIG_W | (sign_mask & SIGN_W);
+        if row == 3 {
+            let south = index + self.stride;
+            self.flags[south - 1] |= 4;
+            self.flags[south] |= 2;
+            self.flags[south + 1] |= 1;
+        }
+    }
+
+    fn magnitude_bit(&self, index: usize, row: usize) -> bool {
+        self.data[index][row].unsigned_abs() & (1 << self.bit_plane) != 0
     }
 }
 
@@ -964,6 +1005,8 @@ mod tests {
             (1, 1, 0),
             (1, 17, 1),
             (17, 1, 2),
+            (11, 6, 0),
+            (11, 7, 1),
             (13, 9, 3),
             (32, 24, 1),
             (64, 64, 3),
