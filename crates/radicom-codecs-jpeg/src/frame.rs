@@ -1,6 +1,6 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
-use super::color::{rgb_to_ycc, JpegColorSpace};
+use super::color::{rgb8_to_ycc, rgb_to_ycc, JpegColorSpace};
 use super::lossless::{LosslessFrame, Selection};
 use super::sequential::{FrameExpectation, SequentialFrame};
 use radicom::error::{CodecError, Error};
@@ -385,12 +385,22 @@ pub(crate) fn encode_sequential(
         let bytes = frame
             .data()
             .map_err(|e| operation_error(codec, &format!("frame {i}: {e}")))?;
-        let mut samples = layout
-            .read_samples(bytes.as_ref())
-            .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?;
-        if layout.photometric == PhotometricInterpretation::Rgb {
-            rgb_to_ycc(&mut samples, layout.bits_stored);
-        }
+        let samples = if layout.photometric == PhotometricInterpretation::Rgb
+            && layout.bits_allocated == 1
+            && layout.bits_stored == 8
+            && layout.planar == 0
+            && bytes.len() >= layout.frame_length
+        {
+            rgb8_to_ycc(&bytes[..layout.frame_length])
+        } else {
+            let mut samples = layout
+                .read_samples(bytes.as_ref())
+                .map_err(|m| operation_error(codec, &format!("frame {i}: {m}")))?;
+            if layout.photometric == PhotometricInterpretation::Rgb {
+                rgb_to_ycc(&mut samples, layout.bits_stored);
+            }
+            samples
+        };
         let frame = SequentialFrame::new(
             layout.width,
             layout.height,

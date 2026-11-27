@@ -6,6 +6,16 @@ pub(crate) const ZIGZAG: [usize; 64] = [
     52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
+pub(crate) fn ac_mask(coefficients: &[i32; 64]) -> u64 {
+    ZIGZAG
+        .iter()
+        .enumerate()
+        .skip(1)
+        .fold(0, |mask, (position, &index)| {
+            mask | (u64::from(coefficients[index] != 0) << position)
+        })
+}
+
 pub(crate) const LUMA_Q: [u8; 64] = [
     16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56,
     14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113,
@@ -38,7 +48,8 @@ pub(crate) fn scaled_table(base: &[u8; 64], quality: u32, max_qval: u16) -> [u16
 /// `FIX_*` values. Rust's `wrapping_*` mirrors the wrap-around MSVC produces
 /// for the C signed arithmetic. `precision` selects `PASS1_BITS` (2 for 8-bit
 /// samples, 1 for 12-bit) exactly as `jfdctint.c` does.
-pub(crate) fn islow_forward(input: &[i32; 64], precision: u8) -> [i32; 64] {
+#[cfg(test)]
+fn islow_forward(input: &[i32; 64], precision: u8) -> [i32; 64] {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: The feature check guards the AVX2 kernel.
@@ -199,13 +210,25 @@ impl ForwardQuantizer {
         quantizer
     }
 
-    pub(crate) fn quantize(&self, coefficients: &[i32; 64]) -> [i32; 64] {
+    #[cfg(test)]
+    fn quantize(&self, coefficients: &[i32; 64]) -> [i32; 64] {
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: The feature check guards the AVX2 kernel.
             return unsafe { avx2::quantize(coefficients, self) };
         }
         std::array::from_fn(|i| self.quantize_one(i, coefficients[i]))
+    }
+
+    pub(crate) fn transform(&self, samples: &[i32; 64], precision: u8) -> ([i32; 64], u64) {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: The feature check guards the AVX2 kernel.
+            return unsafe { avx2::forward_quantized(samples, precision, self) };
+        }
+        let coefficients = islow_forward_scalar(samples, precision);
+        let quantized = std::array::from_fn(|i| self.quantize_one(i, coefficients[i]));
+        (quantized, ac_mask(&quantized))
     }
 
     #[inline]
@@ -591,6 +614,28 @@ mod tests {
                     i32::from((coefficient.signum() * value as i32) as i16)
                 });
                 assert_eq!(quantizer.quantize(&input), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn combined_forward_transform_matches_scalar_at_both_precisions() {
+        for precision in [8, 12] {
+            let table = scaled_table(&LUMA_Q, 90, 255);
+            let quantizer = ForwardQuantizer::new(&table, precision);
+            let midpoint = 1 << (precision - 1);
+            for offset in 0..32 {
+                let block = std::array::from_fn(|i| {
+                    ((i as i32 * (379 + offset) + offset + (i as i32 / 7) * 13)
+                        & (2 * midpoint - 1))
+                        - midpoint
+                });
+                let coefficients = islow_forward_scalar(&block, precision);
+                let expected = std::array::from_fn(|i| quantizer.quantize_one(i, coefficients[i]));
+                assert_eq!(
+                    quantizer.transform(&block, precision),
+                    (expected, ac_mask(&expected))
+                );
             }
         }
     }

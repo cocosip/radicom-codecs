@@ -748,16 +748,29 @@ fn decode_scan(
             .as_ref()
             .ok_or_else(|| format!("missing JPEG DC Huffman table {id}"))?;
         if stride == 1 {
-            decode_shared_dc::<1>(
-                &mut bits,
-                huffman,
-                samples,
-                width,
-                precision,
-                scan.predictor,
-            )?;
+            // Amortize the larger table on long 15-bit scans, where common
+            // differences can take more than ten bits including the prefix.
+            if precision == 15 && samples.len() >= 65_536 {
+                decode_shared_dc::<1, 12, 4096>(
+                    &mut bits,
+                    huffman,
+                    samples,
+                    width,
+                    precision,
+                    scan.predictor,
+                )?;
+            } else {
+                decode_shared_dc::<1, 10, 1024>(
+                    &mut bits,
+                    huffman,
+                    samples,
+                    width,
+                    precision,
+                    scan.predictor,
+                )?;
+            }
         } else {
-            decode_shared_dc::<3>(
+            decode_shared_dc::<3, 10, 1024>(
                 &mut bits,
                 huffman,
                 samples,
@@ -871,7 +884,7 @@ fn decode_scan(
     Ok(bits.position())
 }
 
-fn decode_shared_dc<const N: usize>(
+fn decode_shared_dc<const N: usize, const PREFIX: u8, const ENTRIES: usize>(
     bits: &mut BitReader<'_>,
     huffman: &HuffmanTable,
     samples: &mut [u16],
@@ -886,10 +899,11 @@ fn decode_shared_dc<const N: usize>(
         count: u8,
         bits: u8,
     }
-    let mut lookup = [Pair::default(); 1024];
-    // A ten-bit prefix can contain two complete difference codes in smooth regions.
+    let long_amplitudes = huffman.short_amplitudes::<PREFIX, ENTRIES>();
+    let mut lookup = [Pair::default(); ENTRIES];
+    // A prefix can contain two complete difference codes in smooth regions.
     for (prefix, entry) in lookup.iter_mut().enumerate() {
-        let first = amplitudes[prefix];
+        let first = long_amplitudes[prefix];
         let first_width = first as u8;
         if first_width == 0 || (first >> 8) as u8 > precision + 1 {
             continue;
@@ -897,10 +911,10 @@ fn decode_shared_dc<const N: usize>(
         entry.differences[0] = (first >> 16) as u16;
         entry.bits = first_width;
         entry.count = 1;
-        let second = amplitudes[(prefix << first_width) & 1023];
+        let second = long_amplitudes[(prefix << first_width) & (ENTRIES - 1)];
         let second_width = second as u8;
         if second_width > 0
-            && first_width + second_width <= 10
+            && first_width + second_width <= PREFIX
             && (second >> 8) as u8 <= precision + 1
         {
             entry.differences[1] = (second >> 16) as u16;
@@ -911,6 +925,8 @@ fn decode_shared_dc<const N: usize>(
     let max = (1i32 << precision) - 1;
     let mut above = [1i32 << (precision - 1); N];
     let mut previous_row: &[u16] = &[];
+    #[cfg(target_arch = "x86_64")]
+    let vector_mono = N == 1 && predictor == 1 && std::arch::is_x86_feature_detected!("avx2");
     for (y, row) in samples.chunks_exact_mut(width * N).enumerate() {
         let mut index = 0;
         while index < row.len() {
@@ -918,7 +934,7 @@ fn decode_shared_dc<const N: usize>(
             let mut left = available;
             // Eight Huffman bits and fifteen amplitude bits fit in this window.
             while left >= 24 && index + 1 < row.len() {
-                let entry = lookup[(window >> 54) as usize];
+                let entry = lookup[(window >> (64 - PREFIX)) as usize];
                 let mut consumed = entry.bits;
                 if consumed != 0 {
                     row[index..index + 2].copy_from_slice(&entry.differences);
@@ -944,6 +960,20 @@ fn decode_shared_dc<const N: usize>(
                 row[index] = read_difference(bits, huffman, &amplitudes, precision)? as u16;
                 index += 1;
             }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if vector_mono {
+            // SAFETY: The feature check above guards the row kernel.
+            unsafe { reconstruct_left_mono(row, above[0] as u16, max as u16) }.map_err(
+                |index| {
+                    format!(
+                        "JPEG lossless sample is outside the declared precision at pixel {}, component 0",
+                        y * width + index
+                    )
+                },
+            )?;
+            above[0] = i32::from(row[0]);
+            continue;
         }
         if predictor == 2 && y != 0 {
             for (sample, &prediction) in row.iter_mut().zip(previous_row) {
@@ -975,6 +1005,41 @@ fn decode_shared_dc<const N: usize>(
             }
         }
         previous_row = row;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn reconstruct_left_mono(row: &mut [u16], mut left: u16, max: u16) -> Result<(), usize> {
+    use std::arch::x86_64::*;
+    let (blocks, tail) = row.as_chunks_mut::<8>();
+    let forbidden = _mm_set1_epi16(!max as i16);
+    for (index, block) in blocks.iter_mut().enumerate() {
+        // SAFETY: A block contains eight words and the loads/stores are unaligned.
+        let mut sum = unsafe { _mm_loadu_si128(block.as_ptr().cast()) };
+        sum = _mm_add_epi16(sum, _mm_slli_si128::<2>(sum));
+        sum = _mm_add_epi16(sum, _mm_slli_si128::<4>(sum));
+        sum = _mm_add_epi16(sum, _mm_slli_si128::<8>(sum));
+        sum = _mm_add_epi16(sum, _mm_set1_epi16(left as i16));
+        // Below 16 bits, the first invalid prediction either exceeds max or
+        // wraps from a negative value into the unused upper part of u16.
+        if max != u16::MAX && _mm_testz_si128(sum, forbidden) == 0 {
+            let valid = _mm_cmpeq_epi16(_mm_and_si128(sum, forbidden), _mm_setzero_si128());
+            let invalid_bytes = !_mm_movemask_epi8(valid) as u16;
+            return Err(index * 8 + invalid_bytes.trailing_zeros() as usize / 2);
+        }
+        // SAFETY: The destination is the same eight-word block loaded above.
+        unsafe { _mm_storeu_si128(block.as_mut_ptr().cast(), sum) };
+        left = _mm_extract_epi16::<7>(sum) as u16;
+    }
+    let start = blocks.len() * 8;
+    for (index, difference) in tail.iter_mut().enumerate() {
+        left = left.wrapping_add(*difference);
+        if left > max {
+            return Err(start + index);
+        }
+        *difference = left;
     }
     Ok(())
 }
@@ -1384,6 +1449,30 @@ fn predict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vector_left_prediction_preserves_wrapping_and_reports_the_first_invalid_sample() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut differences = [1, 0, 0, 0, 0, 0, 0, 0, 1];
+        // SAFETY: AVX2 support was checked above.
+        unsafe {
+            assert_eq!(
+                reconstruct_left_mono(&mut differences, u16::MAX, u16::MAX),
+                Ok(())
+            );
+            assert_eq!(differences, [0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            let mut differences = [0, 0, u16::MAX, 1, 0, 0, 0, 0, 0];
+            assert_eq!(reconstruct_left_mono(&mut differences, 0, 32767), Err(2));
+            let mut differences = [0, 0, 0, 0, 0, 0, 0, 0, 1];
+            assert_eq!(
+                reconstruct_left_mono(&mut differences, 32767, 32767),
+                Err(8)
+            );
+        }
+    }
 
     /// Process 14 accepts every predictor and point transform, so it is the
     /// widest policy for exercising the marker and entropy layers.

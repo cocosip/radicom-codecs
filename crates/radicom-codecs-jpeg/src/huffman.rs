@@ -31,13 +31,18 @@ impl HuffmanEncoder {
         suffix_bits: u8,
         writer: &mut BitWriter,
     ) -> Result<(), String> {
-        write_code(
-            self.0[usize::from(symbol)],
-            symbol,
-            suffix,
-            suffix_bits,
-            writer,
-        )
+        let code = self.0[usize::from(symbol)];
+        if code.length == 0 {
+            return Err(format!("Huffman symbol 0x{symbol:02x} is not defined"));
+        }
+        // Sequential amplitudes use at most 16 bits and the canonical code
+        // construction bounds the prefix to 16 bits.
+        debug_assert!(suffix_bits <= 16 && suffix < 1 << suffix_bits);
+        writer.write_codeword(
+            (u32::from(code.value) << suffix_bits) | suffix,
+            code.length + suffix_bits,
+        );
+        Ok(())
     }
 }
 

@@ -102,6 +102,107 @@ pub(crate) fn rgb_to_ycc(samples: &mut [u16], precision: u8) {
     convert_rgb(samples, precision);
 }
 
+pub(crate) fn rgb8_to_ycc(input: &[u8]) -> Vec<u16> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: The detected feature guards the vector conversion.
+        return unsafe { rgb8_to_ycc_avx2(input) };
+    }
+    let mut samples: Vec<_> = input.iter().copied().map(u16::from).collect();
+    convert_rgb(&mut samples, 8);
+    samples
+}
+
+#[cfg(target_arch = "x86_64")]
+type ShuffleMasks = [[[u8; 16]; 3]; 3];
+
+#[cfg(target_arch = "x86_64")]
+const fn rgb_shuffle_masks() -> (ShuffleMasks, ShuffleMasks) {
+    let mut unpack = [[[0x80; 16]; 3]; 3];
+    let mut pack = [[[0x80; 16]; 3]; 3];
+    let mut word = 0;
+    while word < 24 {
+        let channel = word % 3;
+        let lane = word / 3 * 2;
+        let register = word / 8;
+        let byte = (word % 8) * 2;
+        unpack[channel][register][lane] = byte as u8;
+        unpack[channel][register][lane + 1] = byte as u8 + 1;
+        pack[register][channel][byte] = lane as u8;
+        pack[register][channel][byte + 1] = lane as u8 + 1;
+        word += 1;
+    }
+    (unpack, pack)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+fn shuffle_rgb(
+    input: [std::arch::x86_64::__m128i; 3],
+    masks: &[[u8; 16]; 3],
+) -> std::arch::x86_64::__m128i {
+    use std::arch::x86_64::*;
+    // SAFETY: Each mask contains exactly 16 bytes.
+    unsafe {
+        let a = _mm_shuffle_epi8(input[0], _mm_loadu_si128(masks[0].as_ptr().cast()));
+        let b = _mm_shuffle_epi8(input[1], _mm_loadu_si128(masks[1].as_ptr().cast()));
+        let c = _mm_shuffle_epi8(input[2], _mm_loadu_si128(masks[2].as_ptr().cast()));
+        _mm_or_si128(_mm_or_si128(a, b), c)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rgb8_to_ycc_avx2(input: &[u8]) -> Vec<u16> {
+    use std::arch::x86_64::*;
+    const MASKS: (ShuffleMasks, ShuffleMasks) = rgb_shuffle_masks();
+    let mut output = Vec::<u16>::with_capacity(input.len());
+    let (chunks, tail) = input.as_chunks::<24>();
+    let mul = |a, k| _mm256_mullo_epi32(a, _mm256_set1_epi32(k));
+    let add = _mm256_add_epi32;
+    let sub = _mm256_sub_epi32;
+    let chroma_bias = _mm256_set1_epi32((128 << 16) + 32767);
+    for chunk in chunks {
+        // SAFETY: The input has 24 readable bytes, and the output has room for
+        // 24 words at this offset. Every word is initialized before set_len.
+        unsafe {
+            let input = std::array::from_fn(|i| {
+                _mm_cvtepu8_epi16(_mm_loadl_epi64(chunk.as_ptr().add(i * 8).cast()))
+            });
+            let [r, g, b] = MASKS
+                .0
+                .map(|masks| _mm256_cvtepu16_epi32(shuffle_rgb(input, &masks)));
+            let y = add(
+                add(mul(r, 19595), mul(g, 38470)),
+                add(mul(b, 7471), _mm256_set1_epi32(32768)),
+            );
+            let cb = sub(
+                add(mul(b, 32768), chroma_bias),
+                add(mul(r, 11059), mul(g, 21709)),
+            );
+            let cr = sub(
+                add(mul(r, 32768), chroma_bias),
+                add(mul(g, 27439), mul(b, 5329)),
+            );
+            let channels = [y, cb, cr].map(|v| {
+                let v = _mm256_srai_epi32::<16>(v);
+                _mm_packus_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v))
+            });
+            let start = output.len();
+            for (i, masks) in MASKS.1.iter().enumerate() {
+                let values = shuffle_rgb(channels, masks);
+                _mm_storeu_si128(output.as_mut_ptr().add(start + i * 8).cast(), values);
+            }
+            output.set_len(start + 24);
+        }
+    }
+    let start = output.len();
+    output.extend(tail.iter().copied().map(u16::from));
+    convert_rgb(&mut output[start..], 8);
+    output
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn rgb_to_ycc_avx2(samples: &mut [u16], precision: u8) {
@@ -209,33 +310,7 @@ unsafe fn ybr422_to_rgb_avx2<T: DecodedSample + Into<u16>>(
     max: i32,
 ) {
     use std::arch::x86_64::*;
-    type ShuffleMasks = [[[u8; 16]; 3]; 3];
-    const MASKS: (ShuffleMasks, ShuffleMasks) = {
-        let mut unpack = [[[0x80; 16]; 3]; 3];
-        let mut pack = [[[0x80; 16]; 3]; 3];
-        let mut word = 0;
-        while word < 24 {
-            let channel = word % 3;
-            let lane = word / 3 * 2;
-            let register = word / 8;
-            let byte = (word % 8) * 2;
-            unpack[channel][register][lane] = byte as u8;
-            unpack[channel][register][lane + 1] = byte as u8 + 1;
-            pack[register][channel][byte] = lane as u8;
-            pack[register][channel][byte + 1] = lane as u8 + 1;
-            word += 1;
-        }
-        (unpack, pack)
-    };
-    let convert = |input: [__m128i; 3], masks: &[[u8; 16]; 3]| {
-        // SAFETY: Each mask contains exactly 16 bytes.
-        unsafe {
-            let shuffled = std::array::from_fn::<_, 3, _>(|i| {
-                _mm_shuffle_epi8(input[i], _mm_loadu_si128(masks[i].as_ptr().cast()))
-            });
-            _mm_or_si128(_mm_or_si128(shuffled[0], shuffled[1]), shuffled[2])
-        }
-    };
+    const MASKS: (ShuffleMasks, ShuffleMasks) = rgb_shuffle_masks();
     let interpolate = |values, left: u16, right: u16| {
         let prev = _mm_or_si128(
             _mm_slli_si128::<2>(values),
@@ -250,12 +325,10 @@ unsafe fn ybr422_to_rgb_avx2<T: DecodedSample + Into<u16>>(
         let three_times = _mm_add_epi16(values, _mm_slli_epi16::<1>(values));
         _mm_srli_epi16::<2>(_mm_add_epi16(_mm_add_epi16(three_times, adjacent), bias))
     };
-    let center = _mm256_set1_epi32(center);
-    let max_vec = _mm256_set1_epi32(max);
-    let add = _mm256_add_epi32;
-    let sub = _mm256_sub_epi32;
-    let mul = |values, factor| _mm256_mullo_epi32(values, _mm256_set1_epi32(factor));
-    let bias = _mm256_set1_epi32(32768);
+    let center_vec = _mm_set1_epi16(center as i16);
+    let max_vec = _mm_set1_epi16(max as i16);
+    let add = _mm_add_epi16;
+    let sub = _mm_sub_epi16;
     for row in samples.chunks_exact_mut(width * 3) {
         let mut previous = (row[1].into(), row[2].into());
         let mut offset = 0;
@@ -272,48 +345,51 @@ unsafe fn ybr422_to_rgb_avx2<T: DecodedSample + Into<u16>>(
             unsafe {
                 let block = row.as_mut_ptr().add(offset);
                 let input = std::array::from_fn(|i| T::load_row(block.add(i * 8)));
-                let y = _mm256_cvtepu16_epi32(convert(input, &MASKS.0[0]));
+                let y = shuffle_rgb(input, &MASKS.0[0]);
                 let cb = sub(
-                    _mm256_cvtepu16_epi32(interpolate(
-                        convert(input, &MASKS.0[1]),
-                        previous.0,
-                        cb_next,
-                    )),
-                    center,
+                    interpolate(shuffle_rgb(input, &MASKS.0[1]), previous.0, cb_next),
+                    center_vec,
                 );
                 let cr = sub(
-                    _mm256_cvtepu16_epi32(interpolate(
-                        convert(input, &MASKS.0[2]),
-                        previous.1,
-                        cr_next,
-                    )),
-                    center,
+                    interpolate(shuffle_rgb(input, &MASKS.0[2]), previous.1, cr_next),
+                    center_vec,
                 );
-                let deltas = [
-                    add(mul(cr, 91881), bias),
-                    sub(sub(bias, mul(cb, 22554)), mul(cr, 46802)),
-                    add(mul(cb, 116130), bias),
-                ];
+                // Separate whole multiples of 65536 so the fixed-point
+                // products can use signed 16-bit coefficients.
+                let red_factor = _mm_set1_epi16((91881i32 - 65536) as i16);
+                let red_round = _mm_srli_epi16::<15>(_mm_mullo_epi16(cr, red_factor));
+                let red = add(cr, add(_mm_mulhi_epi16(cr, red_factor), red_round));
+                let blue = add(
+                    _mm_slli_epi16::<1>(cb),
+                    _mm_mulhrs_epi16(cb, _mm_set1_epi16(((116130i32 - 2 * 65536) / 2) as i16)),
+                );
+                let green_factors =
+                    _mm_setr_epi16(-22554, 18734, -22554, 18734, -22554, 18734, -22554, 18734);
+                let green_half = |pairs| {
+                    _mm_srai_epi32::<16>(_mm_add_epi32(
+                        _mm_madd_epi16(pairs, green_factors),
+                        _mm_set1_epi32(32768),
+                    ))
+                };
+                let green = sub(
+                    _mm_packs_epi32(
+                        green_half(_mm_unpacklo_epi16(cb, cr)),
+                        green_half(_mm_unpackhi_epi16(cb, cr)),
+                    ),
+                    cr,
+                );
+                let deltas = [red, green, blue];
                 let channels = deltas.map(|delta| {
-                    let channel = _mm256_min_epi32(add(y, _mm256_srai_epi32::<16>(delta)), max_vec);
-                    _mm_packus_epi32(
-                        _mm256_castsi256_si128(channel),
-                        _mm256_extracti128_si256::<1>(channel),
-                    )
+                    _mm_max_epi16(_mm_min_epi16(add(y, delta), max_vec), _mm_setzero_si128())
                 });
                 for (i, masks) in MASKS.1.iter().enumerate() {
-                    T::store_row(block.add(i * 8), convert(channels, masks));
+                    T::store_row(block.add(i * 8), shuffle_rgb(channels, masks));
                 }
             }
             previous = last;
             offset += 24;
         }
-        convert_422_tail(
-            &mut row[offset..],
-            Some(previous),
-            _mm256_extract_epi32::<0>(center),
-            max,
-        );
+        convert_422_tail(&mut row[offset..], Some(previous), center, max);
     }
 }
 
@@ -338,9 +414,30 @@ mod tests {
                 for row in expected.chunks_exact_mut(width * 3) {
                     convert_422_tail(row, None, center, max);
                 }
+                if precision == 8 {
+                    let mut bytes: Vec<_> = actual.iter().map(|&value| value as u8).collect();
+                    ybr422_to_rgb(&mut bytes, width, precision);
+                    assert!(bytes
+                        .iter()
+                        .copied()
+                        .map(u16::from)
+                        .eq(expected.iter().copied()));
+                }
                 ybr422_to_rgb(&mut actual, width, precision);
                 assert_eq!(actual, expected, "{width} columns at {precision} bits");
             }
+        }
+    }
+
+    #[test]
+    fn packed_rgb_conversion_matches_scalar_with_partial_vectors() {
+        let mut input = Vec::new();
+        for tail in 0..8 {
+            input.extend((0..(16 + tail) * 3).map(|i| (i * 157 + i / 7 * 43) as u8));
+            let mut expected: Vec<_> = input.iter().copied().map(u16::from).collect();
+            convert_rgb(&mut expected, 8);
+            assert_eq!(rgb8_to_ycc(&input), expected, "tail of {tail} pixels");
+            input.clear();
         }
     }
 

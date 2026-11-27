@@ -7,11 +7,12 @@
 use super::bit::{BitReader, BitWriter};
 use super::color::JpegColorSpace;
 use super::dct::{
-    inverse, inverse_dc, islow_forward, scaled_table, BlockOutput, DecodedSample, ForwardQuantizer,
-    CHROMA_Q, LUMA_Q, MAX_QUANTIZATION, ZIGZAG,
+    inverse, inverse_dc, scaled_table, BlockOutput, DecodedSample, ForwardQuantizer, CHROMA_Q,
+    LUMA_Q, MAX_QUANTIZATION, ZIGZAG,
 };
 use super::huffman::{HuffmanEncoder, HuffmanTable};
 use super::marker::{check_trailing, Marker, MarkerReader, MarkerWriter};
+use std::sync::LazyLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SequentialFrame {
@@ -72,6 +73,12 @@ const ANNEX_K_HUFFMAN: [(&[u8; 16], &[u8]); 4] = [
     ),
 ];
 
+static STANDARD_SPECS: LazyLock<[Spec; 4]> = LazyLock::new(|| {
+    ANNEX_K_HUFFMAN.map(|(counts, values)| {
+        Spec::new(counts.to_vec(), values.to_vec()).expect("valid Annex K Huffman table")
+    })
+});
+
 struct Spec {
     counts: Vec<u8>,
     values: Vec<u8>,
@@ -112,6 +119,7 @@ enum ScanStep<'a> {
         slot: usize,
         diff: i32,
         block: &'a [i32; 64],
+        nonzero: u64,
     },
     Restart(u8),
 }
@@ -418,7 +426,12 @@ impl SequentialFrame {
                 colorspace,
                 |step| {
                     match step {
-                        ScanStep::Block { slot, diff, block } => {
+                        ScanStep::Block {
+                            slot,
+                            diff,
+                            block,
+                            nonzero,
+                        } => {
                             let size = category(diff);
                             dc_frequencies[slot][usize::from(size)] += 1;
                             if cache_tokens {
@@ -428,7 +441,7 @@ impl SequentialFrame {
                                     table: 2 * slot as u8,
                                 });
                             }
-                            for_each_ac(block, |symbol, suffix, _| {
+                            for_each_ac(block, nonzero, |symbol, suffix, _| {
                                 ac_frequencies[slot][usize::from(symbol)] += 1;
                                 if cache_tokens {
                                     tokens.push(EntropyToken {
@@ -452,17 +465,17 @@ impl SequentialFrame {
             )?;
             scan_ends.push(tokens.len());
         }
-        let mut tables = Vec::with_capacity(2 * table_count);
-        if optimize_huffman {
+        let mut optimal_tables;
+        let tables: &[Spec] = if optimize_huffman {
+            optimal_tables = Vec::with_capacity(2 * table_count);
             for slot in 0..table_count {
-                tables.push(Spec::optimal(&dc_frequencies[slot])?);
-                tables.push(Spec::optimal(&ac_frequencies[slot])?);
+                optimal_tables.push(Spec::optimal(&dc_frequencies[slot])?);
+                optimal_tables.push(Spec::optimal(&ac_frequencies[slot])?);
             }
+            &optimal_tables
         } else {
-            for &(counts, values) in &ANNEX_K_HUFFMAN[..2 * table_count] {
-                tables.push(Spec::new(counts.to_vec(), values.to_vec())?);
-            }
-        }
+            &STANDARD_SPECS[..2 * table_count]
+        };
         let mut out = MarkerWriter::default();
         colorspace.write_file_header(&mut out)?;
         // jcmarker.c `write_frame_header`: one DQT per quantization table
@@ -537,7 +550,7 @@ impl SequentialFrame {
             } else {
                 self.write_scan(
                     &mut out,
-                    &tables,
+                    tables,
                     sampling,
                     smoothing,
                     scan,
@@ -627,19 +640,20 @@ impl SequentialFrame {
                                     slot: table,
                                     diff: 0,
                                     block: &[0; 64],
+                                    nonzero: 0,
                                 })?;
                                 continue;
                             }
                             let mut block = [0i32; 64];
                             self.load_block(pooling, block_x, block_y, &mut block);
-                            let quant = if block.iter().all(|&sample| sample == block[0]) {
+                            let (quant, nonzero) = if block.iter().all(|&sample| sample == block[0])
+                            {
                                 // A constant block has only one DCT coefficient, 64 * sample.
                                 let mut quantized = [0; 64];
                                 quantized[0] = quantizers[table].quantize_one(0, 64 * block[0]);
-                                quantized
+                                (quantized, 0)
                             } else {
-                                let coefficients = islow_forward(&block, self.precision);
-                                quantizers[table].quantize(&coefficients)
+                                quantizers[table].transform(&block, self.precision)
                             };
                             let dc = quant[0];
                             let diff = dc - previous_dc[c];
@@ -648,6 +662,7 @@ impl SequentialFrame {
                                 slot: table,
                                 diff,
                                 block: &quant,
+                                nonzero,
                             })?;
                         }
                     }
@@ -683,9 +698,14 @@ impl SequentialFrame {
                     out.write_raw(&bits.take_bytes());
                     out.write_marker(Marker::Restart(index))
                 }
-                ScanStep::Block { slot, diff, block } => {
+                ScanStep::Block {
+                    slot,
+                    diff,
+                    block,
+                    nonzero,
+                } => {
                     write_value(&mut bits, &tables[2 * slot].table, diff)?;
-                    for_each_ac(block, |symbol, value, size| {
+                    for_each_ac(block, nonzero, |symbol, value, size| {
                         tables[2 * slot + 1]
                             .table
                             .encode_with_suffix(symbol, value, size, &mut bits)
@@ -1826,27 +1846,24 @@ fn write_value(w: &mut BitWriter, h: &HuffmanEncoder, v: i32) -> Result<(), Stri
 /// a nonzero coefficient actually follows; a trailing zero run is one EOB.
 fn for_each_ac(
     quant: &[i32; 64],
+    mut nonzero: u64,
     mut emit: impl FnMut(u8, u32, u8) -> Result<(), String>,
 ) -> Result<(), String> {
-    if quant[1..].iter().all(|&value| value == 0) {
-        return emit(0, 0, 0);
-    }
-    let mut run = 0u32;
-    for &index in ZIGZAG.iter().skip(1) {
-        let value = quant[index];
-        if value == 0 {
-            run += 1;
-            continue;
-        }
+    let mut previous = 0;
+    while nonzero != 0 {
+        let position = nonzero.trailing_zeros() as usize;
+        nonzero &= nonzero - 1;
+        let mut run = position - previous - 1;
         while run >= 16 {
             emit(0xf0, 0, 0)?;
             run -= 16;
         }
+        let value = quant[ZIGZAG[position]];
         let size = category(value);
         emit(((run as u8) << 4) | size, amplitude(value, size), size)?;
-        run = 0;
+        previous = position;
     }
-    if run > 0 {
+    if previous != 63 {
         emit(0, 0, 0)?;
     }
     Ok(())
@@ -2618,10 +2635,14 @@ mod tests {
         let mut quant = [0i32; 64];
         quant[0] = 5;
         let mut symbols = Vec::new();
-        for_each_ac(&quant, |symbol, _, _| {
-            symbols.push(symbol);
-            Ok(())
-        })
+        for_each_ac(
+            &quant,
+            super::super::dct::ac_mask(&quant),
+            |symbol, _, _| {
+                symbols.push(symbol);
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(symbols, [0x00]);
 
@@ -2631,10 +2652,14 @@ mod tests {
         quant[0] = 5;
         quant[ZIGZAG[17]] = 1;
         let mut symbols = Vec::new();
-        for_each_ac(&quant, |symbol, _, _| {
-            symbols.push(symbol);
-            Ok(())
-        })
+        for_each_ac(
+            &quant,
+            super::super::dct::ac_mask(&quant),
+            |symbol, _, _| {
+                symbols.push(symbol);
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(symbols, [0xf0, 0x01, 0x00]);
     }

@@ -1,55 +1,113 @@
 use std::arch::x86_64::*;
 
-use super::ForwardQuantizer;
+use super::{ForwardQuantizer, ZIGZAG};
 
+// Map the eight nonzero flags of each natural-order row to entropy order.
+static ROW_AC_MASKS: [[u64; 256]; 8] = {
+    let mut masks = [[0u64; 256]; 8];
+    let mut position = 1;
+    while position < ZIGZAG.len() {
+        let index = ZIGZAG[position];
+        let mut pattern = 0;
+        while pattern < 256 {
+            if pattern & (1 << (index % 8)) != 0 {
+                masks[index / 8][pattern] |= 1 << position;
+            }
+            pattern += 1;
+        }
+        position += 1;
+    }
+    masks
+};
+
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 pub(super) fn quantize(input: &[i32; 64], quantizer: &ForwardQuantizer) -> [i32; 64] {
-    let mut output = [0; 64];
-    for i in (0..64).step_by(8) {
-        // SAFETY: Each input, table and output row contains eight 32-bit lanes.
-        unsafe {
-            let coefficient = _mm256_loadu_si256(input.as_ptr().add(i).cast());
-            let correction = _mm256_loadu_si256(quantizer.correction.as_ptr().add(i).cast());
-            let reciprocal = _mm256_loadu_si256(quantizer.reciprocal.as_ptr().add(i).cast());
-            let shift = _mm256_loadu_si256(quantizer.shift.as_ptr().add(i).cast());
-            let magnitude = _mm256_add_epi32(_mm256_abs_epi32(coefficient), correction);
-            let even = _mm256_srlv_epi64(
-                _mm256_mul_epu32(magnitude, reciprocal),
-                _mm256_and_si256(shift, _mm256_set1_epi64x(0xffff_ffff)),
-            );
-            let odd = _mm256_srlv_epi64(
-                _mm256_mul_epu32(
-                    _mm256_srli_epi64::<32>(magnitude),
-                    _mm256_srli_epi64::<32>(reciprocal),
-                ),
-                _mm256_srli_epi64::<32>(shift),
-            );
-            let result = _mm256_sign_epi32(
-                _mm256_or_si256(even, _mm256_slli_epi64::<32>(odd)),
-                coefficient,
-            );
-            let truncated = _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(result));
-            _mm256_storeu_si256(output.as_mut_ptr().add(i).cast(), truncated);
-        }
+    let mut rows = load_rows(input);
+    for (i, row) in rows.iter_mut().enumerate() {
+        *row = quantize_row(*row, quantizer, i * 8);
     }
-    output
+    store_rows(rows)
 }
 
+#[inline]
 #[target_feature(enable = "avx2")]
-pub(super) fn forward(input: &[i32; 64], precision: u8) -> [i32; 64] {
-    let rows = std::array::from_fn(|row| {
+fn quantize_row(coefficient: __m256i, quantizer: &ForwardQuantizer, i: usize) -> __m256i {
+    // SAFETY: The caller supplies one of the eight row offsets in each table.
+    unsafe {
+        let correction = _mm256_loadu_si256(quantizer.correction.as_ptr().add(i).cast());
+        let reciprocal = _mm256_loadu_si256(quantizer.reciprocal.as_ptr().add(i).cast());
+        let shift = _mm256_loadu_si256(quantizer.shift.as_ptr().add(i).cast());
+        let magnitude = _mm256_add_epi32(_mm256_abs_epi32(coefficient), correction);
+        let even = _mm256_srlv_epi64(
+            _mm256_mul_epu32(magnitude, reciprocal),
+            _mm256_and_si256(shift, _mm256_set1_epi64x(0xffff_ffff)),
+        );
+        let odd = _mm256_srlv_epi64(
+            _mm256_mul_epu32(
+                _mm256_srli_epi64::<32>(magnitude),
+                _mm256_srli_epi64::<32>(reciprocal),
+            ),
+            _mm256_srli_epi64::<32>(shift),
+        );
+        let result = _mm256_sign_epi32(
+            _mm256_or_si256(even, _mm256_slli_epi64::<32>(odd)),
+            coefficient,
+        );
+        _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(result))
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn load_rows(input: &[i32; 64]) -> [__m256i; 8] {
+    std::array::from_fn(|row| {
         // SAFETY: Every row has eight i32 lanes and unaligned loads are valid.
         unsafe { _mm256_loadu_si256(input.as_ptr().add(row * 8).cast()) }
-    });
+    })
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn forward_rows(input: &[i32; 64], precision: u8) -> [__m256i; 8] {
+    let rows = load_rows(input);
     let pass1_bits = if precision == 8 { 2 } else { 1 };
     let columns = forward_lanes::<true>(transpose_i32(rows), pass1_bits);
-    let rows = forward_lanes::<false>(transpose_i32(columns), pass1_bits);
+    forward_lanes::<false>(transpose_i32(columns), pass1_bits)
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn store_rows(rows: [__m256i; 8]) -> [i32; 64] {
     let mut output = [0; 64];
     for (row, lanes) in rows.into_iter().enumerate() {
         // SAFETY: The output has room for eight contiguous i32 lanes per row.
         unsafe { _mm256_storeu_si256(output.as_mut_ptr().add(row * 8).cast(), lanes) };
     }
     output
+}
+
+#[cfg(test)]
+#[target_feature(enable = "avx2")]
+pub(super) fn forward(input: &[i32; 64], precision: u8) -> [i32; 64] {
+    store_rows(forward_rows(input, precision))
+}
+
+#[target_feature(enable = "avx2")]
+pub(super) fn forward_quantized(
+    input: &[i32; 64],
+    precision: u8,
+    quantizer: &ForwardQuantizer,
+) -> ([i32; 64], u64) {
+    let mut rows = forward_rows(input, precision);
+    let mut nonzero = 0;
+    for (i, row) in rows.iter_mut().enumerate() {
+        *row = quantize_row(*row, quantizer, i * 8);
+        let zero_lanes = _mm256_cmpeq_epi32(*row, _mm256_setzero_si256());
+        let row_mask = !_mm256_movemask_ps(_mm256_castsi256_ps(zero_lanes)) as u8;
+        nonzero |= ROW_AC_MASKS[i][usize::from(row_mask)];
+    }
+    (store_rows(rows), nonzero)
 }
 
 #[target_feature(enable = "avx2")]
