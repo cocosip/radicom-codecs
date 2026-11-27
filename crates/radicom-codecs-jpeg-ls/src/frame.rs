@@ -7,8 +7,8 @@ use crate::{
     },
     preset::Preset,
     scan::{
-        append_scan, decode_byte_scan, decode_line_scan_planes, decode_scan, decode_word_scan,
-        ScanConfig,
+        append_byte_scan, append_scan, decode_byte_scan, decode_line_scan_planes,
+        decode_rgb_byte_lines, decode_scan, decode_word_scan, ScanConfig,
     },
 };
 use radicom::pixel::codec::JpegLsParams;
@@ -253,9 +253,18 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
                 .into(),
         );
     }
+    let use_byte_input = layout.bits_allocated == 8
+        && layout.bits_stored == 8
+        && layout.planar == 0
+        && layout.pi != PhotometricInterpretation::YbrFull
+        && layout.frame_len > 64
+        && color_transformation == 0
+        && (ilv != 0 || layout.components == 1);
     let mut stack_samples = [0u16; 64];
     let mut allocated_samples;
-    let samples = if layout.bits_allocated == 8
+    let samples = if use_byte_input {
+        &mut [][..]
+    } else if layout.bits_allocated == 8
         && layout.planar == 0
         && layout.pi != PhotometricInterpretation::YbrFull
         && layout.frame_len <= stack_samples.len()
@@ -332,7 +341,14 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
             preset,
         };
         write_sos(&mut out, layout.components, near, ilv)?;
-        out = append_scan(cfg, samples, restart, out)?;
+        out = if use_byte_input {
+            let raw = raw
+                .get(..layout.frame_len)
+                .ok_or("native frame is truncated")?;
+            append_byte_scan(cfg, raw, restart, out)?
+        } else {
+            append_scan(cfg, samples, restart, out)?
+        };
     }
     write_eoi(&mut out);
     Ok(out)
@@ -413,6 +429,12 @@ fn assemble_planes(
         let plane_geometry = geometry[index];
         if plane.len() != plane_geometry.columns * plane_geometry.lines {
             return Err("decoded plane size does not match the sampling factors".into());
+        }
+        if plane_geometry.horizontal == horizontal_max && plane_geometry.vertical == vertical_max {
+            for (sample, &value) in samples[index..].iter_mut().step_by(components).zip(plane) {
+                *sample = value;
+            }
+            continue;
         }
         for y in 0..layout.height {
             let source_y = y * plane_geometry.vertical / vertical_max;
@@ -554,6 +576,20 @@ fn decode_samples(
             ilv: 1,
             preset: entry.preset,
         };
+        if uniform
+            && sampling[0].1 == 1
+            && allow_direct_output
+            && h.color_transformation == 0
+            && layout.planar == 0
+            && layout.components == 3
+            && layout.bits_allocated == 8
+            && layout.bits_stored == 8
+        {
+            // Full-width samples already hold their native byte representation.
+            let bytes =
+                decode_rgb_byte_lines(cfg, &data[entry.start..entry.end], entry.restart_interval)?;
+            return Ok((DecodedSamples::Bytes(bytes), 0));
+        }
         let planes: Vec<(usize, usize, usize)> = geometry
             .iter()
             .map(|plane| (plane.columns, plane.lines, plane.vertical))
@@ -661,6 +697,36 @@ mod tests {
         assert_eq!(
             decode(&layout, &stream, &params, Some(0), false).unwrap(),
             [1, 2, 3, 4, 2, 6]
+        );
+    }
+
+    #[test]
+    fn uniform_vertical_sampling_keeps_multiple_lines_per_mcu() {
+        let layout = rgb_layout(1, 2, 8, 8);
+        let params = JpegLsParams::default();
+        let mut stream = Vec::new();
+        write_soi(&mut stream);
+        write_sof55(
+            &mut stream,
+            &FrameHeader {
+                precision: 8,
+                width: 1,
+                height: 2,
+                components: 3,
+            },
+        )
+        .unwrap();
+        for component in 0..3 {
+            stream[13 + 3 * component] = 0x12;
+        }
+        write_dri(&mut stream, 1);
+        write_sos(&mut stream, 3, 0, 1).unwrap();
+        // One MCU contains six one-sample runs, two for each component.
+        stream.push(0xfc);
+        write_eoi(&mut stream);
+        assert_eq!(
+            decode(&layout, &stream, &params, Some(0), false).unwrap(),
+            [0; 6]
         );
     }
 

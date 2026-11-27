@@ -7,7 +7,7 @@ pub(crate) fn predict(ra: i32, rb: i32, rc: i32) -> i32 {
     ra + rb - rc.max(ra.min(rb)).min(ra.max(rb))
 }
 
-#[inline]
+#[cfg(test)]
 pub(crate) fn quantize(d: i32, t1: i32, t2: i32, t3: i32, near: i32) -> i32 {
     let magnitude = d.abs();
     let quantized = i32::from(magnitude > near)

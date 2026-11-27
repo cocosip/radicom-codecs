@@ -5,9 +5,9 @@ use crate::{
     golomb::{decode_mapped, encode_mapped},
     marker::split_restart_segments,
     preset::Preset,
-    run::{map_error, predict, quantize, unmap_error, J},
+    run::{map_error, predict, unmap_error, J},
 };
-use std::{borrow::Cow, sync::OnceLock};
+use std::{cell::RefCell, rc::Rc};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScanConfig {
@@ -26,24 +26,16 @@ struct ErrorQuantizer {
     range: i32,
     reciprocal: u64,
     lossless_shift: Option<u32>,
-    byte_table: Option<&'static [i8; 512]>,
 }
 
 impl ErrorQuantizer {
-    fn new(maxval: u16, near: u16, range: i32) -> Self {
-        static NEAR_ONE: [i8; 512] = byte_error_table(1);
-        static NEAR_THREE: [i8; 512] = byte_error_table(3);
+    fn new(near: u16, range: i32) -> Self {
         Self {
             near: i32::from(near),
             range,
             reciprocal: (1u64 << 32).div_ceil(2 * u64::from(near) + 1),
             lossless_shift: (near == 0 && (range as u32).is_power_of_two())
                 .then(|| 32 - range.trailing_zeros()),
-            byte_table: match (maxval, near) {
-                (255, 1) => Some(&NEAR_ONE),
-                (255, 3) => Some(&NEAR_THREE),
-                _ => None,
-            },
         }
     }
 
@@ -51,10 +43,6 @@ impl ErrorQuantizer {
     fn quantize(self, value: i32) -> i32 {
         if let Some(shift) = self.lossless_shift {
             return (value << shift) >> shift;
-        }
-        if let Some(table) = self.byte_table {
-            debug_assert!((-255..=255).contains(&value));
-            return i32::from(table[((value + 255) as usize) & 511]);
         }
         let quantized = if self.near == 0 {
             value
@@ -78,21 +66,6 @@ impl ErrorQuantizer {
     }
 }
 
-const fn byte_error_table(near: i32) -> [i8; 512] {
-    let step = 2 * near + 1;
-    let range = (255 + 2 * near) / step + 1;
-    let mut values = [0; 512];
-    let mut i = 0;
-    while i < 511 {
-        let error = i as i32 - 255;
-        let magnitude = (error.abs() + near) / step;
-        let quantized = if error < 0 { -magnitude } else { magnitude };
-        values[i] = ((quantized + range / 2).rem_euclid(range) - range / 2) as i8;
-        i += 1;
-    }
-    values
-}
-
 #[inline]
 fn reconstructed(pred: i32, e: i32, sign: i32, near: i32, maxval: i32, range: i32) -> i32 {
     if near == 0 && maxval & (maxval + 1) == 0 {
@@ -100,6 +73,9 @@ fn reconstructed(pred: i32, e: i32, sign: i32, near: i32, maxval: i32, range: i3
     }
     let step = 2 * near + 1;
     let mut value = pred + sign * e * step;
+    if value as u32 <= maxval as u32 {
+        return value;
+    }
     if value < -near {
         value += range * step;
     } else if value > maxval + near {
@@ -109,13 +85,20 @@ fn reconstructed(pred: i32, e: i32, sign: i32, near: i32, maxval: i32, range: i3
 }
 
 fn correct_prediction(pred: i32, maxval: i32) -> i32 {
-    pred.clamp(0, maxval)
+    if pred as u32 <= maxval as u32 {
+        pred
+    } else if pred < 0 {
+        0
+    } else {
+        maxval
+    }
 }
 
-fn context_id(ra: i32, rb: i32, rc: i32, rd: i32, p: &Preset, near: i32) -> i32 {
-    let q1 = quantize(rd - rb, p.t1 as i32, p.t2 as i32, p.t3 as i32, near);
-    let q2 = quantize(rb - rc, p.t1 as i32, p.t2 as i32, p.t3 as i32, near);
-    let q3 = quantize(rc - ra, p.t1 as i32, p.t2 as i32, p.t3 as i32, near);
+#[cfg(test)]
+fn context_id(ra: i32, rb: i32, rc: i32, rd: i32, gradients: &GradientTable) -> i32 {
+    let q1 = gradients.quantize_reconstructed(rd - rb);
+    let q2 = gradients.quantize_reconstructed(rb - rc);
+    let q3 = gradients.quantize_reconstructed(rc - ra);
     (q1 * 9 + q2) * 9 + q3
 }
 
@@ -127,24 +110,21 @@ struct GradientTable {
 }
 
 impl GradientTable {
-    fn for_scan(preset: Preset, near: u16) -> Cow<'static, Self> {
-        static DEFAULTS: [[OnceLock<GradientTable>; 4]; 4] =
-            [const { [const { OnceLock::new() }; 4] }; 4];
-        let precision = match preset.maxval {
-            255 => 0,
-            1023 => 1,
-            4095 => 2,
-            65535 => 3,
-            _ => return Cow::Owned(Self::new(preset, near)),
-        };
-        if near < 4 && Preset::defaults(preset.maxval, near).is_ok_and(|default| default == preset)
-        {
-            Cow::Borrowed(
-                DEFAULTS[precision][usize::from(near)].get_or_init(|| Self::new(preset, near)),
-            )
-        } else {
-            Cow::Owned(Self::new(preset, near))
+    fn for_scan(preset: Preset, near: u16) -> Rc<Self> {
+        thread_local! {
+            static LAST_SCAN: RefCell<Option<(Preset, u16, Rc<GradientTable>)>> =
+                const { RefCell::new(None) };
         }
+        LAST_SCAN.with_borrow_mut(|last| {
+            if let Some((cached_preset, cached_near, table)) = last {
+                if *cached_preset == preset && *cached_near == near {
+                    return Rc::clone(table);
+                }
+            }
+            let table = Rc::new(Self::new(preset, near));
+            *last = Some((preset, near, Rc::clone(&table)));
+            table
+        })
     }
 
     fn new(preset: Preset, near: u16) -> Self {
@@ -323,6 +303,10 @@ fn decode_regular_with_context(
     let sign_mask = qs >> 31;
     let bias = (ctx.bias() ^ sign_mask) - sign_mask;
     let corrected = correct_prediction(prediction + bias, c.maxval as i32);
+    if c.near != 0 && ctx.accepts_zero_rice() && r.take_zero_rice() {
+        ctx.update_zero_error(i32::from(c.preset.reset));
+        return Ok(corrected);
+    }
     let k = ctx.k();
     let mapped = decode_mapped(r, k, limit, qbpp)?;
     let error = unmap_error(mapped) ^ ctx.correction(k | c.near as u8);
@@ -383,41 +367,8 @@ fn decode_byte_rgb_shared<T: OutputSample>(
     Ok(sample)
 }
 
-#[inline(never)]
-fn decode_rgb_near_regular<const NEAR: u16>(
-    reader: &mut BitReader<'_>,
-    state: &mut RegularContext,
-    context_id: i32,
-    prediction: i32,
-) -> Result<i32, EntropyError> {
-    let sign = context_id >> 31;
-    let bias = (state.bias() ^ sign) - sign;
-    let predicted = correct_prediction(prediction + bias, 255);
-    if state.accepts_zero_rice() && reader.take_zero_rice() {
-        // A zero mapped error has no correction in near-lossless mode.
-        state.update_zero_error();
-        return Ok(predicted);
-    }
-    let range = (255 + 2 * i32::from(NEAR)) / (2 * i32::from(NEAR) + 1) + 1;
-    let qbpp = (range as u32 - 1).ilog2() as u8 + 1;
-    let mapped = decode_mapped(reader, state.k(), 32, qbpp)?;
-    let error = unmap_error(mapped);
-    if error.wrapping_add(range / 2) as u32 >= range as u32 {
-        return Err(EntropyError::PredictionErrorExceedsRange);
-    }
-    state.update(error, i32::from(NEAR), 64);
-    Ok(reconstructed(
-        predicted,
-        (error ^ sign) - sign,
-        1,
-        i32::from(NEAR),
-        255,
-        range,
-    ))
-}
-
 #[inline(always)]
-fn decode_mono_byte_regular(
+fn decode_lossless_byte_regular(
     reader: &mut BitReader<'_>,
     contexts: &mut [RegularContext; 365],
     context_id: i32,
@@ -611,6 +562,50 @@ pub(crate) fn append_scan(
     restart_interval: u32,
     output: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
+    append_scan_input(c, ScanInput::Words(input), restart_interval, output)
+}
+
+pub(crate) fn append_byte_scan(
+    c: ScanConfig,
+    input: &[u8],
+    restart_interval: u32,
+    output: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    append_scan_input(c, ScanInput::Bytes(input), restart_interval, output)
+}
+
+#[derive(Clone, Copy)]
+enum ScanInput<'a> {
+    Words(&'a [u16]),
+    Bytes(&'a [u8]),
+}
+
+impl ScanInput<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Words(samples) => samples.len(),
+            Self::Bytes(samples) => samples.len(),
+        }
+    }
+
+    fn row<'a>(&'a self, range: std::ops::Range<usize>, scratch: &'a mut Vec<u16>) -> &'a [u16] {
+        match self {
+            Self::Words(samples) => &samples[range],
+            Self::Bytes(samples) => {
+                scratch.clear();
+                scratch.extend(samples[range].iter().copied().map(u16::from));
+                scratch
+            }
+        }
+    }
+}
+
+fn append_scan_input(
+    c: ScanConfig,
+    input: ScanInput<'_>,
+    restart_interval: u32,
+    output: Vec<u8>,
+) -> Result<Vec<u8>, String> {
     let expected = c
         .width
         .checked_mul(c.height)
@@ -628,73 +623,24 @@ pub(crate) fn append_scan(
     if c.ilv == 1 {
         return encode_line_scan(c, input, restart_interval, output);
     }
-    if c.maxval == c.preset.maxval && c.preset.reset == 64 {
-        match (c.maxval, c.components, c.near) {
-            (255, 1, 0) => {
-                return encode_interleaved::<1, true, 255, 0>(c, input, restart_interval, output)
-            }
-            (255, 1, 1) => {
-                return encode_interleaved::<1, false, 255, 1>(c, input, restart_interval, output)
-            }
-            (255, 1, 3) => {
-                return encode_interleaved::<1, false, 255, 3>(c, input, restart_interval, output)
-            }
-            (255, 3, 0) => {
-                return encode_interleaved::<3, true, 255, 0>(c, input, restart_interval, output)
-            }
-            (4095, 1, 0) => {
-                return encode_interleaved::<1, true, 4095, 0>(c, input, restart_interval, output)
-            }
-            (65535, 1, 0) => {
-                return encode_interleaved::<1, true, 65535, 0>(c, input, restart_interval, output)
-            }
-            _ => {}
-        }
-    }
     match (c.components, c.near == 0) {
-        (1, true) => {
-            encode_interleaved::<1, true, 0, DYNAMIC_NEAR>(c, input, restart_interval, output)
-        }
-        (1, false) => {
-            encode_interleaved::<1, false, 0, DYNAMIC_NEAR>(c, input, restart_interval, output)
-        }
-        (2, _) => {
-            encode_interleaved::<2, false, 0, DYNAMIC_NEAR>(c, input, restart_interval, output)
-        }
-        (3, true) => {
-            encode_interleaved::<3, true, 0, DYNAMIC_NEAR>(c, input, restart_interval, output)
-        }
-        (3, false) => {
-            encode_interleaved::<3, false, 0, DYNAMIC_NEAR>(c, input, restart_interval, output)
-        }
+        (1, true) => encode_interleaved::<1, true>(c, input, restart_interval, output),
+        (1, false) => encode_interleaved::<1, false>(c, input, restart_interval, output),
+        (2, _) => encode_interleaved::<2, false>(c, input, restart_interval, output),
+        (3, true) => encode_interleaved::<3, true>(c, input, restart_interval, output),
+        (3, false) => encode_interleaved::<3, false>(c, input, restart_interval, output),
         _ => unreachable!("validated component count"),
     }
 }
 
-const DYNAMIC_NEAR: u16 = u16::MAX;
-
-fn encode_interleaved<
-    const COMPONENTS: usize,
-    const LOSSLESS: bool,
-    const MAXVAL: u16,
-    const NEAR: u16,
->(
-    mut c: ScanConfig,
-    input: &[u16],
+fn encode_interleaved<const COMPONENTS: usize, const LOSSLESS: bool>(
+    c: ScanConfig,
+    input: ScanInput<'_>,
     restart_interval: u32,
     output: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
-    if LOSSLESS {
-        c.near = 0;
-    }
-    if MAXVAL != 0 {
-        c.maxval = MAXVAL;
-        c.preset.maxval = MAXVAL;
-        c.preset.reset = 64;
-        c.near = NEAR;
-    }
     let (range, limit, qbpp) = golomb_params(&c);
-    let quantizer = ErrorQuantizer::new(c.maxval, c.near, range);
+    let quantizer = ErrorQuantizer::new(c.near, range);
     let gradients = GradientTable::for_scan(c.preset, c.near);
     let interval = u64::from(restart_interval);
     let mut restart_index = 0u8;
@@ -713,7 +659,10 @@ fn encode_interleaved<
     };
     let (mut previous, mut current) = lines.split_at_mut(stride);
     let mut previous_left = [0u16; COMPONENTS];
-    for (y, input_row) in input.chunks_exact(c.width * COMPONENTS).enumerate() {
+    let row_len = c.width * COMPONENTS;
+    let mut scratch = Vec::new();
+    for y in 0..c.height {
+        let input_row = input.row(y * row_len..(y + 1) * row_len, &mut scratch);
         // T.87 B.4/D.4: an MCU is one image line, so a restart boundary always
         // falls between lines and never inside a run.
         if interval != 0 && y != 0 && (y as u64).is_multiple_of(interval) {
@@ -826,8 +775,19 @@ fn matching_run<const COMPONENTS: usize>(
     near: u16,
 ) -> usize {
     #[cfg(target_arch = "x86_64")]
-    if COMPONENTS == 1 && samples.len() >= 16 && samples[0][0].abs_diff(reference[0]) <= near {
-        return matching_mono_run(samples.as_flattened(), reference[0], near);
+    if samples.len() >= 16 {
+        if COMPONENTS == 1 && samples[0][0].abs_diff(reference[0]) <= near {
+            return matching_mono_run(samples.as_flattened(), reference[0], near);
+        }
+        if COMPONENTS == 3
+            && samples[0]
+                .iter()
+                .zip(reference)
+                .all(|(&a, b)| a.abs_diff(b) <= near)
+        {
+            let reference = [reference[0], reference[1], reference[2]];
+            return matching_rgb_run(samples.as_flattened(), reference, near);
+        }
     }
     samples
         .iter()
@@ -869,23 +829,81 @@ fn matching_mono_run(samples: &[u16], reference: u16, near: u16) -> usize {
             .count()
 }
 
+#[cfg(target_arch = "x86_64")]
+fn matching_rgb_run(samples: &[u16], [r, g, b]: [u16; 3], near: u16) -> usize {
+    use std::arch::x86_64::*;
+
+    let (blocks, tail) = samples.as_chunks::<24>();
+    // SAFETY: SSE2 is available on x86-64. Each block contains eight complete
+    // pixels, so the channel order realigns after three unaligned vector loads.
+    unsafe {
+        let (r, g, b) = (r as i16, g as i16, b as i16);
+        let references = [
+            _mm_setr_epi16(r, g, b, r, g, b, r, g),
+            _mm_setr_epi16(b, r, g, b, r, g, b, r),
+            _mm_setr_epi16(g, b, r, g, b, r, g, b),
+        ];
+        let limit = _mm_set1_epi16(near as i16);
+        let zero = _mm_setzero_si128();
+        for (index, block) in blocks.iter().enumerate() {
+            let mut mask = 0u64;
+            for (i, (values, reference)) in
+                block.as_chunks::<8>().0.iter().zip(references).enumerate()
+            {
+                let values = _mm_loadu_si128(values.as_ptr().cast());
+                let matches = if near == 0 {
+                    _mm_cmpeq_epi16(values, reference)
+                } else {
+                    let difference = _mm_or_si128(
+                        _mm_subs_epu16(values, reference),
+                        _mm_subs_epu16(reference, values),
+                    );
+                    _mm_cmpeq_epi16(_mm_subs_epu16(difference, limit), zero)
+                };
+                mask |= u64::from(_mm_movemask_epi8(matches) as u16) << (i * 16);
+            }
+            if mask != (1u64 << 48) - 1 {
+                return index * 8 + mask.trailing_ones() as usize / 6;
+            }
+        }
+    }
+    blocks.len() * 8
+        + tail
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .take_while(|pixel| {
+                pixel[0].abs_diff(r) <= near
+                    && pixel[1].abs_diff(g) <= near
+                    && pixel[2].abs_diff(b) <= near
+            })
+            .count()
+}
+
 fn encode_line_scan(
     c: ScanConfig,
-    input: &[u16],
+    input: ScanInput<'_>,
     restart_interval: u32,
     output: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     let (range, limit, qbpp) = golomb_params(&c);
-    let quantizer = ErrorQuantizer::new(c.maxval, c.near, range);
+    let quantizer = ErrorQuantizer::new(c.near, range);
+    let gradients = GradientTable::for_scan(c.preset, c.near);
     let interval = u64::from(restart_interval);
     let mut restart_index = 0u8;
     let mut writer = BitWriter::from_bytes(output);
     let mut contexts = [RegularContext::new(range); 365];
     let mut run_contexts = [RunContext::new(0, range), RunContext::new(1, range)];
     let mut run_indexes = vec![0usize; c.components];
-    let mut previous = vec![0i32; c.width * c.components];
+    let stride = c.width + 2;
+    let mut previous = vec![0i32; stride * c.components];
+    let mut current = vec![0i32; stride * c.components];
     let mut previous_left = vec![0i32; c.components];
+    let mut component_samples = Vec::with_capacity(c.width);
+    let row_len = c.width * c.components;
+    let mut scratch = Vec::new();
     for y in 0..c.height {
+        let input_row = input.row(y * row_len..(y + 1) * row_len, &mut scratch);
         // V1 = V2 = 1: one image line is one MCU, even for line interleave.
         if interval != 0 && y != 0 && (y as u64).is_multiple_of(interval) {
             writer = end_restart_interval(writer, &mut restart_index);
@@ -898,75 +916,54 @@ fn encode_line_scan(
                 &mut previous_left,
             );
         }
-        let mut current = vec![0i32; c.width * c.components];
-        for component in 0..c.components {
-            let mut run_index = run_indexes[component];
+        for (component, run_index) in run_indexes.iter_mut().enumerate() {
+            let start = component * stride;
+            let row = &mut current[start + 1..start + 1 + c.width];
+            let prior = &mut previous[start..start + stride];
+            prior[0] = previous_left[component];
+            prior[c.width + 1] = prior[c.width];
+            component_samples.clear();
+            component_samples.extend(input_row[component..].iter().step_by(c.components).copied());
+            let samples = component_samples.as_chunks::<1>().0;
+            let mut ra = prior[1];
+            let mut horizontal = gradients.quantize(ra - prior[0]);
             let mut x = 0usize;
-            while x < c.width {
-                let at = component * c.width + x;
-                let ra = if x == 0 {
-                    if y != 0 {
-                        previous[component * c.width]
-                    } else {
-                        0
-                    }
-                } else {
-                    current[component * c.width + x - 1]
-                };
-                let rb = previous[at];
-                let rc = if x == 0 {
-                    if y != 0 {
-                        previous_left[component]
-                    } else {
-                        0
-                    }
-                } else {
-                    previous[component * c.width + x - 1]
-                };
-                let rd = if x + 1 == c.width {
-                    rb
-                } else {
-                    previous[at + 1]
-                };
-                let qs = context_id(ra, rb, rc, rd, &c.preset, c.near as i32);
+            let mut neighborhoods = prior.windows(3);
+            while let Some(&[rc, rb, rd]) = neighborhoods.next() {
+                let next = gradients.quantize(rd - rb);
+                let qs = (next * 9 + horizontal) * 9 + gradients.quantize(rc - ra);
+                horizontal = next;
                 if qs == 0 {
-                    let mut run = 0usize;
-                    while x + run < c.width {
-                        let sample = (y * c.width + x + run) * c.components + component;
-                        if (input[sample] as i32 - ra).abs() > c.near as i32 {
-                            break;
-                        }
-                        run += 1;
+                    let run = matching_run(&samples[x..], [ra as u16], c.near);
+                    encode_run_length(&mut writer, run, run_index, run == c.width - x)?;
+                    row[x..x + run].fill(ra);
+                    x += run;
+                    if x == c.width {
+                        break;
                     }
-                    encode_run_length(&mut writer, run, &mut run_index, run == c.width - x)?;
-                    for j in 0..run {
-                        current[component * c.width + x + j] = ra;
-                    }
-                    if run < c.width - x {
-                        let pos = x + run;
-                        let sample = (y * c.width + pos) * c.components + component;
-                        let previous_at = previous[component * c.width + pos];
-                        current[component * c.width + pos] = encode_run_interrupt(
-                            &mut writer,
-                            &mut run_contexts,
-                            run_index,
-                            input[sample] as i32,
-                            ra,
-                            previous_at,
-                            &c,
-                            quantizer,
-                            limit,
-                            qbpp,
-                        );
-                        run_index = run_index.saturating_sub(1);
-                        x = pos + 1;
-                    } else {
-                        x += run;
+                    ra = encode_run_interrupt(
+                        &mut writer,
+                        &mut run_contexts,
+                        *run_index,
+                        i32::from(samples[x][0]),
+                        ra,
+                        prior[x + 1],
+                        &c,
+                        quantizer,
+                        limit,
+                        qbpp,
+                    );
+                    row[x] = ra;
+                    *run_index = run_index.saturating_sub(1);
+                    x += 1;
+                    if run != 0 {
+                        horizontal = gradients.quantize(prior[x + 1] - prior[x]);
+                        neighborhoods = prior[x..].windows(3);
                     }
                 } else {
                     let idx = qs.unsigned_abs() as usize;
-                    let sample = input[(y * c.width + x) * c.components + component] as i32;
-                    current[at] = encode_regular(
+                    let sample = i32::from(samples[x][0]);
+                    ra = encode_regular(
                         &mut writer,
                         &mut contexts[idx],
                         qs,
@@ -979,15 +976,13 @@ fn encode_line_scan(
                         limit,
                         qbpp,
                     );
+                    row[x] = ra;
                     x += 1;
                 }
             }
-            run_indexes[component] = run_index;
+            previous_left[component] = prior[1];
         }
-        for component in 0..c.components {
-            previous_left[component] = previous[component * c.width];
-        }
-        previous = current;
+        std::mem::swap(&mut previous, &mut current);
     }
     Ok(writer.finish())
 }
@@ -1071,48 +1066,35 @@ fn decode_sample_scan<T: OutputSample>(
     scan: &[u8],
     restart_interval: u32,
 ) -> Result<Vec<T>, String> {
-    if c.maxval == 255 && c.preset.maxval == 255 && c.preset.reset == 64 {
-        match (c.components, c.near) {
-            (1, 0) => return decode_interleaved::<T, 1, true, 0>(c, scan, restart_interval),
-            (1, 1) => return decode_interleaved::<T, 1, false, 1>(c, scan, restart_interval),
-            (1, 3) => return decode_interleaved::<T, 1, false, 3>(c, scan, restart_interval),
-            (3, 0) => return decode_interleaved::<T, 3, true, 0>(c, scan, restart_interval),
-            (3, 1) => return decode_interleaved::<T, 3, false, 1>(c, scan, restart_interval),
-            (3, 3) => return decode_interleaved::<T, 3, false, 3>(c, scan, restart_interval),
-            _ => {}
-        }
-    }
-    match (c.components, c.near == 0) {
-        (1, true) => decode_interleaved::<T, 1, true, DYNAMIC_NEAR>(c, scan, restart_interval),
-        (1, false) => decode_interleaved::<T, 1, false, DYNAMIC_NEAR>(c, scan, restart_interval),
-        (2, _) => decode_interleaved::<T, 2, false, DYNAMIC_NEAR>(c, scan, restart_interval),
-        (3, true) => decode_interleaved::<T, 3, true, DYNAMIC_NEAR>(c, scan, restart_interval),
-        (3, false) => decode_interleaved::<T, 3, false, DYNAMIC_NEAR>(c, scan, restart_interval),
+    let byte_lossless = is_byte_lossless(&c);
+    match (c.components, c.near == 0, byte_lossless) {
+        (1, true, true) => decode_interleaved::<T, 1, true, true>(c, scan, restart_interval),
+        (3, true, true) => decode_interleaved::<T, 3, true, true>(c, scan, restart_interval),
+        (1, true, false) => decode_interleaved::<T, 1, true, false>(c, scan, restart_interval),
+        (1, false, _) => decode_interleaved::<T, 1, false, false>(c, scan, restart_interval),
+        (2, _, _) => decode_interleaved::<T, 2, false, false>(c, scan, restart_interval),
+        (3, true, false) => decode_interleaved::<T, 3, true, false>(c, scan, restart_interval),
+        (3, false, _) => decode_interleaved::<T, 3, false, false>(c, scan, restart_interval),
         _ => unreachable!("validated component count"),
     }
+}
+
+fn is_byte_lossless(c: &ScanConfig) -> bool {
+    c.near == 0 && c.maxval == 255 && c.preset.maxval == 255 && c.preset.reset == 64
 }
 
 fn decode_interleaved<
     T: OutputSample,
     const COMPONENTS: usize,
     const LOSSLESS: bool,
-    const BYTE_NEAR: u16,
+    const BYTE_LOSSLESS: bool,
 >(
-    mut c: ScanConfig,
+    c: ScanConfig,
     scan: &[u8],
     restart_interval: u32,
 ) -> Result<Vec<T>, String> {
     if c.maxval != c.preset.maxval {
         return Err("JPEG-LS scan and preset MAXVAL differ".into());
-    }
-    if LOSSLESS {
-        c.near = 0;
-    }
-    if BYTE_NEAR != DYNAMIC_NEAR {
-        c.maxval = 255;
-        c.preset.maxval = 255;
-        c.preset.reset = 64;
-        c.near = BYTE_NEAR;
     }
     let (range, limit, qbpp) = golomb_params(&c);
     // With no DRI, BitReader validates the entire scan as one entropy segment.
@@ -1224,7 +1206,7 @@ fn decode_interleaved<
                     // SAFETY: Three signed base-nine digits give |qs| <= 364.
                     let stored =
                         unsafe { contexts.get_unchecked_mut(qs[0].unsigned_abs() as usize) };
-                    if BYTE_NEAR == 0 {
+                    if BYTE_LOSSLESS {
                         let rgb = decode_byte_rgb_shared(
                             &mut reader,
                             stored,
@@ -1259,22 +1241,10 @@ fn decode_interleaved<
                     continue;
                 }
                 let mut decode_component = |i: usize| {
-                    if COMPONENTS == 1 && BYTE_NEAR == 0 {
-                        return decode_mono_byte_regular(
+                    if BYTE_LOSSLESS {
+                        return decode_lossless_byte_regular(
                             &mut reader,
                             &mut contexts,
-                            qs[i],
-                            predictions[i],
-                        )
-                        .map(T::from_integer);
-                    }
-                    if COMPONENTS == 3 && matches!(BYTE_NEAR, 1 | 3) {
-                        // SAFETY: Three signed base-nine digits give |qs| <= 364.
-                        let context =
-                            unsafe { contexts.get_unchecked_mut(qs[i].unsigned_abs() as usize) };
-                        return decode_rgb_near_regular::<BYTE_NEAR>(
-                            &mut reader,
-                            context,
                             qs[i],
                             predictions[i],
                         )
@@ -1319,66 +1289,69 @@ fn decode_interleaved<
 /// sample of the line before it, and `current` receives the decoded line; the
 /// buffers are component-local so a sub-sampled scan can use planes of
 /// different widths. Returns the updated run-mode index.
-fn decode_component_line(
+fn decode_component_line<T: OutputSample, const BYTE_LOSSLESS: bool>(
     reader: &mut BitReader<'_>,
     contexts: &mut [RegularContext; 365],
     run_contexts: &mut [RunContext; 2],
     run_index: usize,
-    previous: &[i32],
-    previous_left: i32,
-    current: &mut [i32],
+    previous: &mut [T],
+    previous_left: T,
+    current: &mut [T],
     c: &ScanConfig,
+    gradients: &GradientTable,
     range: i32,
     limit: u32,
     qbpp: u8,
 ) -> Result<usize, String> {
     let width = c.width;
+    previous[0] = previous_left;
+    previous[width + 1] = previous[width];
     let mut run_index = run_index;
     let mut x = 0usize;
-    while x < width {
-        let ra = if x == 0 { previous[0] } else { current[x - 1] };
-        let rb = previous[x];
-        let rc = if x == 0 {
-            previous_left
-        } else {
-            previous[x - 1]
-        };
-        let rd = if x + 1 == width { rb } else { previous[x + 1] };
-        let qs = context_id(ra, rb, rc, rd, &c.preset, c.near as i32);
+    let mut ra = previous[1].as_integer();
+    let mut horizontal = gradients.quantize_reconstructed(ra - previous_left.as_integer());
+    let mut neighborhoods = previous.windows(3);
+    while let Some(&[rc, rb, rd]) = neighborhoods.next() {
+        let (rc, rb, rd) = (rc.as_integer(), rb.as_integer(), rd.as_integer());
+        let next = gradients.quantize_reconstructed(rd - rb);
+        let qs = (next * 9 + horizontal) * 9 + gradients.quantize_reconstructed(rc - ra);
+        horizontal = next;
         if qs == 0 {
             let run = decode_run_length(reader, width - x, &mut run_index)?;
-            for value in current[x..x + run].iter_mut() {
-                *value = ra;
+            current[x..x + run].fill(T::from_integer(ra));
+            x += run;
+            if x == width {
+                break;
             }
-            if run == width - x {
-                x += run;
-            } else {
-                let pos = x + run;
-                current[pos] = decode_run_interrupt(
-                    reader,
-                    run_contexts,
-                    run_index,
-                    ra,
-                    previous[pos],
-                    c,
-                    range,
-                    limit,
-                    qbpp,
-                )?;
-                run_index = run_index.saturating_sub(1);
-                x = pos + 1;
-            }
-        } else {
-            current[x] = decode_regular(
+            ra = decode_run_interrupt(
                 reader,
-                contexts,
-                qs,
-                predict(ra, rb, rc),
+                run_contexts,
+                run_index,
+                ra,
+                previous[x + 1].as_integer(),
                 c,
                 range,
                 limit,
                 qbpp,
             )?;
+            current[x] = T::from_integer(ra);
+            run_index = run_index.saturating_sub(1);
+            x += 1;
+            if run != 0 {
+                horizontal = gradients.quantize_reconstructed(
+                    previous[x + 1].as_integer() - previous[x].as_integer(),
+                );
+                neighborhoods = previous[x..].windows(3);
+            }
+        } else {
+            let prediction = predict(ra, rb, rc);
+            ra = if BYTE_LOSSLESS {
+                decode_lossless_byte_regular(reader, contexts, qs, prediction)?
+            } else {
+                decode_regular(reader, contexts, qs, prediction, c, range, limit, qbpp)?
+            };
+            // SAFETY: There are width windows in the padded row and width outputs.
+            unsafe { *current.get_unchecked_mut(x) = T::from_integer(ra) };
             x += 1;
         }
     }
@@ -1406,7 +1379,79 @@ pub(crate) fn decode_line_scan_planes(
     {
         return Err("invalid scan geometry".into());
     }
+    let mut planes: Vec<Vec<u16>> = geometry
+        .iter()
+        .map(|(width, height, _)| vec![0u16; width * height])
+        .collect();
+    decode_line_rows(
+        c,
+        geometry,
+        scan,
+        restart_interval,
+        |index, line, rows, component| {
+            let row = &rows[component];
+            let width = row.len();
+            planes[index][line * width..(line + 1) * width].copy_from_slice(row);
+        },
+    )?;
+    Ok(planes)
+}
+
+pub(crate) fn decode_rgb_byte_lines(
+    c: ScanConfig,
+    scan: &[u8],
+    restart_interval: u32,
+) -> Result<Vec<u8>, String> {
+    let geometry = [(c.width, c.height, 1); 3];
+    let stride = c.width * 3;
+    let mut output = vec![0; stride * c.height];
+    decode_line_rows(
+        c,
+        &geometry,
+        scan,
+        restart_interval,
+        |index, line, rows, _| {
+            if index == 2 {
+                // The last component completes this row for all three components.
+                let padded = c.width + 2;
+                let red = &rows[1..1 + c.width];
+                let green = &rows[padded + 1..padded + 1 + c.width];
+                let blue = &rows[2 * padded + 1..2 * padded + 1 + c.width];
+                let pixels = output[line * stride..(line + 1) * stride]
+                    .as_chunks_mut::<3>()
+                    .0;
+                for (((pixel, &r), &g), &b) in pixels.iter_mut().zip(red).zip(green).zip(blue) {
+                    *pixel = [r, g, b];
+                }
+            }
+        },
+    )?;
+    Ok(output)
+}
+
+fn decode_line_rows<T: OutputSample>(
+    c: ScanConfig,
+    geometry: &[(usize, usize, usize)],
+    scan: &[u8],
+    restart_interval: u32,
+    write_row: impl FnMut(usize, usize, &[T], std::ops::Range<usize>),
+) -> Result<(), String> {
+    if is_byte_lossless(&c) {
+        decode_line_rows_impl::<T, true>(c, geometry, scan, restart_interval, write_row)
+    } else {
+        decode_line_rows_impl::<T, false>(c, geometry, scan, restart_interval, write_row)
+    }
+}
+
+fn decode_line_rows_impl<T: OutputSample, const BYTE_LOSSLESS: bool>(
+    c: ScanConfig,
+    geometry: &[(usize, usize, usize)],
+    scan: &[u8],
+    restart_interval: u32,
+    mut write_row: impl FnMut(usize, usize, &[T], std::ops::Range<usize>),
+) -> Result<(), String> {
     let (range, limit, qbpp) = golomb_params(&c);
+    let gradients = GradientTable::for_scan(c.preset, c.near);
     let rounds = geometry
         .iter()
         .map(|(_, height, vs)| height.div_ceil(*vs))
@@ -1428,15 +1473,11 @@ pub(crate) fn decode_line_scan_planes(
     let mut total = 0usize;
     for (width, _, _) in geometry {
         offsets.push(total);
-        total += *width;
+        total += *width + 2;
     }
-    let mut previous = vec![0i32; total];
-    let mut current = vec![0i32; total];
-    let mut previous_left = vec![0i32; c.components];
-    let mut planes: Vec<Vec<u16>> = geometry
-        .iter()
-        .map(|(width, height, _)| vec![0u16; width * height])
-        .collect();
+    let mut even = vec![T::default(); total];
+    let mut odd = vec![T::default(); total];
+    let mut previous_left = vec![T::default(); c.components];
     for round in 0..rounds {
         if interval != 0 && round != 0 && (round as u64).is_multiple_of(interval) {
             begin_restart_interval(&mut reader, &segments, &mut segment_index)?;
@@ -1445,9 +1486,10 @@ pub(crate) fn decode_line_scan_planes(
                 &mut contexts,
                 &mut run_contexts,
                 &mut run_indexes,
-                &mut previous,
+                &mut even,
                 &mut previous_left,
             );
+            odd.fill(T::default());
         }
         for (index, &(width, height, vs)) in geometry.iter().enumerate() {
             let offset = offsets[index];
@@ -1460,35 +1502,37 @@ pub(crate) fn decode_line_scan_planes(
             for k in 0..vs {
                 let line = round * vs + k;
                 let left = previous_left[index];
-                let run_index = decode_component_line(
+                let even_row = &mut even[offset..offset + width + 2];
+                let odd_row = &mut odd[offset..offset + width + 2];
+                let (previous, current) = if line % 2 == 0 {
+                    (even_row, odd_row)
+                } else {
+                    (odd_row, even_row)
+                };
+                let run_index = decode_component_line::<T, BYTE_LOSSLESS>(
                     &mut reader,
                     &mut contexts,
                     &mut run_contexts,
                     run_indexes[index],
-                    &previous[offset..offset + width],
+                    previous,
                     left,
-                    &mut current[offset..offset + width],
+                    &mut current[1..=width],
                     &component,
+                    &gradients,
                     range,
                     limit,
                     qbpp,
                 )?;
                 run_indexes[index] = run_index;
+                previous_left[index] = previous[1];
                 if line < height {
-                    for (dst, src) in planes[index][line * width..(line + 1) * width]
-                        .iter_mut()
-                        .zip(&current[offset..offset + width])
-                    {
-                        *dst = *src as u16;
-                    }
+                    let rows = if line % 2 == 0 { &odd } else { &even };
+                    write_row(index, line, rows, offset + 1..offset + width + 1);
                 }
-                previous_left[index] = previous[offset];
-                previous[offset..offset + width].copy_from_slice(&current[offset..offset + width]);
             }
         }
     }
-    reader.finish()?;
-    Ok(planes)
+    reader.finish()
 }
 
 fn decode_line_scan(c: ScanConfig, scan: &[u8], restart_interval: u32) -> Result<Vec<u16>, String> {
@@ -1508,22 +1552,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn byte_error_table_matches_arithmetic_near_lossless_quantization() {
-        for near in [1, 3] {
+    fn rgb_runs_stop_at_the_first_out_of_range_component() {
+        let reference = [0, 127, u16::MAX];
+        for near in [0, 1, 3] {
+            let matched = [near, 127 + near, u16::MAX - near];
+            let samples = [matched; 25];
+            assert_eq!(matching_run(&samples, reference, near), samples.len());
+            for index in 0..samples.len() {
+                for component in 0..3 {
+                    let mut interrupted = samples;
+                    interrupted[index][component] = reference[component] ^ u16::MAX;
+                    assert_eq!(matching_run(&interrupted, reference, near), index);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reciprocal_quantization_matches_integer_division() {
+        for near in 0u16..=127 {
             let range = Preset::defaults(255, near).unwrap().range(near) as i32;
-            let table = ErrorQuantizer::new(255, near, range);
-            let arithmetic = ErrorQuantizer {
-                byte_table: None,
-                ..table
-            };
-            for error in -255..=255 {
-                assert_eq!(table.quantize(error), arithmetic.quantize(error));
+            let quantizer = ErrorQuantizer::new(near, range);
+            let near = i32::from(near);
+            for error in -255i32..=255 {
+                let magnitude = (error.abs() + near) / (2 * near + 1);
+                let signed = magnitude * error.signum();
+                let expected = (signed + range / 2).rem_euclid(range) - range / 2;
+                assert_eq!(quantizer.quantize(error), expected);
             }
         }
     }
 
     #[test]
     fn gradient_table_matches_thresholds_across_the_entire_sample_range() {
+        use crate::run::quantize;
+
         for (preset, near) in [
             (Preset::defaults(255, 0).unwrap(), 0),
             (Preset::defaults(65535, 3).unwrap(), 3),
@@ -1532,8 +1595,14 @@ mod tests {
             let table = GradientTable::new(preset, near);
             for d in -i32::from(preset.maxval)..=i32::from(preset.maxval) {
                 assert_eq!(
-                    table.quantize(d) * 81,
-                    context_id(0, 0, 0, d, &preset, i32::from(near))
+                    context_id(0, 0, 0, d, &table),
+                    quantize(
+                        d,
+                        preset.t1.into(),
+                        preset.t2.into(),
+                        preset.t3.into(),
+                        near.into()
+                    ) * 81,
                 );
             }
         }
@@ -1542,6 +1611,7 @@ mod tests {
     #[test]
     fn gradient_quantization_addresses_all_regular_contexts() {
         let preset = Preset::defaults(255, 0).unwrap();
+        let table = GradientTable::new(preset, 0);
         let gradients = [-30, -10, -4, -1, 0, 1, 4, 10, 30];
         let mut visited = [false; 365];
         for d1 in gradients {
@@ -1551,7 +1621,7 @@ mod tests {
                     let rc = rb - d2;
                     let ra = rc - d3;
                     let rd = rb + d1;
-                    visited[context_id(ra, rb, rc, rd, &preset, 0).unsigned_abs() as usize] = true;
+                    visited[context_id(ra, rb, rc, rd, &table).unsigned_abs() as usize] = true;
                 }
             }
         }

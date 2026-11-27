@@ -61,12 +61,12 @@ impl RegularContext {
     }
 
     #[inline(always)]
-    pub(crate) fn update_zero_error(&mut self) {
+    pub(crate) fn update_zero_error(&mut self, reset: i32) {
         // B is already in [1-N, 0], and increasing N preserves the bias.
-        if self.n == 64 {
+        if self.n == reset {
             self.a >>= 1;
             self.b >>= 1;
-            self.n = 32;
+            self.n >>= 1;
         }
         self.n += 1;
     }
@@ -77,7 +77,7 @@ impl RegularContext {
         // After the count advances, B remains in the new bias interval.
         self.a -= error;
         self.b += error;
-        self.update_zero_error();
+        self.update_zero_error(64);
     }
 
     #[inline(always)]
@@ -118,7 +118,7 @@ mod tests {
                 let mut regular = RegularContext { a: n, b, n, c: 7 };
                 let mut zero = regular;
                 regular.update(0, 1, 64);
-                zero.update_zero_error();
+                zero.update_zero_error(64);
                 assert_eq!(
                     (zero.a, zero.b, zero.n, zero.c),
                     (regular.a, regular.b, regular.n, regular.c)

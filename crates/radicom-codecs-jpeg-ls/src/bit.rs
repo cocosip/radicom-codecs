@@ -263,15 +263,12 @@ impl<'a> BitReader<'a> {
             self.fill()?;
         }
         let pending = self.current << (64 - self.left);
-        if k == 0 && pending >> 63 != 0 && limit != 0 {
-            self.left -= 1;
-            return Ok(0);
-        }
         let zeroes = (pending | 1).leading_zeros();
         let width = zeroes + 1 + u32::from(k);
         if width <= u32::from(self.left) && zeroes < limit.min(63) {
             self.left -= width as u8;
-            let suffix = ((self.current >> self.left) as u32) & ((1 << k) - 1);
+            // The aligned code starts with unary zeroes and a one above the suffix.
+            let suffix = ((pending >> (64 - width)) as u32) ^ (1 << k);
             return Ok((zeroes << k) | suffix);
         }
         self.read_long_rice(k, limit, qbpp)
