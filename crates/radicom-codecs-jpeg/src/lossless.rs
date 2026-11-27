@@ -193,21 +193,23 @@ impl LosslessFrame {
             }
         }
         let mut frequencies = [[0u32; 256]; 2];
-        let shared_left = predictor == 1
+        // Above prediction otherwise uses the general scan walker twice.
+        let shared_dc_min_samples = if predictor == 2 { 1024 } else { 4096 };
+        let shared_dc = matches!(predictor, 1 | 2)
             && point_transform == 0
             && restart_interval.is_none()
             && !used[1]
             && scans.len() == 1
             && scans[0].iter().copied().eq(0..self.components)
-            && self.samples.len() >= 4096;
-        let mut reconstructed = if predictor == 1 && restart_interval.is_none() {
+            && self.samples.len() >= shared_dc_min_samples;
+        let mut reconstructed = if shared_dc || (predictor == 1 && restart_interval.is_none()) {
             Vec::new()
         } else {
             allocate_samples(self.samples.len())?
         };
         for scan in scans {
-            if shared_left {
-                self.count_left_differences(&mut frequencies[0]);
+            if shared_dc {
+                self.count_differences(predictor, &mut frequencies[0]);
                 continue;
             }
             self.walk_scan(
@@ -267,8 +269,13 @@ impl LosslessFrame {
                 &sos_payload(scan, predictor, point_transform, colorspace)?,
             )?;
             let mut entropy = BitWriter::default();
-            if shared_left {
-                encode_left_differences(self, &tables[0].as_ref().unwrap().2, &mut entropy);
+            if shared_dc {
+                encode_shared_dc(
+                    self,
+                    predictor,
+                    &tables[0].as_ref().unwrap().2,
+                    &mut entropy,
+                );
                 entropy.flush_to_byte();
                 output_bytes(&mut output, entropy.take_bytes());
                 continue;
@@ -335,30 +342,38 @@ impl LosslessFrame {
         Ok(output.into_bytes())
     }
 
-    fn left_differences(&self, mut visit: impl FnMut(&[u16])) {
+    fn differences(&self, predictor: u8, mut visit: impl FnMut(&[u16])) {
         let stride = usize::from(self.components);
-        let mut above = [1u16 << (self.precision - 1); 3];
+        let initial = [1u16 << (self.precision - 1); 3];
+        let mut previous_row = &initial[..stride];
         let mut scratch = [0; 256];
-        for row in self.samples.chunks_exact(self.width * stride) {
-            for c in 0..stride {
-                scratch[c] = row[c].wrapping_sub(above[c]);
-                above[c] = row[c];
-            }
-            visit(&scratch[..stride]);
-            for (values, previous) in row[stride..].chunks(256).zip(row.chunks(256)) {
+        for (y, row) in self.samples.chunks_exact(self.width * stride).enumerate() {
+            let (values, predictions) = if predictor == 2 && y != 0 {
+                (row, previous_row)
+            } else {
+                for c in 0..stride {
+                    scratch[c] = row[c].wrapping_sub(previous_row[c]);
+                }
+                visit(&scratch[..stride]);
+                (&row[stride..], row)
+            };
+            for (values, predictions) in values.chunks(256).zip(predictions.chunks(256)) {
                 let differences = &mut scratch[..values.len()];
-                for ((out, &value), &left) in differences.iter_mut().zip(values).zip(previous) {
-                    *out = value.wrapping_sub(left);
+                for ((out, &value), &prediction) in
+                    differences.iter_mut().zip(values).zip(predictions)
+                {
+                    *out = value.wrapping_sub(prediction);
                 }
                 visit(differences);
             }
+            previous_row = row;
         }
     }
 
-    fn count_left_differences(&self, frequencies: &mut [u32; 256]) {
+    fn count_differences(&self, predictor: u8, frequencies: &mut [u32; 256]) {
         // Independent counters keep short repeated categories from serializing the histogram.
         let mut counts = [[0u32; 17]; 4];
-        self.left_differences(|differences| {
+        self.differences(predictor, |differences| {
             let (blocks, tail) = differences.as_chunks::<8>();
             for block in blocks {
                 if *block == [0; 8] {
@@ -630,7 +645,12 @@ impl LosslessFrame {
     }
 }
 
-fn encode_left_differences(frame: &LosslessFrame, table: &HuffmanTable, bits: &mut BitWriter) {
+fn encode_shared_dc(
+    frame: &LosslessFrame,
+    predictor: u8,
+    table: &HuffmanTable,
+    bits: &mut BitWriter,
+) {
     let code = |difference: i32| {
         let category = category(difference);
         let Some((prefix, width)) = table.codeword(category) else {
@@ -661,7 +681,7 @@ fn encode_left_differences(frame: &LosslessFrame, table: &HuffmanTable, bits: &m
     } else {
         0
     };
-    frame.left_differences(|differences| {
+    frame.differences(predictor, |differences| {
         let (blocks, tail) = differences.as_chunks::<8>();
         for block in blocks {
             if width <= 4 && *block == [0; 8] {
@@ -709,7 +729,7 @@ fn decode_scan(
     let stride = usize::from(components);
     let mut restart_index = 0u8;
     let mut next_restart = restart_interval.map_or(usize::MAX, usize::from);
-    if scan.predictor == 1
+    if matches!(scan.predictor, 1 | 2)
         && scan.point_transform == 0
         && restart_interval.is_none()
         && samples.len() >= 256
@@ -728,9 +748,23 @@ fn decode_scan(
             .as_ref()
             .ok_or_else(|| format!("missing JPEG DC Huffman table {id}"))?;
         if stride == 1 {
-            decode_shared_dc::<1>(&mut bits, huffman, samples, width, precision)?;
+            decode_shared_dc::<1>(
+                &mut bits,
+                huffman,
+                samples,
+                width,
+                precision,
+                scan.predictor,
+            )?;
         } else {
-            decode_shared_dc::<3>(&mut bits, huffman, samples, width, precision)?;
+            decode_shared_dc::<3>(
+                &mut bits,
+                huffman,
+                samples,
+                width,
+                precision,
+                scan.predictor,
+            )?;
         }
         bits.align_to_byte();
         return Ok(bits.position());
@@ -843,6 +877,7 @@ fn decode_shared_dc<const N: usize>(
     samples: &mut [u16],
     width: usize,
     precision: u8,
+    predictor: u8,
 ) -> Result<(), String> {
     let amplitudes = huffman.short_amplitudes::<10, 1024>();
     #[derive(Clone, Copy, Default)]
@@ -875,6 +910,7 @@ fn decode_shared_dc<const N: usize>(
     }
     let max = (1i32 << precision) - 1;
     let mut above = [1i32 << (precision - 1); N];
+    let mut previous_row: &[u16] = &[];
     for (y, row) in samples.chunks_exact_mut(width * N).enumerate() {
         let mut index = 0;
         while index < row.len() {
@@ -909,21 +945,36 @@ fn decode_shared_dc<const N: usize>(
                 index += 1;
             }
         }
-        let mut left = above;
-        for (x, pixel) in row.as_chunks_mut::<N>().0.iter_mut().enumerate() {
-            for c in 0..N {
-                let difference = i32::from(pixel[c] as i16);
-                let value = left[c] + difference;
-                if precision < 16 && !(0..=max).contains(&value) {
-                    return Err(format!("JPEG lossless sample is outside the declared precision at pixel {}, component {c}: prediction={}, amplitude={difference}, shifted={value}, max={max}", y * width + x, left[c]));
+        if predictor == 2 && y != 0 {
+            for (sample, &prediction) in row.iter_mut().zip(previous_row) {
+                *sample = sample.wrapping_add(prediction);
+            }
+            if precision < 16 {
+                if let Some(index) = row.iter().position(|&value| i32::from(value) > max) {
+                    let prediction = previous_row[index];
+                    let difference = row[index].wrapping_sub(prediction) as i16;
+                    let value = i32::from(prediction) + i32::from(difference);
+                    return Err(format!("JPEG lossless sample is outside the declared precision at pixel {}, component {}: prediction={prediction}, amplitude={difference}, shifted={value}, max={max}", y * width + index / N, index % N));
                 }
-                pixel[c] = value as u16;
-                left[c] = i32::from(pixel[c]);
+            }
+        } else {
+            let mut left = above;
+            for (x, pixel) in row.as_chunks_mut::<N>().0.iter_mut().enumerate() {
+                for c in 0..N {
+                    let difference = i32::from(pixel[c] as i16);
+                    let value = left[c] + difference;
+                    if precision < 16 && !(0..=max).contains(&value) {
+                        return Err(format!("JPEG lossless sample is outside the declared precision at pixel {}, component {c}: prediction={}, amplitude={difference}, shifted={value}, max={max}", y * width + x, left[c]));
+                    }
+                    pixel[c] = value as u16;
+                    left[c] = i32::from(pixel[c]);
+                }
+            }
+            for c in 0..N {
+                above[c] = i32::from(row[c]);
             }
         }
-        for c in 0..N {
-            above[c] = i32::from(row[c]);
-        }
+        previous_row = row;
     }
     Ok(())
 }
@@ -1615,8 +1666,12 @@ mod tests {
     #[test]
     fn shared_dc_matches_scalar_coding_at_row_and_word_boundaries() {
         // A restart exactly at the end of the image writes only the DRI header.
-        let (width, height) = (79, 53);
-        for (precision, components) in [(8, 3u8), (12, 1), (16, 1)] {
+        for (width, height, precision, components) in [
+            (32, 32, 8, 1u8),
+            (79, 53, 8, 3),
+            (79, 53, 12, 1),
+            (79, 53, 16, 1),
+        ] {
             let mask = (1u32 << precision) - 1;
             let samples = (0..width * height * usize::from(components))
                 .map(|i| match i % 43 {
@@ -1632,14 +1687,18 @@ mod tests {
             } else {
                 JpegColorSpace::Rgb
             };
-            let optimized = frame.encode_with_colorspace(1, 0, None, space).unwrap();
-            let mut scalar = frame
-                .encode_with_colorspace(1, 0, Some((width * height) as u16), space)
-                .unwrap();
-            let dri = scalar.windows(2).position(|p| p == [0xff, 0xdd]).unwrap();
-            scalar.drain(dri..dri + 6);
-            assert_eq!(optimized, scalar);
-            assert_eq!(decode_any(&optimized).unwrap(), frame);
+            for predictor in [1, 2] {
+                let optimized = frame
+                    .encode_with_colorspace(predictor, 0, None, space)
+                    .unwrap();
+                let mut scalar = frame
+                    .encode_with_colorspace(predictor, 0, Some((width * height) as u16), space)
+                    .unwrap();
+                let dri = scalar.windows(2).position(|p| p == [0xff, 0xdd]).unwrap();
+                scalar.drain(dri..dri + 6);
+                assert_eq!(optimized, scalar);
+                assert_eq!(decode_any(&optimized).unwrap(), frame);
+            }
         }
     }
 

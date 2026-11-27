@@ -199,6 +199,12 @@ follow the existing RLE crate conventions, but responsibilities are fixed:
 6. **Frame adapter** — DICOM layout validation, color conversion, planar
    repacking, per-frame encapsulation, and output metadata.
 
+For a large scan in frame component order with one DC table and no point
+transform or restart interval, predictors 1 and 2 share the row-based Huffman
+path. Predictor 2 uses left prediction in the first row, starting from the
+midpoint, and reconstructs each later row from the row above. The decoder
+checks reconstructed values against the declared precision.
+
 ### Marker rules
 
 The decoder validates SOI, one supported SOF marker, DQT/DHT definitions (one
