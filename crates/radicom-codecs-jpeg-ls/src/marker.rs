@@ -18,7 +18,7 @@ pub(crate) struct ScanHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScanEntry {
     pub scan: ScanHeader,
-    pub ids: Vec<u8>,
+    ids: [u8; 3],
     /// Entropy bytes are `data[start..end]`; restart markers stay inside.
     pub start: usize,
     pub end: usize,
@@ -35,16 +35,23 @@ pub(crate) struct ScanEntry {
 pub(crate) struct ParsedHeader {
     pub frame: FrameHeader,
     /// `(horizontal, vertical)` sampling factors in frame component order.
-    pub sampling: Vec<(u8, u8)>,
+    sampling: [(u8, u8); 3],
     /// CharLS colour transform from an APP8 `mrfx` segment; 0 means none.
     pub color_transformation: u8,
     pub scans: Vec<ScanEntry>,
 }
+
+impl ParsedHeader {
+    pub(crate) fn sampling(&self) -> &[(u8, u8)] {
+        &self.sampling[..usize::from(self.frame.components)]
+    }
+}
+
 #[derive(Default)]
 struct HeaderState {
     frame: Option<FrameHeader>,
-    frame_ids: Option<Vec<u8>>,
-    sampling: Option<Vec<(u8, u8)>>,
+    frame_ids: [u8; 3],
+    sampling: [(u8, u8); 3],
     color_transformation: Option<u8>,
     preset: Option<Preset>,
     restart_interval: u32,
@@ -172,34 +179,28 @@ impl HeaderState {
                 if !(2..=16).contains(&f.precision)
                     || f.width == 0
                     || f.height == 0
-                    || f.components == 0
+                    || !(1..=3).contains(&f.components)
                     || q.len() != 6 + 3 * f.components as usize
                 {
                     return Err("invalid SOF55".into());
                 }
-                let ids = q[6..]
-                    .chunks(3)
-                    .map(|component| component[0])
-                    .collect::<Vec<_>>();
-                if ids.iter().enumerate().any(|(i, id)| ids[..i].contains(id)) {
-                    return Err("duplicate SOF55 component id".into());
+                if self.frame.is_some() {
+                    return Err("duplicate SOF55".into());
                 }
                 // T.81 B.2.2: each component carries horizontal and vertical
                 // sampling factors in 1..=4; JPEG-LS sub-sampling (T.87 A.2.1)
                 // derives each component plane as ceil(dimension * factor / max).
-                let mut sampling = Vec::with_capacity(f.components as usize);
-                for component in q[6..].chunks(3) {
+                for (index, component) in q[6..].as_chunks::<3>().0.iter().enumerate() {
+                    if self.frame_ids[..index].contains(&component[0]) {
+                        return Err("duplicate SOF55 component id".into());
+                    }
                     let (hs, vs) = (component[1] >> 4, component[1] & 0x0f);
                     if !(1..=4).contains(&hs) || !(1..=4).contains(&vs) || component[2] != 0 {
                         return Err("unsupported SOF55 sampling factors".into());
                     }
-                    sampling.push((hs, vs));
+                    self.frame_ids[index] = component[0];
+                    self.sampling[index] = (hs, vs);
                 }
-                if self.frame.is_some() {
-                    return Err("duplicate SOF55".into());
-                }
-                self.frame_ids = Some(ids);
-                self.sampling = Some(sampling);
                 self.frame = Some(f)
             }
             0xf8 => {
@@ -275,8 +276,9 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
         }
     };
     let frame = state.frame.ok_or("missing SOF55")?;
-    let frame_ids = state.frame_ids.take().ok_or("missing SOF55")?;
-    let sampling = state.sampling.take().ok_or("missing SOF55")?;
+    let frame_ids = state.frame_ids;
+    let sampling = state.sampling;
+    let component_count = usize::from(frame.components);
     let color_transformation = state.color_transformation.unwrap_or(0);
     if color_transformation != 0 && frame.components != 3 {
         return Err("color transformation requires three components".into());
@@ -332,7 +334,7 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
         let first = &scans[0];
         (first.scan.near, first.scan.ilv, first.scan.point_transform)
     };
-    let mut covered = vec![false; frame_ids.len()];
+    let mut covered = [false; 3];
     for entry in &mut scans {
         if entry.scan.near != near
             || entry.scan.ilv != ilv
@@ -346,7 +348,7 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
         if entry.scan.components != 1 {
             return Err("plane-interleaved scans must hold one component".into());
         }
-        let index = frame_ids
+        let index = frame_ids[..component_count]
             .iter()
             .position(|id| *id == entry.ids[0])
             .ok_or("SOS component id does not match SOF55")?;
@@ -357,7 +359,7 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
         entry.component = index;
     }
     if ilv == 0 {
-        if scans.len() != frame_ids.len() || covered.iter().any(|done| !done) {
+        if scans.len() != component_count || covered[..component_count].iter().any(|done| !done) {
             return Err("missing component scan".into());
         }
     } else {
@@ -376,6 +378,7 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
         // sampling factors is not enough: with a 1-pixel dimension, different
         // factors still produce the same plane size.
         if ilv == 2 {
+            let sampling = &sampling[..component_count];
             let hmax = u32::from(sampling.iter().map(|f| f.0).max().unwrap_or(1));
             let vmax = u32::from(sampling.iter().map(|f| f.1).max().unwrap_or(1));
             let plane = |(hs, vs): &(u8, u8)| {
@@ -400,7 +403,7 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<ParsedHeader, String> {
 
 /// Reads a SOS segment whose length field starts at `p`, returning the scan
 /// header, the component ids and the index where entropy data begins.
-fn read_sos(data: &[u8], p: usize) -> Result<(ScanHeader, Vec<u8>, usize), String> {
+fn read_sos(data: &[u8], p: usize) -> Result<(ScanHeader, [u8; 3], usize), String> {
     let n = u16::from_be_bytes([
         *data.get(p).ok_or("truncated SOS")?,
         *data.get(p + 1).ok_or("truncated SOS")?,
@@ -415,23 +418,20 @@ fn read_sos(data: &[u8], p: usize) -> Result<(ScanHeader, Vec<u8>, usize), Strin
         return Err("short SOS".into());
     }
     let ns = q[0];
-    if ns == 0 || q.len() != 1 + 2 * ns as usize + 3 {
+    if !(1..=3).contains(&ns) || q.len() != 1 + 2 * ns as usize + 3 {
         return Err("invalid SOS components".into());
     }
-    let ids = q[1..1 + 2 * ns as usize]
-        .chunks(2)
-        .map(|component| component[0])
-        .collect::<Vec<_>>();
-    if ids.iter().enumerate().any(|(i, id)| ids[..i].contains(id)) {
-        return Err("duplicate SOS component id".into());
-    }
-    if q[1..1 + 2 * ns as usize]
-        .chunks(2)
-        .any(|component| component[1] != 0)
-    {
-        return Err("JPEG-LS mapping tables are unsupported".into());
-    }
     let base = 1 + 2 * ns as usize;
+    let mut ids = [0; 3];
+    for (index, component) in q[1..base].as_chunks::<2>().0.iter().enumerate() {
+        if ids[..index].contains(&component[0]) {
+            return Err("duplicate SOS component id".into());
+        }
+        if component[1] != 0 {
+            return Err("JPEG-LS mapping tables are unsupported".into());
+        }
+        ids[index] = component[0];
+    }
     let ilv = q[base + 1];
     if ilv > 2 {
         return Err("unsupported JPEG-LS interleave mode".into());
@@ -454,23 +454,20 @@ fn read_sos(data: &[u8], p: usize) -> Result<(ScanHeader, Vec<u8>, usize), Strin
 /// `RSTm` beats stay inside the scan. Any other marker ends the scan; the
 /// caller decides whether it is SOS/EOI or a segment between scans.
 fn scan_end(data: &[u8], start: usize) -> Result<(usize, u8, usize), String> {
-    let mut i = start;
-    while i < data.len() {
-        if data[i] != 0xff {
-            i += 1;
-            continue;
-        }
+    let mut cursor = start;
+    while let Some(offset) = find_marker_prefix(&data[cursor..]) {
+        let i = cursor + offset;
         let mut j = i + 1;
         while j < data.len() && data[j] == 0xff {
             j += 1
         }
         let c = *data.get(j).ok_or("truncated scan marker")?;
         if c & 0x80 == 0 {
-            i = j + 1;
+            cursor = j + 1;
             continue;
         }
         if (0xd0..=0xd7).contains(&c) {
-            i = j + 1;
+            cursor = j + 1;
             continue;
         }
         // All consecutive 0xff bytes before the marker code are fill bytes,
@@ -478,6 +475,21 @@ fn scan_end(data: &[u8], start: usize) -> Result<(usize, u8, usize), String> {
         return Ok((i, c, i));
     }
     Err("missing EOI".into())
+}
+
+fn find_marker_prefix(data: &[u8]) -> Option<usize> {
+    let (words, tail) = data.as_chunks::<8>();
+    for (index, bytes) in words.iter().enumerate() {
+        let inverted = !u64::from_le_bytes(*bytes);
+        let hit = inverted.wrapping_sub(0x0101_0101_0101_0101) & !inverted & 0x8080_8080_8080_8080;
+        if hit != 0 {
+            // Any borrow can only mark a byte after the first zero byte.
+            return Some(index * 8 + (hit.trailing_zeros() / 8) as usize);
+        }
+    }
+    tail.iter()
+        .position(|&byte| byte == 0xff)
+        .map(|index| words.len() * 8 + index)
 }
 
 /// Splits the scan bytes at RSTm markers.
@@ -494,13 +506,10 @@ pub(crate) fn split_restart_segments(
 ) -> Result<Vec<&[u8]>, String> {
     let mut segments = Vec::new();
     let mut start = 0usize;
-    let mut i = 0usize;
+    let mut cursor = 0usize;
     let mut expected = 0u8;
-    while i < scan.len() {
-        if scan[i] != 0xff {
-            i += 1;
-            continue;
-        }
+    while let Some(offset) = find_marker_prefix(&scan[cursor..]) {
+        let i = cursor + offset;
         let mut j = i + 1;
         while j < scan.len() && scan[j] == 0xff {
             j += 1
@@ -508,7 +517,7 @@ pub(crate) fn split_restart_segments(
         let code = *scan.get(j).ok_or("truncated scan marker")?;
         if code & 0x80 == 0 {
             // Stuffed data byte, not a marker.
-            i = j + 1;
+            cursor = j + 1;
             continue;
         }
         if !(0xd0..=0xd7).contains(&code) {
@@ -528,8 +537,8 @@ pub(crate) fn split_restart_segments(
         }
         segments.push(&scan[start..i]);
         expected = (expected + 1) % 8;
-        i = j + 1;
-        start = i;
+        cursor = j + 1;
+        start = cursor;
     }
     segments.push(&scan[start..]);
     if segments.len() as u64 != expected_segments {
@@ -685,10 +694,10 @@ mod tests {
     fn parses_component_sampling_factors_and_rejects_invalid_ones() {
         // T.87 E.1.2 test 7 sampling: red H2V4, green H2V1, blue H1V2.
         let parsed = parse_header(&header_with_sampling(&[(2, 4), (2, 1), (1, 2)], 1)).unwrap();
-        assert_eq!(parsed.sampling, vec![(2, 4), (2, 1), (1, 2)]);
+        assert_eq!(parsed.sampling(), &[(2, 4), (2, 1), (1, 2)]);
 
         let uniform = parse_header(&header_with_sampling(&[(1, 1), (1, 1), (1, 1)], 2)).unwrap();
-        assert_eq!(uniform.sampling, vec![(1, 1); 3]);
+        assert_eq!(uniform.sampling(), &[(1, 1); 3]);
 
         // T.81 B.2.2: factors are in 1..=4 and the table selector must be zero.
         assert!(

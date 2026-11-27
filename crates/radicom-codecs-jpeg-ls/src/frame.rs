@@ -6,7 +6,10 @@ use crate::{
         write_soi, write_sos, write_sos_ids, FrameHeader,
     },
     preset::Preset,
-    scan::{decode_line_scan_planes, decode_scan, encode_restart_scan, ScanConfig},
+    scan::{
+        append_scan, decode_byte_scan, decode_line_scan_planes, decode_scan, decode_word_scan,
+        ScanConfig,
+    },
 };
 use radicom::pixel::codec::JpegLsParams;
 use radicom::{
@@ -204,7 +207,6 @@ impl Layout {
     }
 }
 pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Vec<u8>, String> {
-    let mut samples = layout.read(raw)?;
     let near = u16::try_from(p.near_lossless).map_err(|_| "NEAR overflow")?;
     if near > u16::from(u8::MAX) {
         return Err("NEAR must fit the JPEG-LS SOS field".into());
@@ -251,10 +253,30 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
                 .into(),
         );
     }
+    let mut stack_samples = [0u16; 64];
+    let mut allocated_samples;
+    let samples = if layout.bits_allocated == 8
+        && layout.planar == 0
+        && layout.pi != PhotometricInterpretation::YbrFull
+        && layout.frame_len <= stack_samples.len()
+    {
+        let raw = raw
+            .get(..layout.frame_len)
+            .ok_or("native frame is truncated")?;
+        let samples = &mut stack_samples[..raw.len()];
+        let mask = layout.maxval();
+        for (sample, &byte) in samples.iter_mut().zip(raw) {
+            *sample = u16::from(byte) & mask;
+        }
+        samples
+    } else {
+        allocated_samples = layout.read(raw)?;
+        &mut allocated_samples
+    };
     if color_transformation != 0 {
         // CharLS applies the transform to the sample container before coding and
         // signals it with an APP8 `mrfx` segment.
-        color::forward_transform(&mut samples, color_transformation, layout.bits_stored);
+        color::forward_transform(samples, color_transformation, layout.bits_stored);
     }
     let preset = Preset::defaults(layout.maxval(), near)?;
     let f = FrameHeader {
@@ -263,7 +285,7 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
         width: u16::try_from(layout.width).map_err(|_| "width exceeds JPEG-LS limit")?,
         components: layout.components,
     };
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(64);
     write_soi(&mut out);
     if color_transformation != 0 {
         // CharLS writes the colour transform before the frame header.
@@ -297,7 +319,7 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
                 preset,
             };
             write_sos_ids(&mut out, &[(c + 1) as u8], near, 0)?;
-            out.extend(encode_restart_scan(cfg, &plane, restart)?);
+            out = append_scan(cfg, &plane, restart, out)?;
         }
     } else {
         let cfg = ScanConfig {
@@ -310,7 +332,7 @@ pub(crate) fn encode(layout: &Layout, raw: &[u8], p: &JpegLsParams) -> Result<Ve
             preset,
         };
         write_sos(&mut out, layout.components, near, ilv)?;
-        out.extend(encode_restart_scan(cfg, &samples, restart)?);
+        out = append_scan(cfg, samples, restart, out)?;
     }
     write_eoi(&mut out);
     Ok(out)
@@ -417,8 +439,9 @@ pub(crate) fn decode(
     // Reject an oversized declared frame before any plane or sample buffer is
     // allocated (design §10).
     crate::checked_sample_count(layout.width, layout.height, layout.components as usize)?;
-    let (decoded, color_transformation) = decode_samples(layout, data, expected_near)?;
+    let (decoded, color_transformation) = decode_samples(layout, data, expected_near, !source_ybr)?;
     let mut samples = match decoded {
+        DecodedSamples::Bytes(bytes) => return Ok(bytes),
         DecodedSamples::Interleaved(samples) => samples,
         DecodedSamples::Planes(planes, geometry) => assemble_planes(layout, &planes, &geometry)?,
     };
@@ -433,6 +456,7 @@ pub(crate) fn decode(
 }
 
 enum DecodedSamples {
+    Bytes(Vec<u8>),
     Interleaved(Vec<u16>),
     Planes(Vec<Vec<u16>>, Vec<PlaneGeometry>),
 }
@@ -441,6 +465,7 @@ fn decode_samples(
     layout: &Layout,
     data: &[u8],
     expected_near: Option<u16>,
+    allow_direct_output: bool,
 ) -> Result<(DecodedSamples, u8), String> {
     let h = parse_header(data)?;
     if h.frame.width as usize != layout.width
@@ -460,14 +485,41 @@ fn decode_samples(
     if first.scan.ilv > 2 || first.scan.ilv != 0 && layout.components == 1 {
         return Err("invalid JPEG-LS interleave mode".into());
     }
-    let geometry = plane_geometry(&h.frame, &h.sampling)?;
-    if first.scan.ilv == 2
-        && geometry
-            .iter()
-            .any(|plane| plane.columns != geometry[0].columns || plane.lines != geometry[0].lines)
-    {
-        return Err("sample interleaving requires equal component dimensions".into());
+    let sampling = h.sampling();
+    let uniform = sampling.iter().all(|factor| *factor == sampling[0]);
+    if uniform && (first.scan.ilv == 2 || layout.components == 1) {
+        let cfg = ScanConfig {
+            width: layout.width,
+            height: layout.height,
+            components: usize::from(layout.components),
+            maxval: first.preset.maxval,
+            near: first.scan.near,
+            ilv: first.scan.ilv,
+            preset: first.preset,
+        };
+        let scan = &data[first.start..first.end];
+        let samples = layout.width * layout.height * usize::from(layout.components);
+        if allow_direct_output && layout.planar == 0 && h.color_transformation == 0 {
+            // Full-width byte samples already contain the native bit pattern.
+            if layout.bits_allocated == 8 && layout.bits_stored == 8 && layout.frame_len == samples
+            {
+                let bytes = decode_byte_scan(cfg, scan, first.restart_interval)?;
+                return Ok((DecodedSamples::Bytes(bytes), 0));
+            }
+            // Unsigned words need no sign extension. Full-width signed words
+            // already carry the native bit pattern.
+            if layout.bits_allocated == 16
+                && (!layout.signed || layout.bits_stored == 16)
+                && layout.frame_len == samples * 2
+            {
+                let bytes = decode_word_scan(cfg, scan, first.restart_interval)?;
+                return Ok((DecodedSamples::Bytes(bytes), 0));
+            }
+        }
+        let samples = decode_scan(cfg, scan, first.restart_interval)?;
+        return Ok((DecodedSamples::Interleaved(samples), h.color_transformation));
     }
+    let geometry = plane_geometry(&h.frame, sampling)?;
     let entry = &h.scans[0];
     let planes: Vec<Vec<u16>> = if first.scan.ilv == 0 && layout.components > 1 {
         // Plane interleaving: one scan per component, each with its own model
@@ -523,9 +575,6 @@ fn decode_samples(
             preset: entry.preset,
         };
         let samples = decode_scan(cfg, &data[entry.start..entry.end], entry.restart_interval)?;
-        if h.sampling.iter().all(|factor| *factor == h.sampling[0]) {
-            return Ok((DecodedSamples::Interleaved(samples), h.color_transformation));
-        }
         // On a narrow frame, unequal sampling factors can still round up to equal
         // plane dimensions. Map their sample positions using the original factors.
         (0..usize::from(layout.components))
@@ -1463,7 +1512,7 @@ mod tests {
             return;
         };
         let layout = subsampled_layout();
-        let (decoded, transform) = decode_samples(&layout, &jls, Some(0)).unwrap();
+        let (decoded, transform) = decode_samples(&layout, &jls, Some(0), false).unwrap();
         assert_eq!(transform, 0);
         let DecodedSamples::Planes(planes, geometry) = decoded else {
             panic!("expected sub-sampled planes")
@@ -1514,7 +1563,7 @@ mod tests {
             return;
         };
         let layout = subsampled_layout();
-        let (decoded, _) = decode_samples(&layout, &jls, Some(3)).unwrap();
+        let (decoded, _) = decode_samples(&layout, &jls, Some(3), false).unwrap();
         let DecodedSamples::Planes(planes, _) = decoded else {
             panic!("expected sub-sampled planes")
         };

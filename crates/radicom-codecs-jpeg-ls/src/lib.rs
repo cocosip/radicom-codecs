@@ -11,10 +11,12 @@ mod scan;
 
 use frame::Layout;
 use radicom::error::{CodecError, Error};
+use radicom::model::buffer::MemoryBuffer;
 use radicom::model::transfer_syntax::{syntaxes, TransferSyntax};
 use radicom::pixel::codec::{Codec, CodecParams, JpegLsParams};
 use radicom::pixel::photometric::PhotometricInterpretation;
 use radicom::pixel::{PixelData, PixelDataRef};
+use std::sync::Arc;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JpegLsLosslessCodec;
@@ -192,8 +194,12 @@ fn operate(
         // before the first `add_frame`, never after it.
         frame::update_decoded_color_metadata(dst, &layout);
         for f in frames {
-            dst.add_frame(f)
-                .map_err(|e| error(codec, "decode", e.to_string()))?;
+            let result = if f.len().is_multiple_of(2) {
+                dst.add_frame_buffer(Arc::new(MemoryBuffer::from(f)))
+            } else {
+                dst.add_frame(f)
+            };
+            result.map_err(|e| error(codec, "decode", e.to_string()))?;
         }
         Ok(())
     } else {
@@ -243,8 +249,11 @@ fn operate(
                     .map_err(|m| error(codec, "encode", format!("frame {i}: {m}")))?,
             )
         }
-        for f in frames {
-            dst.add_frame(f)
+        for mut f in frames {
+            if !f.len().is_multiple_of(2) {
+                f.push(0);
+            }
+            dst.add_frame_buffer(Arc::new(MemoryBuffer::from(f)))
                 .map_err(|e| error(codec, "encode", e.to_string()))?;
         }
         frame::update_color_metadata(dst, &layout);

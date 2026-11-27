@@ -1,4 +1,5 @@
-use crate::bit::{BitReader, BitWriter};
+use crate::bit::{BitReader, BitWriter, EntropyError};
+#[inline]
 pub(crate) fn encode_mapped(
     w: &mut BitWriter,
     k: u8,
@@ -9,26 +10,22 @@ pub(crate) fn encode_mapped(
     let high = m >> k;
     let threshold = limit.saturating_sub(u32::from(qbpp) + 1);
     if high < threshold {
-        w.write_unary_with_suffix(high, m & ((1u32 << k) - 1), k)
+        w.write_unary_with_suffix(high, m & ((1u32 << k) - 1), k);
     } else {
         let v = m.checked_sub(1).ok_or("invalid mapped error")?;
-        w.write_unary_with_suffix(threshold, v & ((1u32 << qbpp) - 1), qbpp)
+        w.write_unary_with_suffix(threshold, v & ((1u32 << qbpp) - 1), qbpp);
     }
+    Ok(())
 }
+#[inline]
 pub(crate) fn decode_mapped(
     r: &mut BitReader<'_>,
     k: u8,
     limit: u32,
     qbpp: u8,
-) -> Result<u32, String> {
+) -> Result<u32, EntropyError> {
     let threshold = limit.saturating_sub(u32::from(qbpp) + 1);
-    let high = r.read_unary(threshold)?;
-    if high == threshold {
-        Ok(r.read_bits(qbpp)?.saturating_add(1))
-    } else {
-        let rem = if k > 0 { r.read_bits(k)? } else { 0 };
-        Ok((high << k) | rem)
-    }
+    r.read_rice(k, threshold, qbpp)
 }
 #[cfg(test)]
 mod tests {
