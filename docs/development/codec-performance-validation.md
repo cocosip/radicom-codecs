@@ -58,7 +58,7 @@ interoperability under these workflows to establish fresh results.
   counts as color conversion, packing, allocation, copying, and release.
   Document differences in buffer ownership or reuse when comparing existing
   entry points.
-- Start with five independent process rounds per implementation and at least
+- Start with three independent process rounds per implementation and at least
   ten measured operations per case per round after warm-up. Batch short
   operations equally on both sides. Save each round's elapsed time and
   operation count.
