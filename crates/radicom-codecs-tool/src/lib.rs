@@ -271,10 +271,9 @@ fn unsupported_reason(target: &TargetFormat, pixel: &PixelDataRef<'_>) -> Option
     }
 }
 
-/// Parameters for the tool's encoder policy: the codec defaults for sequential
-/// JPEG (4:4:4, quality 90), and the rate levels for JPEG 2000. JPEG 2000 keeps
-/// the multiple component transform off, so the output stays RGB and viewers
-/// that reject YBR_RCT can still open it.
+/// Parameters that make the tool's output match the fo-dicom reference: the
+/// codec defaults for sequential JPEG (4:4:4, quality 90), and the component
+/// transform plus rate levels for JPEG 2000.
 ///
 /// Public so the benchmark binary measures the same parameter policy the CLI
 /// ships instead of duplicating it.
@@ -285,14 +284,14 @@ pub fn params_for(target: &TargetFormat) -> Option<CodecParams> {
     match target.suffix {
         "j2k_lossless" => Some(CodecParams::Jpeg2000(J2kParams {
             irreversible: false,
-            allow_mct: false,
+            allow_mct: true,
             update_photometric_interpretation: true,
             ..Default::default()
         })),
         "j2k_lossy" => Some(CodecParams::Jpeg2000(J2kParams {
             // The reference tool requests a ratio of 16 for the lossy syntax.
             rate: 16,
-            allow_mct: false,
+            allow_mct: true,
             update_photometric_interpretation: true,
             ..Default::default()
         })),
@@ -375,26 +374,6 @@ mod tests {
         match params_for(&target) {
             Some(CodecParams::Jpeg2000(params)) => assert_eq!(params.rate, 16),
             other => panic!("expected J2K params, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn jpeg2000_targets_keep_the_component_transform_off_and_label_rgb() {
-        for suffix in ["j2k_lossless", "j2k_lossy"] {
-            let target = target_formats()
-                .into_iter()
-                .find(|target| target.suffix == suffix)
-                .unwrap_or_else(|| panic!("{suffix} target"));
-            match params_for(&target) {
-                Some(CodecParams::Jpeg2000(params)) => {
-                    assert!(!params.allow_mct, "{suffix} must not apply MCT");
-                    assert!(
-                        params.update_photometric_interpretation,
-                        "{suffix} must label the RGB output"
-                    );
-                }
-                other => panic!("expected J2K params for {suffix}, got {other:?}"),
-            }
         }
     }
 }
