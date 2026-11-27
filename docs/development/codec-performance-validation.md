@@ -21,11 +21,12 @@ interoperability under these workflows to establish fresh results.
 
 ## Shared Input and Timing Rules
 
-- Extract Pixel Data once from the project's reference DICOM corpora and the
-  additional `dicom-test2` corpus. Save one raw buffer per frame, including
-  every frame in multi-frame files. Keep frames with different content even
-  when their dimensions match. Decode an already compressed source once and
-  record its source transfer syntax and the decoder revision.
+- Extract Pixel Data once from the project's reference DICOM corpora and any
+  additional DICOM test directories supplied for the run. Save one raw buffer
+  per frame, including every frame in multi-frame files. Keep frames with
+  different content even when their dimensions match. Decode an already
+  compressed source once and record its source transfer syntax and the decoder
+  revision.
 - Record the sample ID, corpus-relative name, frame index, Rows, Columns,
   Samples per Pixel, Bits Allocated, Bits Stored, High Bit, Pixel
   Representation, Photometric Interpretation, Planar Configuration, byte
@@ -51,8 +52,8 @@ interoperability under these workflows to establish fresh results.
   the last process to exit before starting the other implementation. Keep the
   case order, warm-up, and iteration counts equal. Run builds, tests, data
   preparation, and other benchmarks outside the timing window. Record process
-  start and end times. If thermal or frequency drift is suspected, repeat the
-  full series in reverse order, still running the two implementations serially.
+  start and end times, the power mode, and the order in which each pair runs.
+  Alternate which implementation runs first across the three round pairs.
 - Time operations on preloaded buffers. Do DICOM parsing, disk I/O, process
   startup, hashing, and comparisons outside the timed interval. Align what
   counts as color conversion, packing, allocation, copying, and release.
@@ -86,8 +87,9 @@ interoperability under these workflows to establish fresh results.
    reference.
 5. **Apply the performance gate.** For each case and direction, divide the
    Rust statistic by the corresponding reference statistic. A ratio of
-   `1.05` or less passes. A ratio below `1.00` means Rust is faster. After
-   all applicable cases pass, run the [final checks](#retests-and-final-checks).
+   `1.05` or less passes. A ratio below `1.00` means Rust is faster. Follow the
+   [retest procedure](#machine-variation-and-retests) if the result is unstable.
+   After all applicable cases pass, run the [final checks](#retests-and-final-checks).
 
 ## HTJ2K Workflow
 
@@ -127,17 +129,40 @@ Record the size difference independently of codec correctness and performance.
    readers resolve the correct frame boundaries, including multi-frame
    inputs. Apply the regression checks below.
 
+## Machine Variation and Retests
+
+1. **Check the individual rounds.** Compare the absolute time per operation
+   for both implementations and their ratio in each round pair. Investigate
+   when ratios fall on both sides of `1.05`, when the result changes with run
+   order, or when the same reference build changes materially between runs.
+   Check the recorded times against concurrent workloads, CPU frequency,
+   thermal throttling, and power-mode changes when those observations are
+   available.
+2. **Replace a round pair when there is evidence of interference.** Keep both
+   originals and record the affected case or time window, the observed event,
+   and the replacement round. Once the machine is idle and stable, repeat the
+   affected pair for both implementations with the same inputs and settings.
+   Keep a slow round in the calculation if its only evidence of interference
+   is the timing itself.
+3. **Retest borderline cases on the same machine.** Use the same binaries,
+   input hashes, logical CPU, and power mode. Run three fresh round pairs for
+   the affected cases, with the first pair in reverse order and the remaining
+   pairs alternating. Increase the operation count equally on both sides if
+   the individual operations are short. If drift affects the entire series,
+   repeat the full matrix in the same way.
+4. **Report the original and retest results together.** Record absolute
+   timings and ratios for each batch. Across valid rounds, use the
+   operation-weighted mean for encoding and the median of per-operation
+   times for decoding. If valid batches still fall on opposite sides of
+   `1.05`, report the case as inconclusive and verify it in a stable
+   measurement window before marking it as passed. A reproducible result above
+   `1.05` remains a performance failure.
+
 ## Retests and Final Checks
 
-- Report pass, fail, missing, and incompatible reference cases separately.
+- Report pass, fail, inconclusive, missing, and incompatible reference cases.
   Use aggregate performance figures to show trends. The acceptance gate
   applies to each frame, syntax, configuration, and direction.
-- Repeat borderline or unstable cases with the same builds, CPU, raw input,
-  and shared codestream. Increase batch size equally for short operations.
-  Keep the original runs and log any independently verified interference.
-  If interference invalidates a round, repeat the corresponding round for
-  both implementations. Combine valid encode rounds by operation count and
-  use the median across valid decode rounds.
 - Optimize cases that remain above the tolerance. Rerun the family's full
   matrix and byte checks after changing codec behavior or performance.
 - Test both public DICOM paths. Decode Rust-encoded files with fo-dicom and
@@ -180,11 +205,14 @@ Record the size difference independently of codec correctness and performance.
 
 ## Running the Checks
 
-Build the reference libraries from a pinned fo-dicom.Codecs revision and prepare
-the frame manifest and buffers described above. Supply reference-source and
-corpus directories as local configuration. External-reference harnesses and
-private corpora are maintained locally and require setup on each machine.
-Record their configuration alongside the results so the run can be reproduced.
+Build the reference libraries from a pinned fo-dicom.Codecs revision. Pass the
+reference source directory and the paths of any additional DICOM test
+directories to the local validation harness. The caller chooses the number,
+names, and locations of the additional directories for each run. Record each
+input path and its corpus identifier in the local run configuration. Prepare
+the frame manifest and buffers described above and share them between both
+implementations. External-reference harnesses and private corpora are maintained
+locally and require setup on each machine.
 
 The repository provides portable regression checks for every codec family.
 Run them from the repository root.
