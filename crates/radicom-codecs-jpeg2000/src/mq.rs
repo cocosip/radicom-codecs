@@ -131,15 +131,17 @@ impl MqEncoder {
         self.renorm();
     }
 
+    #[inline]
     fn renorm(&mut self) {
-        while self.a < 0x8000 {
-            self.a <<= 1;
-            self.c <<= 1;
-            self.ct -= 1;
-            if self.ct == 0 {
-                self.byte_out();
-            }
+        let mut remaining = self.a.leading_zeros() - 16;
+        self.a <<= remaining;
+        while remaining >= self.ct as u32 {
+            self.c <<= self.ct;
+            remaining -= self.ct as u32;
+            self.byte_out();
         }
+        self.c <<= remaining;
+        self.ct -= remaining as i32;
     }
 
     fn byte_out(&mut self) {
@@ -188,6 +190,7 @@ impl MqEncoder {
 pub(crate) struct MqDecoder<'a> {
     data: &'a [u8],
     position: usize,
+    current_byte: u8,
     a: u32,
     c: u32,
     ct: i32,
@@ -196,15 +199,16 @@ pub(crate) struct MqDecoder<'a> {
 
 impl<'a> MqDecoder<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Self {
+        let current_byte = data.first().copied().unwrap_or(0xff);
         let mut decoder = Self {
             data,
-            position: 0,
+            position: 1,
+            current_byte,
             a: 0x8000,
-            c: 0,
+            c: u32::from(current_byte) << 16,
             ct: 0,
             contexts: Contexts::default(),
         };
-        decoder.c = u32::from(decoder.byte_at(0)) << 16;
         decoder.byte_in();
         decoder.c <<= 7;
         decoder.ct -= 7;
@@ -241,40 +245,42 @@ impl<'a> MqDecoder<'a> {
         mps ^ lps
     }
 
+    #[inline]
     fn renorm(&mut self) {
-        let mut remaining = self.a.leading_zeros() - 16;
-        while remaining != 0 {
-            if self.ct == 0 {
-                self.byte_in();
-            }
-            let shift = remaining.min(self.ct as u32);
-            self.a <<= shift;
+        let shift = self.a.leading_zeros() - 16;
+        self.a <<= shift;
+        let available = self.ct - shift as i32;
+        if available >= 0 {
             self.c <<= shift;
-            self.ct -= shift as i32;
-            remaining -= shift;
+            self.ct = available;
+        } else {
+            self.refill(shift);
         }
+    }
+
+    #[inline(never)]
+    fn refill(&mut self, mut remaining: u32) {
+        while remaining > self.ct as u32 {
+            self.c <<= self.ct;
+            remaining -= self.ct as u32;
+            self.byte_in();
+        }
+        self.c <<= remaining;
+        self.ct -= remaining as i32;
     }
 
     fn byte_in(&mut self) {
-        let next = self.byte_at(self.position + 1);
-        if self.byte_at(self.position) == 0xFF {
-            if next > 0x8F {
-                self.c += 0xFF00;
-                self.ct = 8;
-            } else {
-                self.position += 1;
-                self.c += u32::from(next) << 9;
-                self.ct = 7;
-            }
-        } else {
-            self.position += 1;
-            self.c += u32::from(next) << 8;
+        let next = self.data.get(self.position).copied().unwrap_or(0xff);
+        if self.current_byte == 0xff && next > 0x8f {
+            self.c += 0xff00;
             self.ct = 8;
+        } else {
+            let stuffed = u32::from(self.current_byte == 0xff);
+            self.position += 1;
+            self.current_byte = next;
+            self.c += u32::from(next) << (8 + stuffed);
+            self.ct = 8 - stuffed as i32;
         }
-    }
-
-    fn byte_at(&self, index: usize) -> u8 {
-        self.data.get(index).copied().unwrap_or(0xFF)
     }
 }
 

@@ -142,7 +142,8 @@ pub(crate) fn encode_step_size(step_size: f64, precision: u8) -> u16 {
 }
 
 /// Decodes the scalar-expounded representation with the given nominal range.
-pub(crate) fn decode_step_size(encoded: u16, precision: u8) -> f64 {
+#[cfg(test)]
+fn decode_step_size(encoded: u16, precision: u8) -> f64 {
     let exponent = (encoded >> 11) & 0x1F;
     let mantissa = encoded & 0x07FF;
     (1.0 + f64::from(mantissa) / 2048.0) * 2f64.powi(i32::from(precision) - i32::from(exponent))

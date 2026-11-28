@@ -36,15 +36,17 @@ explicit error instead of producing packets in the wrong order.
 HTJ2K is a module in the JPEG 2000 crate. It reuses classic JPEG 2000 marker
 parsing, SIZ geometry, tile/component layout, wavelet/quantization selection,
 Tier-2 packet assembly, and the DICOM frame adapter. It accepts the same
-8/16-bit mono/RGB, signedness, planar RGB, YBR_FULL/YBR_FULL_422 normalization,
+8/16-bit signed or unsigned monochrome, unsigned RGB, planar RGB, YBR_FULL/YBR_FULL_422 normalization,
 checked dimensions, and encapsulation rules described in the shared design.
-JP2/JPT wrappers, partial YBR, palette/CMYK, unknown photometric
+Unsigned PALETTE COLOR is supported for the two lossless-only syntaxes.
+JP2/JPT wrappers, partial YBR, CMYK, unknown photometric
 interpretations, and unsupported Part 2 extensions fail with managed errors.
 
 SIZ width/height, component count, precision, signedness, and decoded byte size
 are checked against the destination before HT decoding, with checked `u64`
 arithmetic and the shared `1 << 28` sample cap over all components, so a
-malformed maximum-size SIZ is rejected before any allocation. The precision may
+malformed maximum-size SIZ is rejected before any allocation. The encoder writes
+`BitsStored` as the component precision in SIZ. On decode the precision may
 lie between the destination's `BitsStored` and `BitsAllocated`: fo-dicom's
 OpenJPH encoder writes `BitsAllocated` into SIZ for a 12-bit dataset, so unsigned
 samples are re-centred on the destination's level shift; signed samples are not
@@ -129,6 +131,15 @@ a mean-absolute-error tolerance and require a decodable codestream.
 
 ## Stages and checks
 
+On AVX2 CPUs the cleanup encoder processes eight adjacent quads together,
+including their VLC contexts and MagSgn fields. It zero-fills the unused
+lanes of a partial stripe and emits only the quads present in the code block.
+The MagSgn decoder can gather eight fields from an unstuffed segment when
+the block has complete 16-column groups, an even height, and at most 25 bits
+per field. A four-byte window then covers a field at any bit alignment.
+Other block shapes and precisions use the quad decoder. Both paths supply
+one bits beyond the MagSgn segment as required by HT cleanup termination.
+
 1. Bounded HT marker/bit structures and capability-marker parsing are
    implemented; the cleanup pass is pinned to a reference byte vector.
 
@@ -159,6 +170,42 @@ assignments.
 The native matrix results above predate the `radicom 0.3` upgrades. These upgrades
 re-run the portable workspace tests, including HTJ2K boundary checks, without
 claiming a new native-reference matrix run.
+
+On Windows x64, a subsequent public DICOM run against fo-dicom.Codecs revision
+`d026cec` covered 298 lossless, 298 RPCL lossless, and 255 lossy frame and
+parameter combinations. The decoders produced identical pixel bytes in both
+directions for all 851 combinations. All 596 lossless reconstructions matched
+the source. Both encoders produced at most one alignment byte after EOC in
+this run. Among 51 original HTJ2K frames, three had excess trailing data.
+The largest tail occupied 1,015,088 bytes in a 2,097,152-byte frame with
+a 1,082,064-byte codestream. The decoder accepts trailing data after a
+structurally validated EOC.
+
+The reference bridge retained compressed color labels or used a different
+component precision in some cases. Pixel agreement and DICOM metadata
+conformance are assessed separately. A separate signed 8-bit monochrome
+fixture had 8,192 differing samples out of 16,384 in each lossless
+cross-decoding direction. Rust restored its own signed source exactly.
+
+The Windows x64 single-worker run on an Intel Core i5-9400 compared the
+eight-quad cleanup kernels and streamed forward 9/7 row lifting with OpenJPH
+from the same reference revision. The table counts DICOM configurations
+after three paired rounds and retesting configurations that crossed the
+1.05 time-ratio limit. Each syntax had 120 encoding configurations with
+different effective reference precision, excluded from the encoding gate.
+All 851 configurations had a shared input for decoding.
+
+| Syntax | Encode pass / fail / inconclusive | Decode pass / fail / inconclusive |
+| --- | --- | --- |
+| .201 | 40 / 123 / 15 | 91 / 207 / 0 |
+| .202 | 42 / 120 / 16 | 91 / 207 / 0 |
+| .203 | 36 / 99 / 0 | 53 / 191 / 11 |
+
+For a 1920 by 1080 lossy RGB frame, mean Rust encoding time fell from
+68.93 ms with eight-quad cleanup alone to 46.68 ms with the RGB input and
+wavelet changes. OpenJPH took 32.05 ms. For a 1024 by 1024 lossy RGB frame
+the corresponding times were 30.72, 18.92, and 13.02 ms. The largest
+remaining decode ratio was 1.971 on lossy RGB.
 
 Fresh performance and interoperability acceptance uses the dedicated
 [HTJ2K workflow](../development/codec-performance-validation.md#htj2k-workflow),

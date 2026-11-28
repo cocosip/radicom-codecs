@@ -24,7 +24,7 @@ fn gain_h(decompositions: usize) -> f32 {
     GAIN97_H[decompositions.min(GAIN97_H.len() - 1)]
 }
 
-fn orientation_gain(orientation: u8) -> f64 {
+fn orientation_gain(orientation: u8) -> f32 {
     match orientation {
         3 => 4.0,
         0 => 1.0,
@@ -188,15 +188,7 @@ pub(crate) fn cap_ccap(
 /// does: the QCD mantissa in single precision, divided by `2^exponent` and by
 /// `2^(31 - Kmax)`, then inverted in single precision.
 pub(crate) fn irrev_delta_inv_f32(encoded_step: u16, orientation: u8, k_max: i32) -> f32 {
-    let exponent = u32::from((encoded_step >> 11) & 0x1F);
-    let gain = match orientation {
-        3 => 4.0f32,
-        0 => 1.0f32,
-        _ => 2.0f32,
-    };
-    let mantissa = ((u32::from(encoded_step & 0x7FF) | 0x800) as f32) * gain;
-    let delta = mantissa / 2048.0f32 / (1u32 << exponent) as f32 / (1u32 << (31 - k_max)) as f32;
-    1.0f32 / delta
+    1.0 / decode_delta(encoded_step, orientation, k_max)
 }
 
 /// Quantizes float coefficients to OpenJPH's sign-magnitude integers.
@@ -205,42 +197,81 @@ pub(crate) fn irrev_delta_inv_f32(encoded_step: u16, orientation: u8, k_max: i32
 /// quantize with `_mm_cvtps_epi32` (round to nearest, ties to even) rather than
 /// the scalar path's truncation. The references therefore carry the rounded
 /// values, so rounding is part of byte-exact interoperability.
-pub(crate) fn to_sign_magnitude_f32(coefficients: &[f32], delta_inv: f32) -> Vec<i32> {
-    coefficients
-        .iter()
-        .map(|&value| {
-            let t = (value * delta_inv).round_ties_even() as i32;
-            let magnitude = t.unsigned_abs();
-            if t < 0 {
-                (0x8000_0000u32 | magnitude) as i32
-            } else {
-                magnitude as i32
-            }
-        })
-        .collect()
+pub(crate) fn quantize(coefficients: &[f32], out: &mut [i32], delta_inv: f32) {
+    scale_and_round::<true>(coefficients, out, delta_inv);
+}
+
+pub(crate) fn scale_and_round<const SIGN_MAGNITUDE: bool>(
+    coefficients: &[f32],
+    out: &mut [i32],
+    delta_inv: f32,
+) {
+    assert_eq!(coefficients.len(), out.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if coefficients.len() >= 8 && crate::wavelet::avx2_available() {
+        // SAFETY: runtime detection confirmed AVX2 support, and lengths match.
+        unsafe { quantize_row_avx2::<SIGN_MAGNITUDE>(coefficients, out, delta_inv) };
+        return;
+    }
+    quantize_row::<SIGN_MAGNITUDE>(coefficients, out, delta_inv);
+}
+
+fn quantize_row<const SIGN_MAGNITUDE: bool>(coefficients: &[f32], out: &mut [i32], delta_inv: f32) {
+    for (&value, dest) in coefficients.iter().zip(out) {
+        let rounded = (value * delta_inv).round_ties_even() as i32;
+        *dest = if SIGN_MAGNITUDE {
+            (rounded.unsigned_abs() | (rounded as u32 & 0x8000_0000)) as i32
+        } else {
+            rounded
+        };
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_row_avx2<const SIGN_MAGNITUDE: bool>(
+    coefficients: &[f32],
+    out: &mut [i32],
+    delta_inv: f32,
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let scale = _mm256_set1_ps(delta_inv);
+    let positive_limit = _mm256_set1_ps(2_147_483_648.0);
+    let max = _mm256_set1_epi32(i32::MAX);
+    let sign_bit = _mm256_set1_epi32(i32::MIN);
+    let (source, tail) = coefficients.as_chunks::<8>();
+    let (dest, tail_out) = out.as_chunks_mut::<8>();
+    for (row, output) in source.iter().zip(dest) {
+        // SAFETY: the chunk contains eight readable floats.
+        let values = unsafe { _mm256_loadu_ps(row.as_ptr()) };
+        let scaled = _mm256_mul_ps(values, scale);
+        // Match the scalar saturating cast, including NaN -> 0.
+        let ordered = _mm256_cmp_ps::<_CMP_ORD_Q>(scaled, scaled);
+        let rounded = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
+            _mm256_and_ps(scaled, ordered),
+        );
+        let overflow = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_GE_OQ>(rounded, positive_limit));
+        let as_int = _mm256_blendv_epi8(_mm256_cvttps_epi32(rounded), max, overflow);
+        let result = if SIGN_MAGNITUDE {
+            _mm256_or_si256(_mm256_abs_epi32(as_int), _mm256_and_si256(as_int, sign_bit))
+        } else {
+            as_int
+        };
+        // SAFETY: the chunk contains eight writable integers.
+        unsafe { _mm256_storeu_si256(output.as_mut_ptr().cast(), result) };
+    }
+    quantize_row::<SIGN_MAGNITUDE>(tail, tail_out, delta_inv);
 }
 
 /// Decodes the coefficient-domain delta for one subband and code-block.
-pub(crate) fn decode_delta(encoded_step: u16, orientation: u8, k_max: i32) -> f64 {
-    let exponent = i32::from((encoded_step >> 11) & 0x1F);
-    let mantissa = f64::from((encoded_step & 0x7FF) | 0x800) * orientation_gain(orientation);
-    let mantissa = mantissa / 2048.0 / (1u32 << exponent) as f64;
-    mantissa / 2f64.powi(31 - k_max)
-}
-
-pub(crate) fn from_sign_magnitude(coefficients: &[i32], delta: f64) -> Vec<f64> {
-    coefficients
-        .iter()
-        .map(|&value| {
-            let bits = value as u32;
-            let magnitude = f64::from(bits & 0x7FFF_FFFF) * delta;
-            if bits & 0x8000_0000 != 0 {
-                -magnitude
-            } else {
-                magnitude
-            }
-        })
-        .collect()
+pub(crate) fn decode_delta(encoded_step: u16, orientation: u8, k_max: i32) -> f32 {
+    let exponent = u32::from((encoded_step >> 11) & 0x1F);
+    let mantissa = f32::from((encoded_step & 0x7FF) | 0x800) * orientation_gain(orientation);
+    mantissa / 2048.0 / (1u32 << exponent) as f32 / 2f32.powi(31 - k_max)
 }
 
 #[cfg(test)]
@@ -316,11 +347,49 @@ mod tests {
         // OpenJPH's SSE2/AVX2 kernels use _mm_cvtps_epi32, so .5 ties round
         // to the even integer instead of truncating.
         let coefficients = [0.625f32, 0.875, -0.625, -0.875];
-        let sign_magnitude = to_sign_magnitude_f32(&coefficients, 4.0);
+        let mut sign_magnitude = [0; 4];
+        quantize(&coefficients, &mut sign_magnitude, 4.0);
         assert_eq!(sign_magnitude[0], 2);
         assert_eq!(sign_magnitude[1], 4);
         assert_eq!(sign_magnitude[2], (0x8000_0000u32 | 2) as i32);
         assert_eq!(sign_magnitude[3], (0x8000_0000u32 | 4) as i32);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn avx2_quantization_preserves_sign_magnitude_and_scalar_tails() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let coefficients = [
+            -f32::INFINITY,
+            -1.0e12,
+            -1.875,
+            -1.625,
+            -0.125,
+            -0.0,
+            f32::NAN,
+            0.125,
+            1.625,
+            1.875,
+            1.0e12,
+            f32::INFINITY,
+            2.125,
+            0.0,
+            -2.125,
+            2.375,
+            9.375,
+        ];
+        let mut scalar = [0; 17];
+        let mut vector = [0; 17];
+        quantize_row::<true>(&coefficients, &mut scalar, 4.0);
+        // SAFETY: this test checks AVX2 support before using the SIMD kernel.
+        unsafe { quantize_row_avx2::<true>(&coefficients, &mut vector, 4.0) };
+        assert_eq!(vector, scalar);
+        quantize_row::<false>(&coefficients, &mut scalar, 4.0);
+        // SAFETY: AVX2 was detected above.
+        unsafe { quantize_row_avx2::<false>(&coefficients, &mut vector, 4.0) };
+        assert_eq!(vector, scalar);
     }
 
     #[test]

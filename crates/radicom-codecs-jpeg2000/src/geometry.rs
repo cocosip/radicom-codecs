@@ -207,7 +207,6 @@ fn high_subband(
 pub(crate) struct CodeBlockPass {
     pub(crate) rate: u32,
     pub(crate) distortiondec: f64,
-    pub(crate) term: bool,
 }
 
 /// One code block inside a precinct band.
@@ -226,17 +225,10 @@ pub(crate) struct CodeBlock {
     pub(crate) total_passes: u32,
     pub(crate) zero_bitplanes: u8,
     pub(crate) data: Vec<u8>,
-    pub(crate) segments: Vec<CodeBlockSegment>,
     /// Per-pass Tier-1 metadata; empty for the HTJ2K encoder.
     pub(crate) passes: Vec<CodeBlockPass>,
     /// Number of passes assigned to each quality layer (classic encoder).
     pub(crate) layer_passes: Vec<u16>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CodeBlockSegment {
-    pub(crate) data: Vec<u8>,
-    pub(crate) pass_count: u32,
 }
 
 /// A band inside one precinct.
@@ -298,9 +290,8 @@ pub(crate) struct Component {
     pub(crate) precision: u8,
     pub(crate) signed: bool,
     pub(crate) coefficients: Vec<i32>,
-    pub(crate) irreversible: Option<Vec<f64>>,
+    pub(crate) irreversible: Option<Vec<f32>>,
     pub(crate) samples: Vec<i32>,
-    pub(crate) float_samples: Option<Vec<f64>>,
     bands: BTreeMap<i32, BTreeMap<i32, Vec<PrecinctBand>>>,
 }
 
@@ -354,7 +345,6 @@ impl Component {
             coefficients,
             irreversible: None,
             samples: Vec::new(),
-            float_samples: None,
             bands: BTreeMap::new(),
         }
     }
@@ -377,6 +367,28 @@ impl Component {
             .get(&resolution)
             .map(|map| map.keys().copied().collect())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn precinct_count(&self, resolution: i32) -> i32 {
+        self.bands
+            .get(&resolution)
+            .map_or(0, |map| map.len() as i32)
+    }
+
+    pub(crate) fn code_blocks(&self) -> impl Iterator<Item = &CodeBlock> {
+        self.bands
+            .values()
+            .flat_map(BTreeMap::values)
+            .flatten()
+            .flat_map(|band| &band.code_blocks)
+    }
+
+    pub(crate) fn code_blocks_mut(&mut self) -> impl Iterator<Item = &mut CodeBlock> {
+        self.bands
+            .values_mut()
+            .flat_map(BTreeMap::values_mut)
+            .flatten()
+            .flat_map(|band| &mut band.code_blocks)
     }
 
     pub(crate) fn has_precinct(&self, resolution: i32, precinct: i32) -> bool {
@@ -544,7 +556,6 @@ impl Component {
                                     total_passes: 0,
                                     zero_bitplanes: 0,
                                     data: Vec::new(),
-                                    segments: Vec::new(),
                                     passes: Vec::new(),
                                     layer_passes: Vec::new(),
                                 });

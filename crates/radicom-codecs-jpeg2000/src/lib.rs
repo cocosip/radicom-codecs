@@ -22,6 +22,7 @@ use frame::Layout;
 use radicom::error::{CodecError, Error};
 use radicom::model::transfer_syntax::{syntaxes, TransferSyntax};
 use radicom::pixel::codec::{Codec, CodecParams, HtJ2kParams, J2kParams, ProgressionOrder};
+use radicom::pixel::photometric::PhotometricInterpretation;
 use radicom::pixel::{PixelData, PixelDataRef};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -358,8 +359,12 @@ fn operate(
                 .data()
                 .map_err(|e| error(codec, "decode", format!("frame {i}: {e}")))?;
             frames.push(
-                frame::decode(&layout, bytes.as_ref())
-                    .map_err(|m| error(codec, "decode", format!("frame {i}: {m}")))?,
+                frame::decode(
+                    &layout,
+                    bytes.as_ref(),
+                    src.photometric_interpretation() == Some(PhotometricInterpretation::YbrFull),
+                )
+                .map_err(|m| error(codec, "decode", format!("frame {i}: {m}")))?,
             );
         }
         for frame in frames {
@@ -386,7 +391,7 @@ fn operate(
                 "source must be native and destination encapsulated",
             ));
         }
-        let layout = Layout::source(src).map_err(|m| error(codec, "encode", m))?;
+        let layout = Layout::source(src, reversible).map_err(|m| error(codec, "encode", m))?;
         let destination = Layout::destination(dst).map_err(|m| error(codec, "encode", m))?;
         if layout.width != destination.width
             || layout.height != destination.height
@@ -569,8 +574,13 @@ fn operate_ht(
                 .data()
                 .map_err(|e| error(codec, "decode", format!("frame {i}: {e}")))?;
             frames.push(
-                frame::decode_ht(&layout, bytes.as_ref(), expected_progression)
-                    .map_err(|m| error(codec, "decode", format!("frame {i}: {m}")))?,
+                frame::decode_ht(
+                    &layout,
+                    bytes.as_ref(),
+                    expected_progression,
+                    src.photometric_interpretation() == Some(PhotometricInterpretation::YbrFull),
+                )
+                .map_err(|m| error(codec, "decode", format!("frame {i}: {m}")))?,
             );
         }
         for frame in frames {
@@ -597,7 +607,7 @@ fn operate_ht(
                 "source must be native and destination encapsulated",
             ));
         }
-        let layout = Layout::source(src).map_err(|m| error(codec, "encode", m))?;
+        let layout = Layout::source(src, reversible).map_err(|m| error(codec, "encode", m))?;
         let destination = Layout::destination(dst).map_err(|m| error(codec, "encode", m))?;
         if layout.width != destination.width
             || layout.height != destination.height
@@ -740,6 +750,41 @@ mod facade_tests {
     }
 
     #[test]
+    fn encoders_reject_signed_color_and_lossy_palette() {
+        let codecs: [&dyn Codec; 5] = [
+            &Jpeg2000LosslessCodec,
+            &Jpeg2000LossyCodec,
+            &HtJpeg2000LosslessCodec,
+            &HtJpeg2000LosslessRpclCodec,
+            &HtJpeg2000LossyCodec,
+        ];
+        for codec in codecs {
+            for (pi, components, signed) in [
+                ("RGB", 3, 1),
+                ("PALETTE COLOR", 1, 1),
+                ("PALETTE COLOR", 1, 0),
+            ] {
+                if signed == 0 && !codec.transfer_syntax().is_lossy() {
+                    continue;
+                }
+                let mut source = ds(8, 8, 8, components, signed, pi);
+                PixelData::create_new(&mut source)
+                    .unwrap()
+                    .add_frame(vec![0; 64 * components as usize])
+                    .unwrap();
+                let mut encoded = source.clone();
+                encoded.set_transfer_syntax(std::sync::Arc::new(codec.transfer_syntax().clone()));
+                encoded.remove(Tag::PIXEL_DATA);
+                let src = PixelDataRef::from_dataset(&source).unwrap();
+                let mut dst = PixelData::create_new(&mut encoded).unwrap();
+                assert!(codec
+                    .encode(&src, &mut dst, &codec.default_params())
+                    .is_err());
+            }
+        }
+    }
+
+    #[test]
     fn palette_color_htj2k_lossless_round_trips_indices() {
         let raw: Vec<u8> = (0..48).map(|i| ((i * 11) % 251) as u8).collect();
         let mut source = ds(8, 6, 8, 1, 0, "PALETTE COLOR");
@@ -841,6 +886,55 @@ mod facade_tests {
     }
 
     #[test]
+    fn ybr_full_without_mct_is_converted_before_labelling_native_rgb() {
+        // Encode the three component values directly, then supply the DICOM
+        // attribute that identifies them as Y, Cb and Cr in the absence of MCT.
+        let raw = [76, 85, 255].repeat(64);
+        for codec in [
+            &Jpeg2000LosslessCodec as &dyn Codec,
+            &HtJpeg2000LosslessCodec,
+        ] {
+            let mut source = ds(8, 8, 8, 3, 0, "RGB");
+            PixelData::create_new(&mut source)
+                .unwrap()
+                .add_frame(&raw[..])
+                .unwrap();
+            let mut encoded = source.clone();
+            encoded.set_transfer_syntax(std::sync::Arc::new(codec.transfer_syntax().clone()));
+            encoded.remove(Tag::PIXEL_DATA);
+            let mut params = codec.default_params();
+            match &mut params {
+                CodecParams::Jpeg2000(p) => p.allow_mct = false,
+                CodecParams::HtJpeg2000(p) => p.employ_color_transform = false,
+                _ => unreachable!(),
+            }
+            codec
+                .encode(
+                    &PixelDataRef::from_dataset(&source).unwrap(),
+                    &mut PixelData::create_new(&mut encoded).unwrap(),
+                    &params,
+                )
+                .unwrap();
+            encoded.insert_str(Tag::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "YBR_FULL");
+            let mut decoded = encoded.clone();
+            decoded.set_transfer_syntax(syntaxes::EXPLICIT_VR_LITTLE_ENDIAN.clone());
+            decoded.remove(Tag::PIXEL_DATA);
+            codec
+                .decode(
+                    &PixelDataRef::from_dataset(&encoded).unwrap(),
+                    &mut PixelData::create_new(&mut decoded).unwrap(),
+                    &params,
+                )
+                .unwrap();
+            assert_eq!(
+                decoded.get_str(Tag::PHOTOMETRIC_INTERPRETATION).unwrap(),
+                "RGB"
+            );
+            assert_eq!(samples(&decoded), [254, 0, 0].repeat(64));
+        }
+    }
+
+    #[test]
     fn decoding_into_a_ybr_full_422_destination_does_not_panic() {
         // A 4:2:2-labelled native destination sizes frames at two bytes per
         // pixel; the adapter still emits full RGB, so the frame length has to
@@ -884,9 +978,15 @@ mod facade_tests {
     #[test]
     fn signed_8_bit_lossless_round_trips_exactly() {
         let raw: Vec<u8> = (0..8 * 6).map(|i| ((i * 37) % 256) as u8).collect();
-        let mut source = ds(8, 6, 8, 1, 1, "MONOCHROME2");
-        let decoded = round_trip(&Jpeg2000LosslessCodec, &mut source, &raw);
-        assert_eq!(samples(&decoded), raw);
+        for codec in [
+            &Jpeg2000LosslessCodec as &dyn Codec,
+            &HtJpeg2000LosslessCodec,
+            &HtJpeg2000LosslessRpclCodec,
+        ] {
+            let mut source = ds(8, 6, 8, 1, 1, "MONOCHROME2");
+            let decoded = round_trip(codec, &mut source, &raw);
+            assert_eq!(samples(&decoded), raw);
+        }
     }
 
     #[test]

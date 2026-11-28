@@ -19,6 +19,24 @@ JPEG, JPEG-LS, and JPEG 2000. Use the [HTJ2K workflow](#htj2k-workflow) for its
 three transfer syntaxes. Run JPEG 2000 and HTJ2K from extraction through
 interoperability under these workflows to establish fresh results.
 
+## JPEG 2000 AVX2
+
+JPEG 2000 Lossless and Lossy enable AVX2 by default on supported x86 and
+x86-64 CPUs. The default requires no environment variable or codec option.
+The codec reads `RADICOM_J2K_AVX2` on its first JPEG 2000 SIMD dispatch and
+caches the setting for the process. Set it to `0` before launching the process
+to disable AVX2. The fallback can still use SSE2 wavelet lifting and SSE4.1
+sample rounding and RGB packing. HTJ2K selects its kernels through runtime
+CPU detection.
+
+For SIMD comparisons, run the same Release binary in separate processes with
+AVX2 enabled and disabled for the two JPEG 2000 transfer syntaxes. Use
+identical inputs and codec settings and report both timings against the same
+pinned OpenJPEG build. Apply the performance gate to each case and direction
+for both Lossless and Lossy. With AVX2 enabled, Rust must take less time than
+OpenJPEG (Rust/reference < `1.00`). With AVX2 disabled, Rust may take up to
+5% longer (Rust/reference ≤ `1.05`). Benchmark HTJ2K with automatic dispatch.
+
 ## Shared Input and Timing Rules
 
 - Extract Pixel Data once from the project's reference DICOM corpora and any
@@ -59,6 +77,9 @@ interoperability under these workflows to establish fresh results.
   counts as color conversion, packing, allocation, copying, and release.
   Document differences in buffer ownership or reuse when comparing existing
   entry points.
+- Benchmark JPEG 2000 and HTJ2K against the native OpenJPEG and OpenJPH
+  entry points from the pinned fo-dicom.Codecs revision. Exercise the public
+  DICOM transcoders during interoperability checks.
 - Start with three independent process rounds per implementation and at least
   ten measured operations per case per round after warm-up. Batch short
   operations equally on both sides. Save each round's elapsed time and
@@ -86,16 +107,18 @@ interoperability under these workflows to establish fresh results.
    Take the median of the resulting round times separately for Rust and the
    reference.
 5. **Apply the performance gate.** For each case and direction, divide the
-   Rust statistic by the corresponding reference statistic. A ratio of
-   `1.05` or less passes. A ratio below `1.00` means Rust is faster. Follow the
+   Rust statistic by the corresponding reference statistic. Use the
+   [JPEG 2000 AVX2 limits](#jpeg-2000-avx2) for its two benchmark runs. For
+   the other codecs in this workflow a ratio of `1.05` or less passes. Follow the
    [retest procedure](#machine-variation-and-retests) if the result is unstable.
    After all applicable cases pass, run the [final checks](#retests-and-final-checks).
 
 ## HTJ2K Workflow
 
-The fo-dicom.Codecs HTJ2K path can emit substantial empty padding. The full
-DICOM file and the encapsulated Pixel Data can therefore differ in size.
-Record the size difference independently of codec correctness and performance.
+Older fo-dicom.Codecs HTJ2K output can contain substantial trailing data after
+the end-of-codestream (EOC) marker, including nonzero bytes. Record the DICOM
+file, encapsulated Pixel Data, and codestream sizes independently of codec
+correctness and performance.
 
 1. **Benchmark encoding with the shared timing rules.** Give Rust and OpenJPH
    the same raw frames and effective settings for each HTJ2K transfer syntax.
@@ -104,25 +127,24 @@ Record the size difference independently of codec correctness and performance.
    same `1.05` limit.
 2. **Inspect both outputs.** Preserve the original outputs. Record the file
    size when testing a DICOM file, the encapsulated frame size, the validated
-   codestream length and SHA-256, and the location and length of any padding.
-   Use DICOM frame and fragment boundaries and the HTJ2K codestream structure
-   to identify the payload and verify its end. Exclude only bytes the
-   structure identifies as padding. Zero-valued bytes alone are insufficient
-   evidence of padding. Stop and investigate malformed boundaries, unexpected
-   trailing data, or incompatible codestream settings.
-3. **Cross-decode both codestreams.** Feed each validated encoder output to
-   both decoders. Require byte-identical Pixel Data from the two decoders
-   for each codestream, with matching output metadata. Both lossless
-   syntaxes must also restore the original pixels exactly. For the lossy
-   syntax, record each encoder's reconstruction error against the source
-   under the agreed settings. Record whether the validated codestream
-   payloads match. HTJ2K encoding passes on valid structure, cross-decoding,
-   and the applicable pixel checks even when the encoded bytes differ.
-4. **Freeze one input for decoding time.** Use the validated reference
+   codestream length and SHA-256, and the location and length of any trailing
+   bytes. Use DICOM frame boundaries and the HTJ2K tile-part lengths to locate
+   EOC. Record fragment alignment and excess trailing bytes separately.
+   Investigate malformed boundaries, unexpected trailing data, and
+   incompatible codestream settings. Retain the complete DICOM output for
+   interoperability checks.
+3. **Freeze one input for decoding time.** Use the validated reference
    codestream payload as the shared input. Both decoders receive the same
    bytes and verified SHA-256. Keep DICOM parsing and padding handling
    outside the timer. Compare median decode time across independent rounds
    using the same `1.05` limit.
+4. **Cross-decode the codestreams.** Feed each validated encoder output to
+   both decoders. Require byte-identical Pixel Data from the two decoders
+   for each codestream, with matching output metadata. Both lossless
+   syntaxes must also restore the original pixels exactly. For the lossy
+   syntax, record each encoder's reconstruction error against the source
+   under the agreed settings. HTJ2K interoperability passes on valid structure,
+   cross-decoding, and the applicable pixel checks. Encoded bytes may differ.
 5. **Run final interoperability on the original DICOM outputs.** Exercise
    both directions with the padding and fragment layout that each encoder
    actually emits. Compare Pixel Data for each file and verify that both
@@ -133,7 +155,7 @@ Record the size difference independently of codec correctness and performance.
 
 1. **Check the individual rounds.** Compare the absolute time per operation
    for both implementations and their ratio in each round pair. Investigate
-   when ratios fall on both sides of `1.05`, when the result changes with run
+   when ratios fall on both sides of the applicable limit, when the result changes with run
    order, or when the same reference build changes materially between runs.
    Check the recorded times against concurrent workloads, CPU frequency,
    thermal throttling, and power-mode changes when those observations are
@@ -153,10 +175,10 @@ Record the size difference independently of codec correctness and performance.
 4. **Report the original and retest results together.** Record absolute
    timings and ratios for each batch. Across valid rounds, use the
    operation-weighted mean for encoding and the median of per-operation
-   times for decoding. If valid batches still fall on opposite sides of
-   `1.05`, report the case as inconclusive and verify it in a stable
-   measurement window before marking it as passed. A reproducible result above
-   `1.05` remains a performance failure.
+   times for decoding. If valid batches still disagree on whether a case meets
+   its limit, report it as inconclusive and verify it in a stable measurement
+   window before marking it as passed. A reproducible result that misses the
+   limit remains a performance failure.
 
 ## Retests and Final Checks
 
@@ -194,10 +216,25 @@ Record the size difference independently of codec correctness and performance.
   comparisons must align these settings. Matching libjpeg's integer inverse
   transform and edge handling changed some P1 and P2/4 output pixels
   compared with older Rust builds.
-- The fo-dicom managed interface rejects some lossy PALETTE COLOR
+- For classic JPEG and JPEG-LS, the fo-dicom managed interface rejects some lossy PALETTE COLOR
   combinations. Rust supports them. Record index-plane comparisons
   separately from public-entry-point support and cross-decode the Rust
   codestream where the reference decoder accepts it.
+- For JPEG 2000 and HTJ2K, classify inputs using the DICOM attribute tables.
+  Monochrome permits signed samples. Color requires unsigned samples, and
+  PALETTE COLOR requires a lossless-only syntax. Exercise signed RGB as an
+  invalid encoder input. Compare signed 8-bit monochrome with the original
+  signed samples, including negative values. Record any unsigned conversion
+  by the reference bridge for that specific direction and build.
+  [PS3.5 Table 8.2.4-1](https://dicom.nema.org/medical/dicom/current/output/chtml/part05/sect_8.2.4.html)
+  and [Table 8.2.14-1](https://dicom.nema.org/medical/dicom/current/output/chtml/part05/sect_8.2.14.html).
+- Check compressed YBR_RCT and YBR_ICT labels against the codestream MCT.
+  After the inverse transform, native RGB samples require an RGB label.
+  Report retained compressed labels separately from pixel differences.
+  With MCT disabled, use the compressed Photometric Interpretation to
+  distinguish RGB from YBR_FULL. For HTJ2K encoding timings also compare
+  the per-component SIZ precision and quantization settings, especially
+  for 12-bit samples stored in 16-bit words.
 - For near-lossless JPEG-LS, check both byte equality on the shared
   codestream and the NEAR bound against the source. When signed samples
   cross the sign boundary, error measured on unsigned code values can

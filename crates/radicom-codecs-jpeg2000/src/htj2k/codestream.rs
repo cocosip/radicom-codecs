@@ -4,7 +4,7 @@
 //! with the classic JPEG 2000 codestream; only the packet headers and
 //! code-block coder differ.
 
-use crate::geometry::{CodeBlock, Component, PrecinctBand};
+use crate::geometry::{CodeBlock, Component};
 use crate::marker::{
     write_cap, write_eoc, write_soc, write_sod, Cod, CodingStyle, MainHeader, QStep, Quantization,
     Siz, SizComp, Sot, COM, EOC, SOD, SOT, TLM,
@@ -12,11 +12,11 @@ use crate::marker::{
 use crate::quantization::{bit_plane_depth, subband_index};
 use crate::wavelet;
 
-use super::cleanup::{decode_cleanup, encode_cleanup};
+use super::cleanup::{encode_cleanup, CleanupDecoder};
 use super::packet::{decode_ht_packet, encode_ht_packet};
 use super::quant::{
-    cap_ccap, create_openjph_steps, create_quality_steps, decode_delta, from_sign_magnitude,
-    irrev_delta_inv_f32, kmax, openjph_reversible_exponents, to_sign_magnitude_f32,
+    cap_ccap, create_openjph_steps, create_quality_steps, decode_delta, irrev_delta_inv_f32, kmax,
+    openjph_reversible_exponents, quantize,
 };
 
 const CODE_BLOCK: i32 = 64;
@@ -82,6 +82,7 @@ pub(crate) fn encode(
                 levels as u8,
                 0,
                 0,
+                wavelet::avx2_available(),
             )?;
         }
     }
@@ -92,12 +93,11 @@ pub(crate) fn encode(
         // then runs the whole irreversible path in single precision.
         let mul = (1.0f64 / (1u64 << precision) as f64) as f32;
         let mut planes: Vec<Vec<f32>> = components
-            .iter()
+            .iter_mut()
             .map(|component| {
-                component
-                    .coefficients
-                    .iter()
-                    .map(|&value| value as f32 * mul)
+                std::mem::take(&mut component.coefficients)
+                    .into_iter()
+                    .map(|value| value as f32 * mul)
                     .collect()
             })
             .collect();
@@ -105,11 +105,12 @@ pub(crate) fn encode(
             forward_ict_f32(&mut planes);
         }
         for (component, plane) in components.iter().zip(planes.iter_mut()) {
-            wavelet::forward_97_f32(
+            wavelet::forward_97_openjph(
                 plane,
                 component.width as usize,
                 component.height as usize,
                 levels as u8,
+                wavelet::avx2_available(),
             )?;
         }
         irreversible_planes = planes;
@@ -149,6 +150,7 @@ pub(crate) fn encode(
     // OpenJPH's `set_tilepart_divisions(resolutions = true)` starts a new tile
     // part at every resolution, so the tile data is collected per resolution.
     let mut resolution_data: Vec<Vec<u8>> = Vec::with_capacity(levels as usize + 1);
+    let mut coefficients = Vec::new();
     for resolution in 0..=levels {
         let mut tile_data = Vec::new();
         for (component_index, component) in components.iter_mut().enumerate() {
@@ -168,12 +170,17 @@ pub(crate) fn encode(
                         let missing = (k_max - 1).max(0) as u32;
                         let shift = (31 - k_max).clamp(0, 30) as u32;
                         for block in band.code_blocks.iter_mut() {
-                            encode_block(block, &plane, plane_width, missing, shift)?;
+                            encode_block(
+                                block,
+                                &plane,
+                                plane_width,
+                                missing,
+                                shift,
+                                &mut coefficients,
+                            )?;
                         }
                     }
-                    let refs: Vec<&PrecinctBand> = bands.iter().collect();
-                    let packet = encode_ht_packet(&refs);
-                    tile_data.extend_from_slice(&packet);
+                    encode_ht_packet(bands, &mut tile_data);
                     component.coefficients = plane;
                 } else {
                     let plane = irreversible_planes
@@ -195,12 +202,11 @@ pub(crate) fn encode(
                                 plane_width,
                                 missing,
                                 delta_inv,
+                                &mut coefficients,
                             )?;
                         }
                     }
-                    let refs: Vec<&PrecinctBand> = bands.iter().collect();
-                    let packet = encode_ht_packet(&refs);
-                    tile_data.extend_from_slice(&packet);
+                    encode_ht_packet(bands, &mut tile_data);
                 }
             }
         }
@@ -305,35 +311,25 @@ fn encode_block_irreversible(
     plane_width: usize,
     missing: u32,
     delta_inv: f32,
+    coefficients: &mut Vec<i32>,
 ) -> Result<(), String> {
     let width = block.width.max(0) as usize;
     let height = block.height.max(0) as usize;
     block.total_passes = 0;
     block.zero_bitplanes = 0;
     block.data.clear();
-    block.segments.clear();
     if width == 0 || height == 0 {
         return Ok(());
     }
-    let mut values = Vec::with_capacity(width * height);
-    let mut any = false;
-    for y in 0..height {
-        for x in 0..width {
-            let value = plane[(block.y0 as usize + y) * plane_width + block.x0 as usize + x];
-            if value != 0.0 {
-                any = true;
-            }
-            values.push(value);
-        }
+    coefficients.resize(width * height, 0);
+    for (y, row) in coefficients.chunks_exact_mut(width).enumerate() {
+        let start = (block.y0 as usize + y) * plane_width + block.x0 as usize;
+        quantize(&plane[start..start + width], row, delta_inv);
     }
-    if !any {
+    if irreversible_block_is_empty(coefficients, missing) {
         return Ok(());
     }
-    let coefficients = to_sign_magnitude_f32(&values, delta_inv);
-    if irreversible_block_is_empty(&coefficients, missing) {
-        return Ok(());
-    }
-    block.data = encode_cleanup(&coefficients, width, height, missing)?;
+    block.data = encode_cleanup(coefficients, width, height, missing)?;
     block.total_passes = 1;
     block.zero_bitplanes = missing.min(255) as u8;
     Ok(())
@@ -354,48 +350,48 @@ fn encode_block(
     plane_width: usize,
     missing: u32,
     shift: u32,
+    coefficients: &mut Vec<i32>,
 ) -> Result<(), String> {
     let width = block.width.max(0) as usize;
     let height = block.height.max(0) as usize;
     block.total_passes = 0;
     block.zero_bitplanes = 0;
     block.data.clear();
-    block.segments.clear();
     if width == 0 || height == 0 {
         return Ok(());
     }
-    let mut coefficients = vec![0i32; width * height];
+    coefficients.resize(width * height, 0);
     let mut any = false;
-    for y in 0..height {
-        for x in 0..width {
-            let sx = block.x0 as usize + x;
-            let sy = block.y0 as usize + y;
-            let value = plane[sy * plane_width + sx];
-            if value != 0 {
-                any = true;
-            }
-            let magnitude = (i64::from(value).unsigned_abs() << shift) as u32;
-            coefficients[y * width + x] = if value < 0 {
-                (0x8000_0000u32 | magnitude) as i32
-            } else {
-                magnitude as i32
-            };
+    for (y, row) in coefficients.chunks_exact_mut(width).enumerate() {
+        let start = (block.y0 as usize + y) * plane_width + block.x0 as usize;
+        for (&value, out) in plane[start..start + width].iter().zip(row) {
+            any |= value != 0;
+            let magnitude = value.unsigned_abs() << shift;
+            *out = (magnitude | (value as u32 & 0x8000_0000)) as i32;
         }
     }
     if !any {
         return Ok(());
     }
-    block.data = encode_cleanup(&coefficients, width, height, missing)?;
+    block.data = encode_cleanup(coefficients, width, height, missing)?;
     block.total_passes = 1;
     block.zero_bitplanes = missing.min(255) as u8;
     Ok(())
 }
 
 /// Decodes one reversible HTJ2K codestream into integer component samples.
+#[cfg(test)]
 pub(crate) fn decode(
     data: &[u8],
     expected_progression: Option<u8>,
 ) -> Result<Vec<Component>, String> {
+    decode_with_mct(data, expected_progression).map(|(components, _)| components)
+}
+
+pub(crate) fn decode_with_mct(
+    data: &[u8],
+    expected_progression: Option<u8>,
+) -> Result<(Vec<Component>, bool), String> {
     let (header, mut offset) = MainHeader::parse(data)?;
     if header.cod.style.style & 0x40 == 0 {
         return Err("codestream is not HTJ2K (COD style 0x40 is missing)".into());
@@ -497,14 +493,12 @@ pub(crate) fn decode(
 
     let mut tile_data = Vec::new();
     let mut tile_parts = 0usize;
-    let eoc_offset;
     loop {
         if offset + 2 > data.len() {
             return Err("truncated HTJ2K codestream before SOT".into());
         }
         let marker = u16::from_be_bytes([data[offset], data[offset + 1]]);
         if marker == EOC {
-            eoc_offset = offset;
             break;
         }
         if marker != SOT {
@@ -551,38 +545,30 @@ pub(crate) fn decode(
         tile_data.extend_from_slice(&data[offset..end]);
         offset = end;
     }
-    // fo-dicom/OpenJPH hands back the whole pooled fragment buffer as the frame,
-    // so real HTJ2K codestreams carry stale capacity bytes after EOC. Unlike the
-    // classic path we cannot require "at most one pad byte" here; bytes after a
-    // present EOC are ignored for interoperability. EOC presence is still
-    // required (the loop only breaks on EOC), and markers before it are validated.
-    let _ = eoc_offset;
+    // Older fo-dicom HTJ2K files can contain unused buffer capacity after EOC.
+    // The marker loop requires EOC at a validated tile-part boundary.
     if tile_parts == 0 {
         return Err("codestream has no tile-part".into());
     }
 
     let mut packet_offset = 0usize;
+    let mut cleanup = CleanupDecoder::default();
     for resolution in 0..=levels {
         for component in components.iter_mut() {
             let precincts = component.precincts_including_empty(resolution);
             for precinct in precincts {
-                let snapshot = component.bands(resolution, precinct).to_vec();
-                let refs: Vec<&PrecinctBand> = snapshot.iter().collect();
-                let (consumed, decoded) = decode_ht_packet(&tile_data[packet_offset..], &refs)?;
+                let (consumed, decoded) = decode_ht_packet(
+                    &tile_data[packet_offset..],
+                    component.bands(resolution, precinct),
+                )?;
                 packet_offset += consumed;
-                let mut by_index = std::collections::HashMap::new();
-                for item in decoded {
-                    by_index.insert(item.index, item);
-                }
+                let mut decoded = decoded.into_iter().peekable();
 
                 let plane_width = component.width as usize;
                 let quant = header.quantization(component.index);
                 if reversible {
                     let mut plane = std::mem::take(&mut component.coefficients);
-                    let bands = component
-                        .bands_mut(resolution, precinct)
-                        .ok_or_else(|| "missing precinct geometry".to_string())?;
-                    for band in bands.iter_mut() {
+                    for band in component.bands(resolution, precinct) {
                         let index = subband_index(resolution, band.orientation).max(0) as usize;
                         let step = quant.step(index).unwrap_or(QStep {
                             exponent: 0,
@@ -591,8 +577,8 @@ pub(crate) fn decode(
                         let encoded = (u16::from(step.exponent) << 11) | (step.mantissa & 0x07FF);
                         let subband_bits = bit_plane_depth(encoded, quant.guard_bits).max(1);
                         let shift = (31 - subband_bits).clamp(0, 30) as u32;
-                        for block in band.code_blocks.iter_mut() {
-                            let item = match by_index.remove(&block.index) {
+                        for block in &band.code_blocks {
+                            let item = match decoded.next_if(|item| item.index == block.index) {
                                 Some(item) => item,
                                 None => continue,
                             };
@@ -601,24 +587,19 @@ pub(crate) fn decode(
                             if width == 0 || height == 0 {
                                 continue;
                             }
-                            let sign_magnitude = decode_cleanup(
-                                &item.data,
+                            let sign_magnitude = cleanup.decode(
+                                item.data,
                                 width,
                                 height,
                                 u32::from(item.zero_bitplanes),
                             )?;
-                            for y in 0..height {
-                                for x in 0..width {
-                                    let value = sign_magnitude[y * width + x];
-                                    let magnitude = ((value as u32) & 0x7FFF_FFFF) >> shift;
-                                    let signed = if value < 0 {
-                                        -(magnitude as i32)
-                                    } else {
-                                        magnitude as i32
-                                    };
-                                    let sx = block.x0 as usize + x;
-                                    let sy = block.y0 as usize + y;
-                                    plane[sy * plane_width + sx] = signed;
+                            for (y, row) in sign_magnitude.chunks_exact(width).enumerate() {
+                                let start =
+                                    (block.y0 as usize + y) * plane_width + block.x0 as usize;
+                                for (out, &bits) in plane[start..start + width].iter_mut().zip(row)
+                                {
+                                    let value = (bits & i32::MAX) >> shift;
+                                    *out = if bits < 0 { -value } else { value };
                                 }
                             }
                         }
@@ -628,11 +609,7 @@ pub(crate) fn decode(
                     let mut plane = component.irreversible.take().unwrap_or_else(|| {
                         vec![0.0; (component.width * component.height) as usize]
                     });
-                    let precision = component.precision;
-                    let bands = component
-                        .bands_mut(resolution, precinct)
-                        .ok_or_else(|| "missing precinct geometry".to_string())?;
-                    for band in bands.iter_mut() {
+                    for band in component.bands(resolution, precinct) {
                         let index = subband_index(resolution, band.orientation).max(0) as usize;
                         let step = quant.step(index).unwrap_or(QStep {
                             exponent: 0,
@@ -640,10 +617,9 @@ pub(crate) fn decode(
                         });
                         let encoded = (u16::from(step.exponent) << 11) | (step.mantissa & 0x07FF);
                         let k_max = kmax(encoded, quant.guard_bits).max(1);
-                        let delta = decode_delta(encoded, band.orientation, k_max)
-                            * 2f64.powi(i32::from(precision));
-                        for block in band.code_blocks.iter_mut() {
-                            let item = match by_index.remove(&block.index) {
+                        let delta = decode_delta(encoded, band.orientation, k_max);
+                        for block in &band.code_blocks {
+                            let item = match decoded.next_if(|item| item.index == block.index) {
                                 Some(item) => item,
                                 None => continue,
                             };
@@ -652,18 +628,19 @@ pub(crate) fn decode(
                             if width == 0 || height == 0 {
                                 continue;
                             }
-                            let sign_magnitude = decode_cleanup(
-                                &item.data,
+                            let sign_magnitude = cleanup.decode(
+                                item.data,
                                 width,
                                 height,
                                 u32::from(item.zero_bitplanes),
                             )?;
-                            let values = from_sign_magnitude(&sign_magnitude, delta);
-                            for y in 0..height {
-                                for x in 0..width {
-                                    let sx = block.x0 as usize + x;
-                                    let sy = block.y0 as usize + y;
-                                    plane[sy * plane_width + sx] = values[y * width + x];
+                            for (y, row) in sign_magnitude.chunks_exact(width).enumerate() {
+                                let start =
+                                    (block.y0 as usize + y) * plane_width + block.x0 as usize;
+                                for (out, &bits) in plane[start..start + width].iter_mut().zip(row)
+                                {
+                                    let value = (bits & 0x7FFF_FFFF) as f32 * delta;
+                                    *out = if bits < 0 { -value } else { value };
                                 }
                             }
                         }
@@ -686,40 +663,37 @@ pub(crate) fn decode(
                 levels as u8,
                 0,
                 0,
+                wavelet::avx2_available(),
             )?;
             component.samples = std::mem::take(&mut component.coefficients);
         } else {
-            let mut plane = component
+            let plane = component
                 .irreversible
-                .take()
+                .as_mut()
                 .ok_or_else(|| "missing irreversible plane".to_string())?;
-            wavelet::inverse_97(
-                &mut plane,
+            wavelet::inverse_97_openjph(
+                plane,
                 component.width as usize,
                 component.height as usize,
                 levels as u8,
             )?;
-            component.samples = plane
-                .iter()
-                .map(|&value| {
-                    if value >= 0.0 {
-                        (value + 0.5) as i32
-                    } else {
-                        (value - 0.5) as i32
-                    }
-                })
-                .collect();
-            component.float_samples = Some(plane);
         }
     }
     if header.cod.mct != 0 && components.len() >= 3 {
         if reversible {
-            inverse_rct(&mut components);
+            crate::codestream::inverse_rct(&mut components);
         } else {
             inverse_ict(&mut components);
         }
     }
-    Ok(components)
+    for component in &mut components {
+        if let Some(plane) = &component.irreversible {
+            let scale = (1u32 << component.precision) as f32;
+            component.samples.resize(plane.len(), 0);
+            super::quant::scale_and_round::<false>(plane, &mut component.samples, scale);
+        }
+    }
+    Ok((components, header.cod.mct != 0))
 }
 
 fn find_next_tile_marker(data: &[u8], start: usize) -> Result<usize, String> {
@@ -759,78 +733,37 @@ fn forward_ict_f32(planes: &mut [Vec<f32>]) {
 }
 
 fn forward_rct(components: &mut [Component]) {
-    let count = components
-        .iter()
-        .take(3)
-        .map(|component| component.coefficients.len())
-        .min()
-        .unwrap_or(0);
-    for index in 0..count {
-        let r = components[0].coefficients[index];
-        let g = components[1].coefficients[index];
-        let b = components[2].coefficients[index];
-        components[0].coefficients[index] = (r + 2 * g + b) >> 2;
-        components[1].coefficients[index] = b - g;
-        components[2].coefficients[index] = r - g;
-    }
-}
-
-fn inverse_rct(components: &mut [Component]) {
-    let count = components
-        .iter()
-        .take(3)
-        .map(|component| component.samples.len())
-        .min()
-        .unwrap_or(0);
-    for index in 0..count {
-        let y = components[0].samples[index];
-        let u = components[1].samples[index];
-        let v = components[2].samples[index];
-        let g = y - ((u + v) >> 2);
-        components[0].samples[index] = v + g;
-        components[1].samples[index] = g;
-        components[2].samples[index] = u + g;
+    let [red, green, blue, ..] = components else {
+        return;
+    };
+    for ((r, g), b) in red
+        .coefficients
+        .iter_mut()
+        .zip(&mut green.coefficients)
+        .zip(&mut blue.coefficients)
+    {
+        (*r, *g, *b) = ((*r + 2 * *g + *b) >> 2, *b - *g, *r - *g);
     }
 }
 
 fn inverse_ict(components: &mut [Component]) {
-    let count = components
-        .iter()
-        .take(3)
-        .map(|component| component.samples.len())
-        .min()
-        .unwrap_or(0);
-    for index in 0..count {
-        let y = components[0]
-            .float_samples
-            .as_ref()
-            .map(|p| p[index])
-            .unwrap_or(f64::from(components[0].samples[index]));
-        let cb = components[1]
-            .float_samples
-            .as_ref()
-            .map(|p| p[index])
-            .unwrap_or(f64::from(components[1].samples[index]));
-        let cr = components[2]
-            .float_samples
-            .as_ref()
-            .map(|p| p[index])
-            .unwrap_or(f64::from(components[2].samples[index]));
-        let r = y + 1.402 * cr;
-        let g = y - 0.344_136 * cb - 0.714_136 * cr;
-        let b = y + 1.772 * cb;
-        if let Some(plane) = components[0].float_samples.as_mut() {
-            plane[index] = r;
+    const KR: f64 = 0.299f32 as f64;
+    const KG: f64 = 0.587f32 as f64;
+    const KB: f64 = 0.114f32 as f64;
+    const CR_TO_G: f32 = (2.0 * KR * (1.0 - KR) / KG) as f32;
+    const CB_TO_G: f32 = (2.0 * KB * (1.0 - KB) / KG) as f32;
+    let [y, cb, cr, ..] = components else { return };
+    if let (Some(y), Some(cb), Some(cr)) = (
+        &mut y.irreversible,
+        &mut cb.irreversible,
+        &mut cr.irreversible,
+    ) {
+        for ((y, cb), cr) in y.iter_mut().zip(cb).zip(cr) {
+            let r = *y + (2.0 * (1.0 - KR)) as f32 * *cr;
+            let g = *y - CR_TO_G * *cr - CB_TO_G * *cb;
+            let b = *y + (2.0 * (1.0 - KB)) as f32 * *cb;
+            (*y, *cb, *cr) = (r, g, b);
         }
-        if let Some(plane) = components[1].float_samples.as_mut() {
-            plane[index] = g;
-        }
-        if let Some(plane) = components[2].float_samples.as_mut() {
-            plane[index] = b;
-        }
-        components[0].samples[index] = r.round() as i32;
-        components[1].samples[index] = g.round() as i32;
-        components[2].samples[index] = b.round() as i32;
     }
 }
 #[cfg(test)]

@@ -45,8 +45,8 @@ impl Layout {
         Ok(layout)
     }
 
-    pub(crate) fn source(d: &PixelDataRef<'_>) -> Result<Self, String> {
-        Self::values(
+    pub(crate) fn source(d: &PixelDataRef<'_>, lossless_syntax: bool) -> Result<Self, String> {
+        let layout = Self::values(
             d.width(),
             d.height(),
             d.bits_allocated().map_err(|e| e.to_string())?,
@@ -55,7 +55,19 @@ impl Layout {
             d.planar_configuration(),
             d.pixel_representation(),
             d.photometric_interpretation(),
-        )
+        )?;
+        if layout.signed
+            && !matches!(
+                layout.pi,
+                PhotometricInterpretation::Monochrome1 | PhotometricInterpretation::Monochrome2
+            )
+        {
+            return Err("JPEG 2000 color and palette encodings require unsigned pixels".into());
+        }
+        if layout.pi == PhotometricInterpretation::PaletteColor && !lossless_syntax {
+            return Err("PALETTE COLOR requires a lossless-only JPEG 2000 transfer syntax".into());
+        }
+        Ok(layout)
     }
 
     pub(crate) fn destination(d: &PixelData<'_>) -> Result<Self, String> {
@@ -173,14 +185,32 @@ impl Layout {
         if bytes.len() < self.frame_len {
             return Err("native frame is truncated".into());
         }
+        if self.components == 1 {
+            let bytes = &bytes[..self.frame_len];
+            let center = 1i32 << (self.bits_stored - 1);
+            let mask = 2 * center - 1;
+            let flip = if self.signed { center } else { 0 };
+            let sample = |raw: i32| ((raw & mask) ^ flip) - center;
+            let plane = if self.bits_allocated == 8 {
+                bytes.iter().map(|&v| sample(i32::from(v))).collect()
+            } else {
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&v| sample(i32::from(u16::from_le_bytes(v))))
+                    .collect()
+            };
+            return Ok(vec![plane]);
+        }
         let pixels = self.width * self.height;
         let mut planes = vec![vec![0i32; pixels]; self.components as usize];
         if self.ybr422 {
             for pair in 0..pixels / 2 {
                 let base = pair * 4;
                 let y0 = i32::from(bytes[base]);
-                let cb = i32::from(bytes[base + 1]);
-                let y1 = i32::from(bytes[base + 2]);
+                let y1 = i32::from(bytes[base + 1]);
+                let cb = i32::from(bytes[base + 2]);
                 let cr = i32::from(bytes[base + 3]);
                 let (r0, g0, b0) = ybr_to_rgb(y0, cb, cr, self.bits_stored);
                 let (r1, g1, b1) = ybr_to_rgb(y1, cb, cr, self.bits_stored);
@@ -256,11 +286,6 @@ impl Layout {
         } else {
             maxval
         };
-        let mask = if self.bits_stored == 16 {
-            u16::MAX
-        } else {
-            (1u16 << self.bits_stored) - 1
-        };
         let mut bytes = vec![0u8; self.frame_len];
         if self.ybr422 {
             if planes.len() != 3 {
@@ -277,34 +302,129 @@ impl Layout {
                 let (y0, cb0, cr0) = rgb_to_ybr(r0, g0, b0, self.bits_stored);
                 let (y1, cb1, cr1) = rgb_to_ybr(r1, g1, b1, self.bits_stored);
                 bytes[base] = y0 as u8;
-                bytes[base + 1] = ((cb0 + cb1) / 2) as u8;
-                bytes[base + 2] = y1 as u8;
+                bytes[base + 1] = y1 as u8;
+                bytes[base + 2] = ((cb0 + cb1) / 2) as u8;
                 bytes[base + 3] = ((cr0 + cr1) / 2) as u8;
             }
             return Ok(bytes);
         }
-        for component in 0..self.components as usize {
-            for pixel in 0..pixels {
-                let value = (planes[component][pixel] + shift).clamp(min, max);
-                let raw = if self.signed {
-                    value as i16 as u16
-                } else {
-                    (value as u16) & mask
-                };
-                let index = if self.planar == 1 {
-                    component * pixels + pixel
-                } else {
-                    pixel * self.components as usize + component
-                };
-                let offset = index * (self.bits_allocated / 8) as usize;
+        let lower = min - shift;
+        let upper = max - shift;
+        let native_sample = |sample: i32| (sample.clamp(lower, upper) + shift) as u16;
+        if self.planar != 1 {
+            if let [red, green, blue] = planes {
                 if self.bits_allocated == 8 {
-                    bytes[offset] = raw as u8;
+                    let prefix = 0;
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                    let prefix = if pixels >= 16 && std::arch::is_x86_feature_detected!("sse4.1") {
+                        // SAFETY: SSE4.1 is available and each chunk has 16 samples per plane.
+                        unsafe {
+                            pack_rgb8_sse41(red, green, blue, &mut bytes, shift, lower, upper)
+                        };
+                        pixels / 16 * 16
+                    } else {
+                        prefix
+                    };
+                    for (output, ((&r, &g), &b)) in
+                        bytes[prefix * 3..].as_chunks_mut::<3>().0.iter_mut().zip(
+                            red[prefix..]
+                                .iter()
+                                .zip(&green[prefix..])
+                                .zip(&blue[prefix..]),
+                        )
+                    {
+                        *output = [
+                            native_sample(r) as u8,
+                            native_sample(g) as u8,
+                            native_sample(b) as u8,
+                        ];
+                    }
                 } else {
-                    bytes[offset..offset + 2].copy_from_slice(&raw.to_le_bytes());
+                    for (output, ((&r, &g), &b)) in bytes
+                        .as_chunks_mut::<6>()
+                        .0
+                        .iter_mut()
+                        .zip(red.iter().zip(green).zip(blue))
+                    {
+                        let [r0, r1] = native_sample(r).to_le_bytes();
+                        let [g0, g1] = native_sample(g).to_le_bytes();
+                        let [b0, b1] = native_sample(b).to_le_bytes();
+                        *output = [r0, r1, g0, g1, b0, b1];
+                    }
+                }
+                return Ok(bytes);
+            }
+        }
+        if self.bits_allocated == 8 {
+            for (output, plane) in bytes.chunks_exact_mut(pixels).zip(planes) {
+                for (output, &sample) in output.iter_mut().zip(plane) {
+                    *output = native_sample(sample) as u8;
+                }
+            }
+        } else {
+            for (output, plane) in bytes.chunks_exact_mut(2 * pixels).zip(planes) {
+                for (output, &sample) in output.as_chunks_mut::<2>().0.iter_mut().zip(plane) {
+                    *output = native_sample(sample).to_le_bytes();
                 }
             }
         }
         Ok(bytes)
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn pack_rgb8_sse41(
+    red: &[i32],
+    green: &[i32],
+    blue: &[i32],
+    output: &mut [u8],
+    shift: i32,
+    lower: i32,
+    upper: i32,
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    const MASKS: [[[u8; 16]; 3]; 3] = {
+        let mut masks = [[[0x80; 16]; 3]; 3];
+        let mut i = 0;
+        while i < 48 {
+            masks[i / 16][i % 3][i % 16] = (i / 3) as u8;
+            i += 1;
+        }
+        masks
+    };
+    let cap = _mm_set1_epi32(upper);
+    let floor = _mm_set1_epi32(lower);
+    let offset = _mm_set1_epi32(shift);
+    let byte_mask = _mm_set1_epi32(0xff);
+    // SAFETY: All reads and writes stay inside the current full chunk, and use unaligned operations.
+    unsafe {
+        let masks = MASKS.map(|group| group.map(|mask| _mm_loadu_si128(mask.as_ptr().cast())));
+        for (chunk, dest) in output.as_chunks_mut::<48>().0.iter_mut().enumerate() {
+            let lanes = [red, green, blue].map(|plane| {
+                let ptr = plane.as_ptr().add(chunk * 16);
+                let words = [0, 4, 8, 12].map(|index| {
+                    let values = _mm_loadu_si128(ptr.add(index).cast());
+                    let samples = _mm_min_epi32(_mm_max_epi32(values, floor), cap);
+                    _mm_and_si128(_mm_add_epi32(samples, offset), byte_mask)
+                });
+                _mm_packus_epi16(
+                    _mm_packus_epi32(words[0], words[1]),
+                    _mm_packus_epi32(words[2], words[3]),
+                )
+            });
+            for (dest, [r, g, b]) in dest.as_chunks_mut::<16>().0.iter_mut().zip(masks) {
+                let rg = _mm_or_si128(_mm_shuffle_epi8(lanes[0], r), _mm_shuffle_epi8(lanes[1], g));
+                _mm_storeu_si128(
+                    dest.as_mut_ptr().cast(),
+                    _mm_or_si128(rg, _mm_shuffle_epi8(lanes[2], b)),
+                );
+            }
+        }
     }
 }
 
@@ -392,19 +512,24 @@ pub(crate) fn encode_ht(
     ) {
         return Err("native source cannot use YBR_RCT or YBR_ICT".into());
     }
-    // fo-dicom passes `BitsAllocated` to OpenJPH, so a narrow sample range is
-    // encoded inside a wider codestream: the SIZ precision and the level shift
-    // both follow the allocated width.
-    let precision = layout.bits_allocated as u8;
-    let mut planes = layout.read(raw)?;
-    if !layout.signed && layout.bits_allocated > u16::from(layout.bits_stored) {
-        let extra = (1i32 << (layout.bits_allocated - 1)) - (1i32 << (layout.bits_stored - 1));
-        for plane in &mut planes {
-            for value in plane.iter_mut() {
-                *value -= extra;
-            }
-        }
-    }
+    let precision = layout.bits_stored;
+    let planes = if layout.pi == PhotometricInterpretation::Rgb
+        && layout.components == 3
+        && layout.planar == 0
+        && !layout.signed
+        && layout.bits_allocated == 8
+        && layout.bits_stored == 8
+    {
+        let bytes = raw
+            .get(..layout.frame_len)
+            .ok_or("native frame is truncated")?;
+        let pixels = bytes.as_chunks::<3>().0;
+        (0..3)
+            .map(|channel| pixels.iter().map(|p| i32::from(p[channel]) - 128).collect())
+            .collect()
+    } else {
+        layout.read(raw)?
+    };
     let mut components = codestream::build_components(
         planes,
         layout.width as i32,
@@ -424,7 +549,7 @@ pub(crate) fn encode_ht(
 fn align_precision(components: &mut [Component], layout: &Layout) -> Result<(), String> {
     let lossy = components
         .iter()
-        .any(|component| component.float_samples.is_some());
+        .any(|component| component.irreversible.is_some());
     let limit = 1i32 << (i32::from(layout.bits_stored) - 1);
     let clamp = |value: i32| value.clamp(-limit, limit - 1);
     // Each component may carry its own precision (SIZ stores per-component
@@ -493,24 +618,43 @@ pub(crate) fn decode_ht(
     layout: &Layout,
     data: &[u8],
     expected_progression: Option<u8>,
+    source_ybr_full: bool,
 ) -> Result<Vec<u8>, String> {
-    let mut components = ht_codestream::decode(data, expected_progression)?;
-    validate_components(&components, layout)?;
-    align_precision(&mut components, layout)?;
-    let planes: Vec<Vec<i32>> = components
-        .into_iter()
-        .map(|component| component.samples)
-        .collect();
-    layout.write(&planes)
+    let (components, mct) = ht_codestream::decode_with_mct(data, expected_progression)?;
+    pack_decoded(layout, components, source_ybr_full && !mct)
 }
-pub(crate) fn decode(layout: &Layout, data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut components = codestream::decode(data)?;
+
+pub(crate) fn decode(
+    layout: &Layout,
+    data: &[u8],
+    source_ybr_full: bool,
+) -> Result<Vec<u8>, String> {
+    let (components, mct) = codestream::decode_with_mct(data)?;
+    pack_decoded(layout, components, source_ybr_full && !mct)
+}
+
+fn pack_decoded(
+    layout: &Layout,
+    mut components: Vec<Component>,
+    convert_ybr: bool,
+) -> Result<Vec<u8>, String> {
     validate_components(&components, layout)?;
     align_precision(&mut components, layout)?;
-    let planes: Vec<Vec<i32>> = components
+    let mut planes: Vec<Vec<i32>> = components
         .into_iter()
         .map(|component| component.samples)
         .collect();
+    if convert_ybr {
+        let [y, cb, cr] = planes.as_mut_slice() else {
+            return Err("YBR_FULL requires three components".into());
+        };
+        let center = 1 << (layout.bits_stored - 1);
+        let unshift = |value: i32| value.clamp(-center, center - 1) + center;
+        for ((y, cb), cr) in y.iter_mut().zip(cb).zip(cr) {
+            let (r, g, b) = ybr_to_rgb(unshift(*y), unshift(*cb), unshift(*cr), layout.bits_stored);
+            (*y, *cb, *cr) = (r - center, g - center, b - center);
+        }
+    }
     layout.write(&planes)
 }
 
@@ -582,6 +726,44 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_rgb_preserves_clamped_samples_across_vector_boundaries() {
+        for signed in [false, true] {
+            for bits_stored in [7, 8] {
+                let layout = Layout {
+                    width: 33,
+                    height: 1,
+                    components: 3,
+                    frame_len: 99,
+                    bits_stored,
+                    signed,
+                    pi: PhotometricInterpretation::Rgb,
+                    ..mono8()
+                };
+                let planes: Vec<Vec<i32>> = (0..3)
+                    .map(|channel| {
+                        let mut samples: Vec<_> = (0..33)
+                            .map(|col| (col - 16) * (channel + 5) + channel)
+                            .collect();
+                        samples[3 + channel as usize] = i32::MAX;
+                        samples[17 + channel as usize] = i32::MIN;
+                        samples
+                    })
+                    .collect();
+                let limit = 1 << (bits_stored - 1);
+                let shift = if signed { 0 } else { limit };
+                let expected: Vec<_> = (0..33)
+                    .flat_map(|col| {
+                        planes
+                            .iter()
+                            .map(move |plane| (plane[col].clamp(-limit, limit - 1) + shift) as u8)
+                    })
+                    .collect();
+                assert_eq!(layout.write(&planes).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
     fn ybr_full_converts_to_rgb() {
         let layout = Layout {
             width: 1,
@@ -595,6 +777,44 @@ mod tests {
         let planes = layout.read(&raw).unwrap();
         for plane in &planes {
             assert_eq!(plane[0], 0);
+        }
+    }
+
+    #[test]
+    fn native_ybr_422_shares_chroma_after_both_luma_samples() {
+        let layout = Layout {
+            width: 2,
+            height: 1,
+            components: 3,
+            frame_len: 4,
+            pi: PhotometricInterpretation::YbrFull422,
+            ybr422: true,
+            ..mono8()
+        };
+        let raw = [10, 200, 128, 128];
+        let planes = layout.read(&raw).unwrap();
+        assert_eq!(planes, vec![vec![-118, 72]; 3]);
+        assert_eq!(layout.write(&planes).unwrap(), raw);
+    }
+
+    #[test]
+    fn ht_siz_uses_stored_precision_and_signedness() {
+        for signed in [false, true] {
+            let layout = Layout {
+                signed,
+                ..narrow_layout()
+            };
+            let options = ht_codestream::EncodeOptions {
+                progression: 2,
+                reversible: true,
+                levels: 2,
+                mct: false,
+                quality: 0,
+                insert_tlm: true,
+            };
+            let stream = encode_ht(&layout, &vec![0; layout.frame_len], &options).unwrap();
+            let header = crate::marker::MainHeader::parse(&stream).unwrap().0;
+            assert_eq!(header.siz.comps[0].ssiz, if signed { 0x8b } else { 0x0b });
         }
     }
 
@@ -629,7 +849,7 @@ mod tests {
         // precision, so a 12-bit dataset arrives in a 16-bit codestream; the
         // samples must be re-centred on the destination's level shift.
         let values: Vec<i32> = (0..(32 * 8)).map(|i| (i * 37) % 4096).collect();
-        let bytes = decode(&narrow_layout(), &full_width_codestream(&values)).unwrap();
+        let bytes = decode(&narrow_layout(), &full_width_codestream(&values), false).unwrap();
         for (index, value) in values.iter().enumerate() {
             let stored = i32::from(u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]));
             assert_eq!(stored, *value, "sample {index}");
@@ -639,7 +859,7 @@ mod tests {
     #[test]
     fn rejects_a_full_width_codestream_whose_samples_do_not_fit() {
         let values: Vec<i32> = (0..(32 * 8)).map(|i| 4095 + (i % 900)).collect();
-        let error = decode(&narrow_layout(), &full_width_codestream(&values)).unwrap_err();
+        let error = decode(&narrow_layout(), &full_width_codestream(&values), false).unwrap_err();
         assert!(error.contains("do not fit"), "{error}");
     }
 
@@ -653,7 +873,7 @@ mod tests {
             signed: true,
             ..narrow_layout()
         };
-        let bytes = decode(&layout, &stream).unwrap();
+        let bytes = decode(&layout, &stream, false).unwrap();
         for (index, value) in values.iter().enumerate() {
             let stored = i16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
             assert_eq!(i32::from(stored), *value, "sample {index}");
@@ -678,7 +898,7 @@ mod tests {
             signed: true,
             ..narrow_layout()
         };
-        let bytes = decode_ht(&layout, &stream, None).unwrap();
+        let bytes = decode_ht(&layout, &stream, None, false).unwrap();
         for (index, value) in values.iter().enumerate() {
             let stored = i16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
             assert_eq!(i32::from(stored), *value, "sample {index}");
@@ -689,7 +909,7 @@ mod tests {
     fn lossy_overshoot_is_clamped_but_lossless_refuses_it() {
         let mut components = vec![Component::new(0, 0, 0, 2, 1, 0, 16, false).unwrap()];
         components[0].samples = vec![40000, -40000];
-        components[0].float_samples = Some(vec![0.0; 2]);
+        components[0].irreversible = Some(vec![0.0; 2]);
         let mut layout = narrow_layout();
         layout.width = 2;
         layout.height = 1;
@@ -697,7 +917,7 @@ mod tests {
         align_precision(&mut components, &layout).unwrap();
         assert_eq!(components[0].samples, vec![2047, -2048]);
 
-        components[0].float_samples = None;
+        components[0].irreversible = None;
         components[0].samples = vec![40000, -40000];
         assert!(align_precision(&mut components, &layout).is_err());
     }

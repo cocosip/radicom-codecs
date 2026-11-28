@@ -8,9 +8,9 @@ use crate::bit::{BitReader, BitWriter};
 use crate::geometry::{CodeBlock, PrecinctBand};
 
 /// Decoded code-block contribution from one HT packet.
-pub(crate) struct DecodedBlock {
+pub(crate) struct DecodedBlock<'a> {
     pub(crate) index: usize,
-    pub(crate) data: Vec<u8>,
+    pub(crate) data: &'a [u8],
     pub(crate) zero_bitplanes: u8,
 }
 
@@ -157,8 +157,16 @@ fn bit_length(value: usize) -> u32 {
     (usize::BITS - value.leading_zeros()).max(1)
 }
 
-/// Encodes one HT packet from the bands of one resolution and precinct.
-pub(crate) fn encode_ht_packet(bands: &[&PrecinctBand]) -> Vec<u8> {
+fn blocks_in_raster_order<'a>(
+    band: &'a PrecinctBand,
+) -> impl FnMut(usize, usize) -> Option<&'a CodeBlock> + 'a {
+    // Geometry emits the existing blocks in raster order, skipping empty cells.
+    let mut blocks = band.code_blocks.iter().peekable();
+    move |x, y| blocks.next_if(|block| block.local_x == x as i32 && block.local_y == y as i32)
+}
+
+/// Appends one HT packet from the bands of one resolution and precinct.
+pub(crate) fn encode_ht_packet(bands: &[PrecinctBand], output: &mut Vec<u8>) {
     let mut header = BitWriter::new_stuffed();
     let mut body = Vec::new();
     let mut coded = false;
@@ -187,15 +195,11 @@ pub(crate) fn encode_ht_packet(bands: &[&PrecinctBand]) -> Vec<u8> {
         let mut inclusion_flags = HtTree::new(width, height, 0);
         let mmsb = HtTree::from_missing_msb(band);
         let mut mmsb_flags = HtTree::new(width, height, 0);
-        let block_map = |x: usize, y: usize| -> Option<&CodeBlock> {
-            band.code_blocks
-                .iter()
-                .find(|block| block.local_x == x as i32 && block.local_y == y as i32)
-        };
+        let mut next_block = blocks_in_raster_order(band);
 
         for y in 0..height {
             for x in 0..width {
-                let block = block_map(x, y);
+                let block = next_block(x, y);
                 let mut empty_block = false;
                 for level_plus_one in (1..=inclusion.levels).rev() {
                     let level = level_plus_one - 1;
@@ -250,25 +254,29 @@ pub(crate) fn encode_ht_packet(bands: &[&PrecinctBand]) -> Vec<u8> {
 
         for block in &band.code_blocks {
             if block.total_passes > 0 && !block.data.is_empty() {
-                body.extend_from_slice(&block.data);
+                body.push(block.data.as_slice());
             }
         }
     }
 
     if !coded {
-        return vec![0];
+        output.push(0);
+        return;
     }
-    let mut output = header.into_bytes();
-    output.extend_from_slice(&body);
-    output
+    let header = header.into_bytes();
+    output.reserve(header.len() + body.iter().map(|block| block.len()).sum::<usize>());
+    output.extend_from_slice(&header);
+    for block in body {
+        output.extend_from_slice(block);
+    }
 }
 
 /// Decodes one HT packet, returning the number of consumed bytes and the
 /// included code-block contributions in packet order.
-pub(crate) fn decode_ht_packet(
-    data: &[u8],
-    bands: &[&PrecinctBand],
-) -> Result<(usize, Vec<DecodedBlock>), String> {
+pub(crate) fn decode_ht_packet<'a>(
+    data: &'a [u8],
+    bands: &[PrecinctBand],
+) -> Result<(usize, Vec<DecodedBlock<'a>>), String> {
     if data.is_empty() {
         return Err("HTJ2K packet is empty".into());
     }
@@ -293,39 +301,27 @@ pub(crate) fn decode_ht_packet(
         let mut inclusion_flags = HtTree::new(width, height, 0);
         let mut mmsb = HtTree::new(width, height, 0);
         let mut mmsb_flags = HtTree::new(width, height, 0);
-        let mut included_state = vec![false; width * height];
-        let block_map = |x: usize, y: usize| -> Option<&CodeBlock> {
-            band.code_blocks
-                .iter()
-                .find(|block| block.local_x == x as i32 && block.local_y == y as i32)
-        };
+        let mut next_block = blocks_in_raster_order(band);
 
         for y in 0..height {
             for x in 0..width {
+                let block = next_block(x, y);
                 let empty =
                     decode_ht_empty_block(&mut reader, &mut inclusion, &mut inclusion_flags, x, y)?;
                 if empty {
                     continue;
                 }
-                let block = match block_map(x, y) {
+                let block = match block {
                     Some(block) => block,
                     None => continue,
                 };
-                let state_index = y * width + x;
-                let zero_bitplanes = if !included_state[state_index] {
-                    included_state[state_index] = true;
-                    decode_ht_missing_msbs(&mut reader, &mut mmsb, &mut mmsb_flags, x, y)?
-                } else {
-                    0
-                };
+                let zero_bitplanes =
+                    decode_ht_missing_msbs(&mut reader, &mut mmsb, &mut mmsb_flags, x, y)?;
                 let pass_count = decode_pass_count(&mut reader)?;
                 if pass_count > 1 {
                     return Err("HTJ2K refinement passes are not supported".into());
                 }
-                let (_, length) = decode_ht_segments(&mut reader, pass_count)?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| "HTJ2K packet is missing a cleanup segment".to_string())?;
+                let length = decode_ht_cleanup_length(&mut reader)?;
                 pending.push(Pending {
                     index: block.index,
                     length,
@@ -345,7 +341,7 @@ pub(crate) fn decode_ht_packet(
         }
         blocks.push(DecodedBlock {
             index: item.index,
-            data: data[offset..offset + item.length].to_vec(),
+            data: &data[offset..offset + item.length],
             zero_bitplanes: item.zero_bitplanes,
         });
         offset += item.length;
@@ -420,10 +416,7 @@ fn decode_pass_count(reader: &mut BitReader<'_>) -> Result<u32, String> {
     Ok(37 + reader.read_bits(7)?)
 }
 
-fn decode_ht_segments(
-    reader: &mut BitReader<'_>,
-    pass_count: u32,
-) -> Result<Vec<(u32, usize)>, String> {
+fn decode_ht_cleanup_length(reader: &mut BitReader<'_>) -> Result<usize, String> {
     let mut bits1 = 3u8;
     while reader.read_bit()? {
         bits1 = bits1.saturating_add(1);
@@ -432,18 +425,7 @@ fn decode_ht_segments(
     if !(2..65535).contains(&cleanup_length) {
         return Err("HTJ2K cleanup segment length is invalid".into());
     }
-    if pass_count <= 1 {
-        return Ok(vec![(1, cleanup_length)]);
-    }
-    let refinement_bits = bits1 + u8::from(pass_count > 2);
-    let refinement_length = reader.read_bits(refinement_bits)? as usize;
-    if refinement_length >= 2047 {
-        return Err("HTJ2K refinement segment length is invalid".into());
-    }
-    Ok(vec![
-        (1, cleanup_length),
-        (pass_count - 1, refinement_length),
-    ])
+    Ok(cleanup_length)
 }
 
 #[cfg(test)]
@@ -472,7 +454,6 @@ mod tests {
             total_passes: 1,
             zero_bitplanes,
             data,
-            segments: Vec::new(),
             passes: Vec::new(),
             layer_passes: Vec::new(),
         }
@@ -512,8 +493,10 @@ mod tests {
     #[test]
     fn single_block_packet_round_trips() {
         let band = band(vec![block(vec![1, 2, 3, 4, 5], 7)]);
-        let packet = encode_ht_packet(&[&band]);
-        let (consumed, blocks) = decode_ht_packet(&packet, &[&band]).unwrap();
+        let bands = std::slice::from_ref(&band);
+        let mut packet = Vec::new();
+        encode_ht_packet(bands, &mut packet);
+        let (consumed, blocks) = decode_ht_packet(&packet, bands).unwrap();
         assert_eq!(consumed, packet.len());
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].data, vec![1, 2, 3, 4, 5]);
@@ -521,11 +504,39 @@ mod tests {
     }
 
     #[test]
+    fn sparse_band_keeps_cleanup_segments_in_raster_order() {
+        let mut first = block(vec![1, 2, 3], 7);
+        first.local_x = 1;
+        let mut second = block(vec![4, 5, 6, 7], 11);
+        second.local_y = 1;
+        second.index = 1;
+        let band = PrecinctBand {
+            orientation: 1,
+            code_block_count_x: 3,
+            code_block_count_y: 2,
+            code_blocks: vec![first, second],
+        };
+        let bands = std::slice::from_ref(&band);
+        let mut packet = Vec::new();
+        encode_ht_packet(bands, &mut packet);
+        let (consumed, blocks) = decode_ht_packet(&packet, bands).unwrap();
+        assert_eq!(consumed, packet.len());
+        assert_eq!(blocks.len(), 2);
+        for (actual, expected) in blocks.iter().zip(&band.code_blocks) {
+            assert_eq!(actual.index, expected.index);
+            assert_eq!(actual.data, expected.data);
+            assert_eq!(actual.zero_bitplanes, expected.zero_bitplanes);
+        }
+    }
+
+    #[test]
     fn empty_packet_is_one_zero_byte() {
         let band = band(vec![block(Vec::new(), 0)]);
-        let packet = encode_ht_packet(&[&band]);
+        let bands = std::slice::from_ref(&band);
+        let mut packet = Vec::new();
+        encode_ht_packet(bands, &mut packet);
         assert_eq!(packet, vec![0]);
-        let (consumed, blocks) = decode_ht_packet(&packet, &[&band]).unwrap();
+        let (consumed, blocks) = decode_ht_packet(&packet, bands).unwrap();
         assert_eq!(consumed, 1);
         assert!(blocks.is_empty());
     }

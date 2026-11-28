@@ -1,15 +1,17 @@
 //! JPEG 2000 codestream assembly and parsing (ISO/IEC 15444-1 Annex A).
 
-use crate::geometry::{CodeBlock, Component};
+use std::borrow::Cow;
+
+use crate::geometry::{CodeBlock, CodeBlockPass, Component};
 use crate::marker::{
     write_eoc, write_soc, write_sod, Cod, CodingStyle, MainHeader, QStep, Quantization, Siz,
     SizComp, Sot, COM, EOC, SOD, SOT,
 };
 use crate::quantization::{
-    band_stepsize, bit_plane_depth, decode_step_size, dwt_norm_53, dwt_norm_97, encode_step_size,
-    gain_bits, irreversible_steps, reversible_steps, subband_index, MCT_NORMS_ICT, MCT_NORMS_RCT,
+    band_stepsize, bit_plane_depth, dwt_norm_53, dwt_norm_97, encode_step_size, gain_bits,
+    irreversible_steps, reversible_steps, subband_index, MCT_NORMS_ICT, MCT_NORMS_RCT,
 };
-use crate::tier1::{self, PassWeight, Tier1Encoder};
+use crate::tier1::{PassWeight, Tier1Decoder, Tier1Encoder};
 use crate::{tier2, wavelet};
 
 pub(crate) const DEFAULT_LEVELS: i32 = 5;
@@ -84,20 +86,22 @@ pub(crate) fn encode_with_precincts(
     if mct && reversible {
         forward_rct(components);
     }
-    let mut irreversible_planes: Option<Vec<Vec<f32>>> = None;
-    if mct && !reversible {
+    let mut transformed_planes = if mct && !reversible {
         let mut planes: Vec<Vec<f32>> = components
             .iter()
             .map(|component| component.coefficients.iter().map(|&v| v as f32).collect())
             .collect();
         forward_ict_planes_f32(&mut planes);
-        irreversible_planes = Some(planes);
+        planes
+    } else {
+        Vec::new()
     }
+    .into_iter();
 
     // Reversible coding keeps integer coefficients (already level shifted and
     // transformed); irreversible coding carries the OpenJPEG f32 9/7 result.
     let mut float_planes: Vec<Vec<f32>> = Vec::with_capacity(components.len());
-    for (index, component) in components.iter_mut().enumerate() {
+    for component in components.iter_mut() {
         component.build_code_blocks(DEFAULT_CODE_BLOCK, DEFAULT_CODE_BLOCK, precincts)?;
         if reversible {
             wavelet::forward_53(
@@ -107,18 +111,19 @@ pub(crate) fn encode_with_precincts(
                 levels as u8,
                 0,
                 0,
+                wavelet::jpeg2000_avx2_enabled(),
             )?;
             float_planes.push(Vec::new());
         } else {
-            let mut plane: Vec<f32> = match &irreversible_planes {
-                Some(planes) => planes[index].clone(),
-                None => component.coefficients.iter().map(|&v| v as f32).collect(),
-            };
+            let mut plane = transformed_planes
+                .next()
+                .unwrap_or_else(|| component.coefficients.iter().map(|&v| v as f32).collect());
             wavelet::forward_97_f32(
                 &mut plane,
                 component.width as usize,
                 component.height as usize,
                 levels as u8,
+                wavelet::jpeg2000_avx2_enabled(),
             )?;
             float_planes.push(plane);
         }
@@ -228,26 +233,20 @@ pub(crate) fn encode_with_precincts(
                             continue;
                         }
                         coefficients.resize(width * height, 0);
-                        if reversible {
-                            for y in 0..height {
-                                for x in 0..width {
-                                    let sx = block.x0 as usize + x;
-                                    let sy = block.y0 as usize + y;
-                                    coefficients[y * width + x] =
-                                        reversible_plane[sy * plane_width + sx] << 6;
+                        for (y, row) in coefficients.chunks_exact_mut(width).enumerate() {
+                            let start = (block.y0 as usize + y) * plane_width + block.x0 as usize;
+                            if reversible {
+                                for (sample, &value) in
+                                    row.iter_mut().zip(&reversible_plane[start..start + width])
+                                {
+                                    *sample = value << 6;
                                 }
-                            }
-                        } else {
-                            for y in 0..height {
-                                for x in 0..width {
-                                    let sx = block.x0 as usize + x;
-                                    let sy = block.y0 as usize + y;
-                                    // OpenJPEG: lrintf((coef / band->stepsize) * 64).
-                                    coefficients[y * width + x] =
-                                        (float_plane[sy * plane_width + sx] / band_step * 64.0f32)
-                                            .round_ties_even()
-                                            as i32;
-                                }
+                            } else {
+                                round_samples::<true>(
+                                    &float_plane[start..start + width],
+                                    row,
+                                    band_step,
+                                );
                             }
                         }
                         let encoded_block = tier1.encode(
@@ -321,10 +320,7 @@ pub(crate) fn encode_with_precincts(
         components.len(),
         precision,
     );
-    allocate_layers(components, &targets)?;
-
-    let (tile_data, _, _) =
-        tier2::encode_packets(components, layer_count, 0, tier2::PacketMode::Final)?;
+    let tile_data = allocate_layers(components, &targets)?;
     let sot = Sot {
         tile: 0,
         length: (14 + tile_data.len()) as u32,
@@ -405,23 +401,6 @@ fn rate_byte_targets(
     values.into_iter().map(f64::from).collect()
 }
 
-fn for_each_code_block_mut(components: &mut [Component], mut f: impl FnMut(&mut CodeBlock)) {
-    for component in components.iter_mut() {
-        for resolution in 0..=component.levels {
-            let precincts = component.precincts_including_empty(resolution);
-            for precinct in precincts {
-                if let Some(bands) = component.bands_mut(resolution, precinct) {
-                    for band in bands.iter_mut() {
-                        for block in band.code_blocks.iter_mut() {
-                            f(block);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn passes_before(block: &CodeBlock, layer: usize) -> u32 {
     block
         .layer_passes
@@ -429,6 +408,19 @@ fn passes_before(block: &CodeBlock, layer: usize) -> u32 {
         .take(layer)
         .map(|&passes| u32::from(passes))
         .sum()
+}
+
+#[derive(Clone, Copy)]
+struct LayerSlopeRange {
+    rejected: f64,
+    accepted: f64,
+}
+
+impl LayerSlopeRange {
+    const EMPTY: Self = Self {
+        rejected: f64::INFINITY,
+        accepted: f64::NEG_INFINITY,
+    };
 }
 
 /// OpenJPEG's `opj_tcd_makelayer`: assigns pass truncation points for one layer
@@ -439,40 +431,54 @@ fn passes_before(block: &CodeBlock, layer: usize) -> u32 {
 /// adding `abs()` (as clippy suggests) would change which passes each layer
 /// keeps.
 #[allow(clippy::float_equality_without_abs)]
-fn make_layer(components: &mut [Component], layer: usize, threshold: f64) -> bool {
+fn make_layer(
+    components: &mut [Component],
+    layer: usize,
+    threshold: f64,
+    ranges: &mut [LayerSlopeRange],
+) -> bool {
     let mut allocation_is_same = true;
-    for_each_code_block_mut(components, |block| {
-        if layer >= block.layer_passes.len() {
-            return;
-        }
+    let blocks = components.iter_mut().flat_map(Component::code_blocks_mut);
+    for (index, block) in blocks.enumerate() {
         let start = passes_before(block, layer);
         let total = block.passes.len() as u32;
         let end = if threshold < 0.0 {
             total
         } else {
+            let range = &mut ranges[index];
+            // If every previous decision still holds, the same passes form this layer.
+            if threshold - range.rejected >= f64::EPSILON
+                && threshold - range.accepted < f64::EPSILON
+            {
+                continue;
+            }
+            let mut rejected = f64::NEG_INFINITY;
+            let mut accepted = f64::INFINITY;
             let mut end = start;
-            for passno in start..total {
-                let pass = &block.passes[passno as usize];
-                let (dr, dd) = if end == 0 {
-                    (pass.rate, pass.distortiondec)
+            let mut previous = start
+                .checked_sub(1)
+                .map_or_else(CodeBlockPass::default, |i| block.passes[i as usize]);
+            for (offset, &pass) in block.passes[start as usize..].iter().enumerate() {
+                let dr = pass.rate.wrapping_sub(previous.rate) as i32;
+                let dd = pass.distortiondec - previous.distortiondec;
+                let keep = if dr == 0 {
+                    dd != 0.0
                 } else {
-                    let previous = &block.passes[(end - 1) as usize];
-                    (
-                        pass.rate.wrapping_sub(previous.rate),
-                        pass.distortiondec - previous.distortiondec,
-                    )
-                };
-                let dr = dr as i32;
-                if dr == 0 {
-                    if dd != 0.0 {
-                        end = passno + 1;
+                    let slope = dd / f64::from(dr);
+                    let keep = threshold - slope < f64::EPSILON;
+                    if keep {
+                        accepted = accepted.min(slope);
+                    } else {
+                        rejected = rejected.max(slope);
                     }
-                    continue;
-                }
-                if threshold - dd / f64::from(dr) < f64::EPSILON {
-                    end = passno + 1;
+                    keep
+                };
+                if keep {
+                    end = start + offset as u32 + 1;
+                    previous = pass;
                 }
             }
+            *range = LayerSlopeRange { rejected, accepted };
             end
         };
         let count = (end - start) as u16;
@@ -480,7 +486,7 @@ fn make_layer(components: &mut [Component], layer: usize, threshold: f64) -> boo
             allocation_is_same = false;
             block.layer_passes[layer] = count;
         }
-    });
+    }
     allocation_is_same
 }
 
@@ -489,35 +495,17 @@ fn make_layer(components: &mut [Component], layer: usize, threshold: f64) -> boo
 fn slope_bounds(components: &[Component]) -> (f64, f64) {
     let mut min = f64::MAX;
     let mut max = 0.0f64;
-    for component in components {
-        for resolution in 0..=component.levels {
-            for precinct in component.precincts_including_empty(resolution) {
-                for band in component.bands(resolution, precinct) {
-                    for block in &band.code_blocks {
-                        for (passno, pass) in block.passes.iter().enumerate() {
-                            let (dr, dd) = if passno == 0 {
-                                (pass.rate, pass.distortiondec)
-                            } else {
-                                let previous = &block.passes[passno - 1];
-                                (
-                                    pass.rate - previous.rate,
-                                    pass.distortiondec - previous.distortiondec,
-                                )
-                            };
-                            if dr == 0 {
-                                continue;
-                            }
-                            let slope = dd / f64::from(dr as i32);
-                            if slope < min {
-                                min = slope;
-                            }
-                            if slope > max {
-                                max = slope;
-                            }
-                        }
-                    }
-                }
+    for block in components.iter().flat_map(Component::code_blocks) {
+        let mut previous = CodeBlockPass::default();
+        for &pass in &block.passes {
+            let dr = pass.rate - previous.rate;
+            let dd = pass.distortiondec - previous.distortiondec;
+            if dr != 0 {
+                let slope = dd / f64::from(dr as i32);
+                min = min.min(slope);
+                max = max.max(slope);
             }
+            previous = pass;
         }
     }
     (min, max)
@@ -525,14 +513,22 @@ fn slope_bounds(components: &[Component]) -> (f64, f64) {
 
 /// Runs OpenJPEG's rate/distortion layer allocation over the encoded code
 /// blocks, filling `block.layer_passes`.
-fn allocate_layers(components: &mut [Component], targets: &[f64]) -> Result<(), String> {
+fn allocate_layers(components: &mut [Component], targets: &[f64]) -> Result<Vec<u8>, String> {
     let layer_count = targets.len();
-    for_each_code_block_mut(components, |block| {
-        block.layer_passes = vec![0u16; layer_count];
-    });
-    let (min, max) = slope_bounds(components);
+    let mut packets = tier2::LayerPackets::new(components, layer_count as u16)?;
+    for block in components.iter_mut().flat_map(Component::code_blocks_mut) {
+        block.layer_passes = vec![0; layer_count];
+    }
+    let (min, max, mut ranges) = if targets.iter().any(|&target| target > 0.0) {
+        let (min, max) = slope_bounds(components);
+        let blocks = components.iter().flat_map(Component::code_blocks).count();
+        (min, max, vec![LayerSlopeRange::EMPTY; blocks])
+    } else {
+        (0.0, 0.0, Vec::new())
+    };
     for (layer, &target) in targets.iter().enumerate() {
         let good_threshold = if target > 0.0 {
+            ranges.fill(LayerSlopeRange::EMPTY);
             let max_len = target.ceil() as u32 as usize;
             let mut lo = min;
             let mut hi = max;
@@ -545,17 +541,11 @@ fn allocate_layers(components: &mut [Component], targets: &[f64]) -> Result<(), 
                     break;
                 }
                 threshold = new_threshold;
-                let same = make_layer(components, layer, threshold) && iteration != 0;
+                let same = make_layer(components, layer, threshold, &mut ranges) && iteration != 0;
                 let fits = if same {
                     true
                 } else {
-                    tier2::encode_packets(
-                        components,
-                        (layer + 1) as u16,
-                        0,
-                        tier2::PacketMode::Measure { max_len },
-                    )?
-                    .2
+                    packets.fits(components, layer as u16, max_len)
                 };
                 if (same && !last_ok) || (!same && !fits) {
                     last_ok = false;
@@ -574,9 +564,10 @@ fn allocate_layers(components: &mut [Component], targets: &[f64]) -> Result<(), 
         } else {
             -1.0
         };
-        make_layer(components, layer, good_threshold);
+        make_layer(components, layer, good_threshold, &mut ranges);
+        packets.commit(components, layer as u16);
     }
-    Ok(())
+    Ok(packets.into_bytes())
 }
 
 /// OpenJPEG's irreversible multiple-component transform, in f32 and with its
@@ -600,7 +591,12 @@ fn forward_ict_planes_f32(planes: &mut [Vec<f32>]) {
 }
 
 /// Decodes a complete codestream into components with integer samples.
+#[cfg(test)]
 pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
+    decode_with_mct(data).map(|(components, _)| components)
+}
+
+pub(crate) fn decode_with_mct(data: &[u8]) -> Result<(Vec<Component>, bool), String> {
     let (mut header, mut offset) = MainHeader::parse(data)?;
     if header.siz.xrsiz() != 1 || header.siz.yrsiz() != 1 {
         return Err("subsampled JPEG 2000 components are not supported".into());
@@ -636,7 +632,7 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
         if comp.xrsiz != 1 || comp.yrsiz != 1 {
             return Err("subsampled JPEG 2000 components are not supported".into());
         }
-        let mut component = Component::new(
+        let mut component = Component::with_coefficients(
             index,
             0,
             0,
@@ -645,7 +641,8 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
             levels,
             comp.precision(),
             comp.signed(),
-        )?;
+            Vec::new(),
+        );
         let style = header.coding_style(index);
         let precincts = if style.precincts.is_empty() {
             None
@@ -660,7 +657,7 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
         components.push(component);
     }
 
-    let mut tile_data = Vec::new();
+    let mut tile_data = Cow::Borrowed(&data[..0]);
     let mut tile_parts = 0usize;
     let eoc_offset;
     loop {
@@ -731,8 +728,12 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
         if end > data.len() || end < offset {
             return Err("tile-part extends past the codestream".into());
         }
+        if tile_parts == 0 {
+            tile_data = Cow::Borrowed(&data[offset..end]);
+        } else {
+            tile_data.to_mut().extend_from_slice(&data[offset..end]);
+        }
         tile_parts += 1;
-        tile_data.extend_from_slice(&data[offset..end]);
         offset = end;
     }
     if eoc_offset + 2 < data.len() {
@@ -756,20 +757,23 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
         &styles,
     )?;
 
+    let mut tier1 = Tier1Decoder::new();
     for (index, component) in components.iter_mut().enumerate() {
         let style = header.coding_style(index);
         let quant = header.quantization(index);
         let reversible = style.transform == 1;
-        if reversible {
-            component.coefficients = vec![0; (component.width * component.height) as usize];
+        let plane_width = component.width as usize;
+        let plane_len = plane_width * component.height as usize;
+        let mut coefficients = if reversible {
+            vec![0; plane_len]
         } else {
-            component.irreversible = Some(vec![0.0; (component.width * component.height) as usize]);
-        }
+            Vec::new()
+        };
+        let mut irreversible = (!reversible).then(|| vec![0.0; plane_len]);
         for resolution in 0..=levels {
             let precincts = component.precincts_including_empty(resolution);
             for precinct in precincts {
-                let bands = component.bands(resolution, precinct).to_vec();
-                for band in &bands {
+                for band in component.bands(resolution, precinct) {
                     let index_in_band = subband_index(resolution, band.orientation).max(0) as usize;
                     let step = quant.step(index_in_band).unwrap_or(QStep {
                         exponent: 0,
@@ -777,71 +781,53 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
                     });
                     let encoded = (u16::from(step.exponent) << 11) | (step.mantissa & 0x07FF);
                     let subband_bits = bit_plane_depth(encoded, quant.guard_bits);
+                    let step = 0.5 * band_stepsize(encoded, component.precision, 0);
                     for block in &band.code_blocks {
                         let max_bit_plane = subband_bits - i32::from(block.zero_bitplanes) + 5;
-                        let decoded = tier1::decode_code_block(
-                            &block.segments,
-                            block.width as usize,
-                            block.height as usize,
+                        let decoded = tier1.decode(
+                            (&block.data, block.total_passes),
+                            (block.width as usize, block.height as usize),
                             band.orientation,
                             max_bit_plane,
                             style.style,
+                            reversible,
                         )?;
                         let width = block.width.max(0) as usize;
-                        let height = block.height.max(0) as usize;
-                        let plane_width = component.width as usize;
-                        if reversible {
-                            for y in 0..height {
-                                for x in 0..width {
-                                    let sx = block.x0 as usize + x;
-                                    let sy = block.y0 as usize + y;
-                                    component.coefficients[sy * plane_width + sx] =
-                                        decoded[y * width + x];
+                        for (y, row) in decoded.chunks_exact(width).enumerate() {
+                            let start = (block.y0 as usize + y) * plane_width + block.x0 as usize;
+                            if let Some(plane) = &mut irreversible {
+                                for (value, &coefficient) in
+                                    plane[start..start + width].iter_mut().zip(row)
+                                {
+                                    *value = coefficient as f32 * step;
                                 }
-                            }
-                        } else {
-                            let step = decode_step_size(encoded, component.precision)
-                                * f64::from(1u32 << gain_bits(band.orientation));
-                            let plane = component
-                                .irreversible
-                                .as_mut()
-                                .ok_or_else(|| "missing irreversible plane".to_string())?;
-                            for y in 0..height {
-                                for x in 0..width {
-                                    let sx = block.x0 as usize + x;
-                                    let sy = block.y0 as usize + y;
-                                    plane[sy * plane_width + sx] =
-                                        f64::from(decoded[y * width + x]) * step;
-                                }
+                            } else {
+                                coefficients[start..start + width].copy_from_slice(row);
                             }
                         }
                     }
                 }
             }
         }
-        if reversible {
-            wavelet::inverse_53(
-                &mut component.coefficients,
-                component.width as usize,
+        if let Some(plane) = &mut irreversible {
+            wavelet::inverse_97_openjpeg(
+                plane,
+                plane_width,
                 component.height as usize,
                 levels as u8,
-                0,
-                0,
             )?;
-            component.samples = component.coefficients.clone();
+            component.irreversible = irreversible;
         } else {
-            let mut plane = component
-                .irreversible
-                .take()
-                .ok_or_else(|| "missing irreversible plane".to_string())?;
-            wavelet::inverse_97(
-                &mut plane,
-                component.width as usize,
+            wavelet::inverse_53(
+                &mut coefficients,
+                plane_width,
                 component.height as usize,
                 levels as u8,
+                0,
+                0,
+                wavelet::jpeg2000_avx2_enabled(),
             )?;
-            component.samples = plane.iter().map(|&v| v.round() as i32).collect();
-            component.float_samples = Some(plane);
+            component.samples = coefficients;
         }
     }
     if header.cod.mct != 0 && components.len() >= 3 {
@@ -851,7 +837,141 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Component>, String> {
             inverse_ict(&mut components);
         }
     }
-    Ok(components)
+    for component in &mut components {
+        if let Some(plane) = component.irreversible.take() {
+            component.samples = round_plane(plane);
+        }
+    }
+    Ok((components, header.cod.mct != 0))
+}
+
+fn round_plane(plane: Vec<f32>) -> Vec<i32> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if wavelet::jpeg2000_avx2_enabled() {
+            // SAFETY: Runtime detection selected AVX2.
+            return unsafe { round_plane_avx2(plane) };
+        }
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            // SAFETY: Runtime detection selected SSE4.1.
+            return unsafe { round_plane_sse41(plane) };
+        }
+    }
+    round_plane_values(plane)
+}
+
+#[inline(always)]
+fn round_plane_values(plane: Vec<f32>) -> Vec<i32> {
+    plane
+        .into_iter()
+        .map(|v| v.round_ties_even() as i32)
+        .collect()
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn round_plane_avx2(plane: Vec<f32>) -> Vec<i32> {
+    round_plane_values(plane)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn round_plane_sse41(plane: Vec<f32>) -> Vec<i32> {
+    round_plane_values(plane)
+}
+
+fn round_samples<const QUANTIZE: bool>(source: &[f32], output: &mut [i32], step: f32) {
+    debug_assert_eq!(source.len(), output.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if source.len() >= 8 && wavelet::jpeg2000_avx2_enabled() {
+        // SAFETY: The dispatcher checks CPU support before entering the kernel.
+        unsafe { round_samples_avx2::<QUANTIZE>(source, output, step) };
+        return;
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if source.len() >= 4 && std::arch::is_x86_feature_detected!("sse4.1") {
+        // SAFETY: SSE4.1 supplies fixed-mode rounding even with AVX2 disabled.
+        unsafe { round_samples_sse41::<QUANTIZE>(source, output, step) };
+        return;
+    }
+    round_samples_scalar::<QUANTIZE>(source, output, step);
+}
+
+#[inline(always)]
+fn round_samples_scalar<const QUANTIZE: bool>(source: &[f32], output: &mut [i32], step: f32) {
+    for (&value, sample) in source.iter().zip(output) {
+        let value = if QUANTIZE { value / step * 64.0 } else { value };
+        *sample = value.round_ties_even() as i32;
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn round_samples_sse41<const QUANTIZE: bool>(source: &[f32], output: &mut [i32], step: f32) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let limit = _mm_set1_ps(2_147_483_648.0);
+    let max = _mm_set1_epi32(i32::MAX);
+    let step_vector = _mm_set1_ps(step);
+    let scale = _mm_set1_ps(64.0);
+    let (input, tail) = source.as_chunks::<4>();
+    let (out, out_tail) = output.as_chunks_mut::<4>();
+    for (input, out) in input.iter().zip(out) {
+        // SAFETY: Each lane group contains four values and accesses are unaligned.
+        unsafe {
+            let mut values = _mm_loadu_ps(input.as_ptr());
+            if QUANTIZE {
+                values = _mm_mul_ps(_mm_div_ps(values, step_vector), scale);
+            }
+            let rounded = _mm_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(values);
+            let integers = _mm_cvttps_epi32(rounded);
+            let overflow = _mm_castps_si128(_mm_cmpge_ps(rounded, limit));
+            let is_number = _mm_castps_si128(_mm_cmpord_ps(rounded, rounded));
+            let saturated = _mm_blendv_epi8(integers, max, overflow);
+            _mm_storeu_si128(out.as_mut_ptr().cast(), _mm_and_si128(saturated, is_number));
+        }
+    }
+    round_samples_scalar::<QUANTIZE>(tail, out_tail, step);
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn round_samples_avx2<const QUANTIZE: bool>(source: &[f32], output: &mut [i32], step: f32) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let limit = _mm256_set1_ps(2_147_483_648.0);
+    let max = _mm256_set1_epi32(i32::MAX);
+    let step_vector = _mm256_set1_ps(step);
+    let scale = _mm256_set1_ps(64.0);
+    let (input, tail) = source.as_chunks::<8>();
+    let (out, out_tail) = output.as_chunks_mut::<8>();
+    for (input, out) in input.iter().zip(out) {
+        // SAFETY: Both chunks contain eight elements. The loads and stores allow unaligned data.
+        unsafe {
+            let mut values = _mm256_loadu_ps(input.as_ptr());
+            if QUANTIZE {
+                values = _mm256_mul_ps(_mm256_div_ps(values, step_vector), scale);
+            }
+            let rounded =
+                _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(values);
+            let integers = _mm256_cvttps_epi32(rounded);
+            // Match Rust's saturating float cast for positive overflow and NaN.
+            let overflow = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_GE_OQ>(rounded, limit));
+            let is_number = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_ORD_Q>(rounded, rounded));
+            let saturated = _mm256_blendv_epi8(integers, max, overflow);
+            _mm256_storeu_si256(
+                out.as_mut_ptr().cast(),
+                _mm256_and_si256(saturated, is_number),
+            );
+        }
+    }
+    round_samples_scalar::<QUANTIZE>(tail, out_tail, step);
 }
 
 fn forward_rct(components: &mut [Component]) {
@@ -871,62 +991,36 @@ fn forward_rct(components: &mut [Component]) {
     }
 }
 
-fn inverse_rct(components: &mut [Component]) {
-    let count = components
-        .iter()
-        .take(3)
-        .map(|component| component.samples.len())
-        .min()
-        .unwrap_or(0);
-    for index in 0..count {
-        let y = components[0].samples[index];
-        let u = components[1].samples[index];
-        let v = components[2].samples[index];
-        let g = y - ((u + v) >> 2);
-        components[0].samples[index] = v + g;
-        components[1].samples[index] = g;
-        components[2].samples[index] = u + g;
+pub(crate) fn inverse_rct(components: &mut [Component]) {
+    let [luma, blue_difference, red_difference, ..] = components else {
+        return;
+    };
+    for ((y, u), v) in luma
+        .samples
+        .iter_mut()
+        .zip(&mut blue_difference.samples)
+        .zip(&mut red_difference.samples)
+    {
+        let g = *y - ((*u + *v) >> 2);
+        (*y, *u, *v) = (*v + g, g, *u + g);
     }
 }
 
 fn inverse_ict(components: &mut [Component]) {
-    let count = components
-        .iter()
-        .take(3)
-        .map(|component| component.samples.len())
-        .min()
-        .unwrap_or(0);
-    for index in 0..count {
-        let y = components[0]
-            .float_samples
-            .as_ref()
-            .map(|p| p[index])
-            .unwrap_or(f64::from(components[0].samples[index]));
-        let cb = components[1]
-            .float_samples
-            .as_ref()
-            .map(|p| p[index])
-            .unwrap_or(f64::from(components[1].samples[index]));
-        let cr = components[2]
-            .float_samples
-            .as_ref()
-            .map(|p| p[index])
-            .unwrap_or(f64::from(components[2].samples[index]));
-        let r = y + 1.402 * cr;
-        let g = y - 0.344_136 * cb - 0.714_136 * cr;
-        let b = y + 1.772 * cb;
-        if let Some(plane) = components[0].float_samples.as_mut() {
-            plane[index] = r;
+    let [c0, c1, c2, ..] = components else {
+        return;
+    };
+    if let (Some(luma), Some(cb), Some(cr)) = (
+        &mut c0.irreversible,
+        &mut c1.irreversible,
+        &mut c2.irreversible,
+    ) {
+        for ((y, u), v) in luma.iter_mut().zip(cb).zip(cr) {
+            let r = *y + *v * 1.402;
+            let g = *y - *u * 0.344_13 - *v * 0.714_14;
+            let b = *y + *u * 1.772;
+            (*y, *u, *v) = (r, g, b);
         }
-        if let Some(plane) = components[1].float_samples.as_mut() {
-            plane[index] = g;
-        }
-        if let Some(plane) = components[2].float_samples.as_mut() {
-            plane[index] = b;
-        }
-        components[0].samples[index] = r.round() as i32;
-        components[1].samples[index] = g.round() as i32;
-        components[2].samples[index] = b.round() as i32;
     }
 }
 
@@ -958,6 +1052,52 @@ impl Siz {
 mod tests {
     use super::*;
     use crate::marker::{write_cap, COC, COD, SIZ};
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn x86_sample_rounding_matches_scalar_ties_saturation_and_tail() {
+        let input = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -2_147_483_648.0,
+            2_147_483_520.0,
+            2_147_483_648.0,
+            -2.5,
+            -1.5,
+            -0.5,
+            -0.0,
+            0.5,
+            1.5,
+            2.5,
+            3.0,
+            17.0,
+            33.0,
+            65.0,
+        ];
+        let (mut scalar, mut vector) = ([0; 17], [0; 17]);
+        for (supported, decode, encode) in [
+            (
+                wavelet::avx2_available(),
+                round_plane_avx2 as unsafe fn(Vec<f32>) -> Vec<i32>,
+                round_samples_avx2::<true> as unsafe fn(&[f32], &mut [i32], f32),
+            ),
+            (
+                std::arch::is_x86_feature_detected!("sse4.1"),
+                round_plane_sse41,
+                round_samples_sse41::<true>,
+            ),
+        ] {
+            if supported {
+                round_samples_scalar::<false>(&input, &mut scalar, 1.0);
+                // SAFETY: Each function is paired with its feature check.
+                assert_eq!(unsafe { decode(input.to_vec()) }, scalar);
+                round_samples_scalar::<true>(&input, &mut scalar, 3.5);
+                unsafe { encode(&input, &mut vector, 3.5) };
+                assert_eq!(scalar, vector);
+            }
+        }
+    }
 
     fn pattern(width: usize, height: usize, seed: i32) -> Vec<i32> {
         (0..width * height)
@@ -1046,15 +1186,13 @@ mod tests {
         let samples = &components[0].samples;
         assert_eq!(samples.len(), expected.len());
         let shift = 1i32 << 7;
-        let mut worst = 0;
         for (index, &reference) in expected.iter().enumerate() {
-            let difference = (samples[index] + shift - i32::from(reference)).abs();
-            worst = worst.max(difference);
+            assert_eq!(
+                samples[index] + shift,
+                i32::from(reference),
+                "sample {index}"
+            );
         }
-        assert!(
-            worst <= 1,
-            "decoded samples differ from OpenJPEG by {worst}"
-        );
     }
 
     #[test]

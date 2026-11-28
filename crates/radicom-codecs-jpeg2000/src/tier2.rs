@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crate::bit::{BitReader, BitWriter};
-use crate::geometry::{CodeBlockSegment, Component};
+use crate::geometry::Component;
 
 const TAG_TREE_UNKNOWN: i32 = 999;
 
@@ -20,37 +20,38 @@ pub(crate) const MAX_PACKETS: u64 = 1 << 22;
 pub(crate) struct TagTree {
     width: usize,
     height: usize,
-    levels: usize,
-    level_widths: Vec<usize>,
-    values: Vec<Vec<i32>>,
-    low: Vec<Vec<i32>>,
-    known: Vec<Vec<bool>>,
+    levels: Vec<(usize, usize)>,
+    nodes: Vec<TagNode>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TagNode {
+    value: i32,
+    low: i32,
+    known: bool,
 }
 
 impl TagTree {
+    fn copy_from_tree(&mut self, source: &Self) {
+        self.width = source.width;
+        self.height = source.height;
+        self.levels.clone_from(&source.levels);
+        self.nodes.clone_from(&source.nodes);
+    }
+
     pub(crate) fn new(width: usize, height: usize) -> Self {
         let width = width.max(1);
         let height = height.max(1);
-        let mut levels = 1;
+        let mut levels = Vec::new();
+        let mut count = 0;
         let mut w = width;
         let mut h = height;
-        while w > 1 || h > 1 {
-            levels += 1;
-            w = w.div_ceil(2);
-            h = h.div_ceil(2);
-        }
-        let mut level_widths = vec![0; levels];
-        let mut values = Vec::with_capacity(levels);
-        let mut low = Vec::with_capacity(levels);
-        let mut known = Vec::with_capacity(levels);
-        w = width;
-        h = height;
-        for slot in level_widths.iter_mut() {
-            *slot = w;
-            let count = w * h;
-            values.push(vec![TAG_TREE_UNKNOWN; count]);
-            low.push(vec![0; count]);
-            known.push(vec![false; count]);
+        loop {
+            levels.push((w, count));
+            count += w * h;
+            if w == 1 && h == 1 {
+                break;
+            }
             w = w.div_ceil(2);
             h = h.div_ceil(2);
         }
@@ -58,37 +59,38 @@ impl TagTree {
             width,
             height,
             levels,
-            level_widths,
-            values,
-            low,
-            known,
+            nodes: vec![
+                TagNode {
+                    value: TAG_TREE_UNKNOWN,
+                    low: 0,
+                    known: false
+                };
+                count
+            ],
         }
     }
 
     pub(crate) fn set_value(&mut self, x: usize, y: usize, value: i32) {
         let mut px = x;
         let mut py = y;
-        for level in 0..self.levels {
-            let index = py * self.level_widths[level] + px;
-            if self.values[level][index] <= value {
+        for &(width, offset) in &self.levels {
+            let node = &mut self.nodes[offset + py * width + px];
+            if node.value <= value {
                 break;
             }
-            self.values[level][index] = value;
+            node.value = value;
             px /= 2;
             py /= 2;
         }
     }
 
-    fn indices(&self, x: usize, y: usize) -> Vec<usize> {
-        let mut indices = Vec::with_capacity(self.levels);
-        let mut px = x;
-        let mut py = y;
-        for &level_width in self.level_widths.iter().take(self.levels) {
-            indices.push(py * level_width + px);
-            px /= 2;
-            py /= 2;
-        }
-        indices
+    #[inline]
+    fn node_index(&self, level: usize, x: usize, y: usize) -> usize {
+        let (width, offset) = self.levels[level];
+        // After usize::BITS halvings even the widest possible leaf is at the root.
+        offset
+            + y.checked_shr(level as u32).unwrap_or(0) * width
+            + x.checked_shr(level as u32).unwrap_or(0)
     }
 
     pub(crate) fn decode(
@@ -101,29 +103,21 @@ impl TagTree {
         if x >= self.width || y >= self.height {
             return Err("tag-tree leaf outside the tree".into());
         }
-        let indices = self.indices(x, y);
         let mut low = 0i32;
-        let mut leaf_value = TAG_TREE_UNKNOWN;
-        for level in (0..self.levels).rev() {
-            let index = indices[level];
-            if low > self.low[level][index] {
-                self.low[level][index] = low;
-            } else {
-                low = self.low[level][index];
-            }
-            while low < threshold && low < self.values[level][index] {
+        for level in (0..self.levels.len()).rev() {
+            let index = self.node_index(level, x, y);
+            let node = &mut self.nodes[index];
+            low = low.max(node.low);
+            while low < threshold && low < node.value {
                 if reader.read_bit()? {
-                    self.values[level][index] = low;
+                    node.value = low;
                 } else {
                     low += 1;
                 }
             }
-            self.low[level][index] = low;
-            if level == 0 {
-                leaf_value = self.values[level][index];
-            }
+            node.low = low;
         }
-        Ok(leaf_value < threshold)
+        Ok(self.nodes[y * self.width + x].value < threshold)
     }
 
     pub(crate) fn decode_value(
@@ -141,27 +135,23 @@ impl TagTree {
     }
 
     pub(crate) fn encode(&mut self, writer: &mut BitWriter, x: usize, y: usize, threshold: i32) {
-        let indices = self.indices(x, y);
         let mut low = 0i32;
-        for level in (0..self.levels).rev() {
-            let index = indices[level];
-            if low > self.low[level][index] {
-                self.low[level][index] = low;
-            } else {
-                low = self.low[level][index];
-            }
+        for level in (0..self.levels.len()).rev() {
+            let index = self.node_index(level, x, y);
+            let node = &mut self.nodes[index];
+            low = low.max(node.low);
             while low < threshold {
-                if low >= self.values[level][index] {
-                    if !self.known[level][index] {
+                if low >= node.value {
+                    if !node.known {
                         writer.write_bit(true);
-                        self.known[level][index] = true;
+                        node.known = true;
                     }
                     break;
                 }
                 writer.write_bit(false);
                 low += 1;
             }
-            self.low[level][index] = low;
+            node.low = low;
         }
     }
 }
@@ -178,10 +168,6 @@ fn max_resolutions(components: &[Component]) -> i32 {
     components.iter().map(|c| c.levels + 1).max().unwrap_or(1)
 }
 
-fn precinct_count(component: &Component, resolution: i32) -> i32 {
-    component.precincts_including_empty(resolution).len() as i32
-}
-
 /// Enumerates packets for the supported progression orders. LRCP and RLCP use
 /// the standard precinct raster order; the position-based orders use the same
 /// precinct index, which is exact when a resolution has a single precinct
@@ -196,7 +182,7 @@ pub(crate) fn packet_order(
         .map(|r| {
             components
                 .iter()
-                .map(|c| precinct_count(c, r))
+                .map(|c| c.precinct_count(r))
                 .max()
                 .unwrap_or(0)
         })
@@ -209,7 +195,7 @@ pub(crate) fn packet_order(
     for resolution in 0..max_res {
         for component in components {
             packets_per_layer = packets_per_layer
-                .checked_add(precinct_count(component, resolution) as u64)
+                .checked_add(component.precinct_count(resolution) as u64)
                 .ok_or_else(|| "packet count overflow".to_string())?;
         }
     }
@@ -225,7 +211,7 @@ pub(crate) fn packet_order(
             for layer in 0..layer_count {
                 for resolution in 0..max_res {
                     for (component_index, component) in components.iter().enumerate() {
-                        for precinct in 0..precinct_count(component, resolution) {
+                        for precinct in 0..component.precinct_count(resolution) {
                             packets.push(PacketKey {
                                 layer,
                                 resolution,
@@ -241,7 +227,7 @@ pub(crate) fn packet_order(
             for resolution in 0..max_res {
                 for layer in 0..layer_count {
                     for (component_index, component) in components.iter().enumerate() {
-                        for precinct in 0..precinct_count(component, resolution) {
+                        for precinct in 0..component.precinct_count(resolution) {
                             packets.push(PacketKey {
                                 layer,
                                 resolution,
@@ -371,14 +357,6 @@ fn decode_pass_count(reader: &mut BitReader<'_>) -> Result<u32, String> {
     Ok(37 + reader.read_bits(7)?)
 }
 
-/// How [`encode_packets`] runs: write the tile data, or only measure how many
-/// bytes the packets for the requested layers would occupy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PacketMode {
-    Final,
-    Measure { max_len: usize },
-}
-
 /// OpenJPEG's `opj_tcd_makelayer` state for one code block while packets are
 /// being emitted: passes already placed in earlier layers and the current
 /// length-indicator width.
@@ -463,132 +441,159 @@ fn write_commacode(writer: &mut BitWriter, mut n: u32) {
     writer.write_bit(false);
 }
 
-/// Encodes the quality-layer packets for one tile (LRCP by default).
-///
-/// `block.layer_passes[layer]` holds the number of Tier-1 passes assigned to
-/// that layer. `PacketMode::Measure` replicates OpenJPEG's `THRESH_CALC` pass:
-/// the same header bytes are produced, but the packets are discarded as soon as
-/// the running byte count exceeds `max_len`.
-pub(crate) fn encode_packets(
-    components: &[Component],
-    layer_count: u16,
-    progression: u8,
-    mode: PacketMode,
-) -> Result<(Vec<u8>, usize, bool), String> {
-    let order = packet_order(components, layer_count, progression)?;
-    let mut states: Vec<HashMap<(i32, i32), PrecinctEncState>> =
-        (0..components.len()).map(|_| HashMap::new()).collect();
-    let mut output = Vec::new();
-    let mut written = 0usize;
-    for key in order {
-        let component = &components[key.component];
-        if !component.has_precinct(key.resolution, key.precinct) {
-            continue;
+/// Encodes LRCP packets in layer order. Each trial starts from the
+/// tag trees and pass counts of the last committed layer.
+pub(crate) struct LayerPackets {
+    packets: Vec<(PacketKey, PrecinctEncState)>,
+    data: Vec<u8>,
+    trial: PrecinctEncState,
+}
+
+impl LayerPackets {
+    pub(crate) fn new(components: &[Component], layer_count: u16) -> Result<Self, String> {
+        let order = packet_order(components, 1, 0)?;
+        if order.len() as u64 * u64::from(layer_count) > MAX_PACKETS {
+            return Err("packet count exceeds the supported limit".into());
         }
-        let bands_meta = component.bands(key.resolution, key.precinct);
-        let state = states[key.component]
-            .entry((key.resolution, key.precinct))
-            .or_insert_with(|| new_precinct_enc_state(component, key.resolution, key.precinct));
-        // OpenJPEG writes the "empty packet" header bit unconditionally in this
-        // build (ENABLE_EMPTY_PACKET_OPTIMIZATION is not defined), so a packet
-        // always starts with a one bit and always carries its header.
-        let mut header = BitWriter::new_stuffed();
-        header.write_bit(true);
-        let mut body = Vec::new();
-        let mut body_len = 0usize;
-        for (band_index, band) in bands_meta.iter().enumerate() {
-            if band.code_blocks.is_empty() {
-                continue;
-            }
-            let band_state = &mut state.bands[band_index];
-            let layer = key.layer;
-            for (block_index, block) in band.code_blocks.iter().enumerate() {
-                let passes = layer_pass_count(block, layer);
-                if passes > 0 && band_state.blocks[block_index].numpasses == 0 {
-                    band_state.inclusion.set_value(
-                        block.local_x as usize,
-                        block.local_y as usize,
-                        i32::from(layer),
-                    );
-                }
-            }
-            for (block_index, block) in band.code_blocks.iter().enumerate() {
-                let block_state = &mut band_state.blocks[block_index];
-                let passes = layer_pass_count(block, layer);
-                if block_state.numpasses == 0 {
-                    band_state.inclusion.encode(
-                        &mut header,
-                        block.local_x as usize,
-                        block.local_y as usize,
-                        i32::from(layer) + 1,
-                    );
-                } else {
-                    header.write_bit(passes != 0);
-                }
-                if passes == 0 {
-                    continue;
-                }
-                if block_state.numpasses == 0 {
-                    block_state.numlenbits = 3;
-                    band_state.zero_bitplanes.encode(
-                        &mut header,
-                        block.local_x as usize,
-                        block.local_y as usize,
-                        999,
-                    );
-                }
-                encode_pass_count(&mut header, passes);
-                let start = block_state.numpasses as usize;
-                let end = start + passes as usize;
-                let mut increment = 0i32;
-                let mut len = 0u32;
-                let mut nump = 0u32;
-                for pass in start..end {
-                    nump += 1;
-                    len += block.passes[pass].rate - pass_offset(block, pass);
-                    if block.passes[pass].term || pass + 1 == end {
-                        increment = increment.max(
-                            floor_log2(len) as i32 + 1
-                                - (block_state.numlenbits as i32 + floor_log2(nump) as i32),
-                        );
-                        len = 0;
-                        nump = 0;
-                    }
-                }
-                write_commacode(&mut header, increment as u32);
-                block_state.numlenbits += increment as u32;
-                let mut len = 0u32;
-                let mut nump = 0u32;
-                for pass in start..end {
-                    nump += 1;
-                    len += block.passes[pass].rate - pass_offset(block, pass);
-                    if block.passes[pass].term || pass + 1 == end {
-                        header.write_bits(len, (block_state.numlenbits + floor_log2(nump)) as u8);
-                        len = 0;
-                        nump = 0;
-                    }
-                }
-                block_state.numpasses += passes;
-                let offset = pass_offset(block, start) as usize;
-                let segment_len = (pass_offset(block, end) - offset as u32) as usize;
-                body_len += segment_len;
-                if mode == PacketMode::Final {
-                    body.extend_from_slice(&block.data[offset..offset + segment_len]);
-                }
-            }
+        let packets = order
+            .into_iter()
+            .filter_map(|key| {
+                let component = &components[key.component];
+                component
+                    .has_precinct(key.resolution, key.precinct)
+                    .then(|| {
+                        let state = new_precinct_enc_state(component, key.resolution, key.precinct);
+                        (key, state)
+                    })
+            })
+            .collect();
+        Ok(Self {
+            packets,
+            data: Vec::new(),
+            trial: PrecinctEncState { bands: Vec::new() },
+        })
+    }
+
+    pub(crate) fn fits(&mut self, components: &[Component], layer: u16, max_len: usize) -> bool {
+        let mut written = self.data.len();
+        if written > max_len {
+            return false;
         }
-        let header_bytes = header.into_bytes();
-        written += header_bytes.len() + body_len;
-        if let PacketMode::Measure { max_len } = mode {
+        for (key, state) in &self.packets {
+            let key = PacketKey { layer, ..*key };
+            let band_count = self.trial.bands.len().min(state.bands.len());
+            for (trial, source) in self.trial.bands.iter_mut().zip(&state.bands) {
+                trial.inclusion.copy_from_tree(&source.inclusion);
+                trial.zero_bitplanes.copy_from_tree(&source.zero_bitplanes);
+                trial.blocks.clone_from(&source.blocks);
+            }
+            self.trial
+                .bands
+                .extend_from_slice(&state.bands[band_count..]);
+            written += encode_packet(components, key, &mut self.trial, None);
             if written > max_len {
-                return Ok((Vec::new(), written, false));
+                return false;
             }
-        } else {
-            output.extend_from_slice(&header_bytes);
-            output.extend_from_slice(&body);
+        }
+        true
+    }
+
+    pub(crate) fn commit(&mut self, components: &[Component], layer: u16) {
+        for (key, state) in &mut self.packets {
+            let key = PacketKey { layer, ..*key };
+            encode_packet(components, key, state, Some(&mut self.data));
         }
     }
-    Ok((output, written, true))
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.data
+    }
+}
+
+fn encode_packet(
+    components: &[Component],
+    key: PacketKey,
+    state: &mut PrecinctEncState,
+    output: Option<&mut Vec<u8>>,
+) -> usize {
+    let bands_meta = components[key.component].bands(key.resolution, key.precinct);
+    // OpenJPEG writes the "empty packet" header bit unconditionally in this
+    // build (ENABLE_EMPTY_PACKET_OPTIMIZATION is not defined), so a packet
+    // always starts with a one bit and always carries its header.
+    let mut header = BitWriter::new_stuffed();
+    header.write_bit(true);
+    let mut body = Vec::new();
+    let mut body_len = 0usize;
+    for (band_index, band) in bands_meta.iter().enumerate() {
+        if band.code_blocks.is_empty() {
+            continue;
+        }
+        let band_state = &mut state.bands[band_index];
+        let layer = key.layer;
+        for (block_index, block) in band.code_blocks.iter().enumerate() {
+            let passes = layer_pass_count(block, layer);
+            if passes > 0 && band_state.blocks[block_index].numpasses == 0 {
+                band_state.inclusion.set_value(
+                    block.local_x as usize,
+                    block.local_y as usize,
+                    i32::from(layer),
+                );
+            }
+        }
+        for (block_index, block) in band.code_blocks.iter().enumerate() {
+            let block_state = &mut band_state.blocks[block_index];
+            let passes = layer_pass_count(block, layer);
+            if block_state.numpasses == 0 {
+                band_state.inclusion.encode(
+                    &mut header,
+                    block.local_x as usize,
+                    block.local_y as usize,
+                    i32::from(layer) + 1,
+                );
+            } else {
+                header.write_bit(passes != 0);
+            }
+            if passes == 0 {
+                continue;
+            }
+            if block_state.numpasses == 0 {
+                block_state.numlenbits = 3;
+                band_state.zero_bitplanes.encode(
+                    &mut header,
+                    block.local_x as usize,
+                    block.local_y as usize,
+                    999,
+                );
+            }
+            encode_pass_count(&mut header, passes);
+            let start = block_state.numpasses as usize;
+            let end = start + passes as usize;
+            // The encoder emits coding style 0, with one MQ segment
+            // across all passes. A packet stores its slice of that segment.
+            let offset = pass_offset(block, start);
+            let segment_len = pass_offset(block, end) - offset;
+            let pass_bits = floor_log2(passes);
+            let increment =
+                (floor_log2(segment_len) + 1).saturating_sub(block_state.numlenbits + pass_bits);
+            write_commacode(&mut header, increment);
+            block_state.numlenbits += increment;
+            header.write_bits(segment_len, (block_state.numlenbits + pass_bits) as u8);
+            block_state.numpasses += passes;
+            let offset = offset as usize;
+            let segment_len = segment_len as usize;
+            body_len += segment_len;
+            if output.is_some() {
+                body.extend_from_slice(&block.data[offset..offset + segment_len]);
+            }
+        }
+    }
+    let header_bytes = header.into_bytes();
+    let len = header_bytes.len() + body_len;
+    if let Some(output) = output {
+        output.extend_from_slice(&header_bytes);
+        output.extend_from_slice(&body);
+    }
+    len
 }
 
 #[derive(Debug, Clone)]
@@ -648,6 +653,7 @@ pub(crate) fn decode_packets(
     let mut states: Vec<HashMap<(i32, i32), PrecinctState>> =
         (0..components.len()).map(|_| HashMap::new()).collect();
     let mut offset = 0usize;
+    let mut contributions = Vec::new();
     for key in order {
         let component = &mut components[key.component];
         if !component.has_precinct(key.resolution, key.precinct) {
@@ -661,14 +667,15 @@ pub(crate) fn decode_packets(
             offset += reader.position();
             continue;
         }
-        let bands_meta = component.bands(key.resolution, key.precinct).to_vec();
         let state = states[key.component]
             .entry((key.resolution, key.precinct))
             .or_insert_with(|| new_precinct_state(component, key.resolution, key.precinct));
-        let mut contributions: Vec<(usize, usize, u32, usize)> = Vec::new();
-        for (band_index, band) in bands_meta.iter().enumerate() {
+        let bands = component
+            .bands_mut(key.resolution, key.precinct)
+            .ok_or_else(|| "packet references a missing precinct".to_string())?;
+        for (band_index, band) in bands.iter_mut().enumerate() {
             let band_state = &mut state.bands[band_index];
-            for (block_index, block) in band.code_blocks.iter().enumerate() {
+            for (block_index, block) in band.code_blocks.iter_mut().enumerate() {
                 let block_state = &mut band_state.blocks[block_index];
                 if !block_state.included {
                     let included = band_state.inclusion.decode(
@@ -690,13 +697,7 @@ pub(crate) fn decode_packets(
                     }
                     block_state.included = true;
                     block_state.num_len_bits = 3;
-                    if let Some(target) = component
-                        .bands_mut(key.resolution, key.precinct)
-                        .and_then(|bands| bands.get_mut(band_index))
-                        .and_then(|band| band.code_blocks.get_mut(block_index))
-                    {
-                        target.zero_bitplanes = zbp as u8;
-                    }
+                    block.zero_bitplanes = zbp as u8;
                 } else if !reader.read_bit()? {
                     continue;
                 }
@@ -724,25 +725,17 @@ pub(crate) fn decode_packets(
         }
         reader.align_to_byte();
         offset += reader.position();
-        for (band_index, block_index, passes, length) in contributions {
+        for (band_index, block_index, passes, length) in contributions.drain(..) {
             let end = offset
                 .checked_add(length)
                 .ok_or_else(|| "packet body length overflow".to_string())?;
             if end > data.len() {
                 return Err("packet body exceeds tile data".into());
             }
-            let bytes = data[offset..end].to_vec();
-            offset = end;
-            let target = component
-                .bands_mut(key.resolution, key.precinct)
-                .and_then(|bands| bands.get_mut(band_index))
-                .and_then(|band| band.code_blocks.get_mut(block_index))
-                .ok_or_else(|| "packet references a missing code block".to_string())?;
+            let target = &mut bands[band_index].code_blocks[block_index];
             target.total_passes += passes;
-            target.segments.push(CodeBlockSegment {
-                data: bytes,
-                pass_count: passes,
-            });
+            target.data.extend_from_slice(&data[offset..end]);
+            offset = end;
         }
     }
     if offset != data.len() {
